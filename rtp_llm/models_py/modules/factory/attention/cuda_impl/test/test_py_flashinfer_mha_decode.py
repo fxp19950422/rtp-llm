@@ -11,7 +11,9 @@ from base_attention_test import BaseAttentionTest, compare_tensors
 from rtp_llm.models_py.modules.factory.attention.cuda_impl.py_flashinfer_mha import (
     PyFlashinferDecodeAttnOp,
 )
+from rtp_llm.ops import KvCacheDataType
 from rtp_llm.ops.compute_ops import (
+    LayerKVCache,
     PyAttentionInputs,
     fill_mla_params,
     get_typemeta,
@@ -252,6 +254,86 @@ class TestPyFlashinferDecodeAttnOp(BaseAttentionTest):
                     head_num_kv=head_num_kv,
                     size_per_head=head_dim,
                 )
+
+    def test_ppu_fp8_production_gqa_group_size_12(self):
+        """Production GLM FP8 decode must match a direct GQA reference."""
+        batch_size = 2
+        sequence_lengths = [67, 129]
+        head_num = 96
+        head_num_kv = 8
+        head_dim = 128
+        block_size = 64
+
+        config = self._create_config(
+            head_num=head_num,
+            head_num_kv=head_num_kv,
+            size_per_head=head_dim,
+            seq_size_per_block=block_size,
+            data_type="bf16",
+        )
+        config.attn_configs.kv_cache_dtype = KvCacheDataType.FP8
+        attn_inputs = self._create_attention_inputs(
+            batch_size,
+            sequence_lengths,
+            block_size,
+            dtype=torch.bfloat16,
+        )
+        attn_op = PyFlashinferDecodeAttnOp(config.attn_configs, attn_inputs)
+        fmha_params = rtp_llm_ops.FlashInferMlaAttnParams()
+        attn_op.set_params(fmha_params)
+        params = attn_op.prepare(attn_inputs)
+
+        q = torch.randn(
+            batch_size,
+            head_num,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        total_blocks = self._calculate_total_blocks(sequence_lengths, block_size)
+        cache = (
+            torch.randn(
+                total_blocks,
+                2,
+                head_num_kv,
+                block_size,
+                head_dim,
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            .mul_(0.5)
+            .to(torch.float8_e4m3fn)
+        )
+        kv_cache = LayerKVCache()
+        kv_cache.kv_cache_base = cache
+
+        output = attn_op.forward(q, kv_cache, params)
+        block_id_list = self._generate_block_id_list(
+            attn_inputs, sequence_lengths, block_size
+        )
+        cache_float = cache.float()
+        group_size = head_num // head_num_kv
+        references = []
+        for batch_idx, sequence_length in enumerate(sequence_lengths):
+            block_ids = block_id_list[batch_idx]
+            k = (
+                cache_float[block_ids, 0]
+                .permute(1, 0, 2, 3)
+                .reshape(head_num_kv, -1, head_dim)[:, :sequence_length]
+            )
+            v = (
+                cache_float[block_ids, 1]
+                .permute(1, 0, 2, 3)
+                .reshape(head_num_kv, -1, head_dim)[:, :sequence_length]
+            )
+            grouped_q = q[batch_idx].float().reshape(head_num_kv, group_size, head_dim)
+            logits = torch.einsum("hgd,htd->hgt", grouped_q, k) / math.sqrt(head_dim)
+            probabilities = torch.softmax(logits, dim=-1)
+            reference = torch.einsum("hgt,htd->hgd", probabilities, v)
+            references.append(reference.reshape(head_num, head_dim))
+
+        reference = torch.stack(references).to(output.dtype)
+        torch.testing.assert_close(output, reference, rtol=0.05, atol=0.05)
 
     def test_edge_case_sequence_lengths(self):
         """Test edge cases with sequence lengths"""

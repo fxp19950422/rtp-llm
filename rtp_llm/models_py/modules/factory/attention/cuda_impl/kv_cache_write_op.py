@@ -51,6 +51,12 @@ class KVCacheWriteOp:
         if kv_cache is not None:
             # For real execution - use provided KV cache
             # KV cache has shape [num_pages, 2, num_kv_heads, page_size, head_dim] (HND layout)
+            cache_dtype = kv_cache.kv_cache_base.dtype
+            if cache_dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz):
+                # FlashInfer's PPU page append corrupts implicit BF16-to-FP8
+                # conversion. Cast first so the kernel only scatters FP8 values.
+                key = key.to(cache_dtype)
+                value = value.to(cache_dtype)
             k_cache = kv_cache.kv_cache_base[
                 :, 0, :, :, :
             ]  # [num_pages, num_kv_heads, page_size, head_dim]

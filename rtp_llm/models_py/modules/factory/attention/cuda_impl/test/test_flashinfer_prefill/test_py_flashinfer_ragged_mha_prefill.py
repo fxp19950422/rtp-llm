@@ -138,6 +138,7 @@ class TestPyFlashinferPrefillAttnOp(BaseAttentionTest):
 
         # Forward pass through PyFlashinferPrefillAttnOp
         output = attn_op.forward(qkv, kv_cache)
+        split_output = attn_op.forward((q, k, v), kv_cache)
 
         # Compute reference outputs using flashinfer's single_prefill_with_kv_cache
         ref_output = compute_flashinfer_prefill_reference(
@@ -151,6 +152,13 @@ class TestPyFlashinferPrefillAttnOp(BaseAttentionTest):
             rtol=1e-2,
             atol=1e-2,
             name=f"Prefill output (batch={batch_size}, seq_lens={sequence_lengths})",
+        )
+        compare_tensors(
+            split_output,
+            ref_output,
+            rtol=1e-2,
+            atol=1e-2,
+            name=f"Split prefill output (batch={batch_size}, seq_lens={sequence_lengths})",
         )
 
         logging.info(

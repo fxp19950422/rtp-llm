@@ -395,21 +395,26 @@ class PyFlashinferPrefillAttnOp(object):
     ## 1. pure prefill attn: qkv contains q and k,v
     ## 2. paged attn: qkv is only q, and kv is in kv_cache
     def forward(
-        self, qkv: torch.Tensor, kv_cache: Optional[LayerKVCache]
+        self,
+        qkv: torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+        kv_cache: Optional[LayerKVCache],
     ) -> torch.Tensor:
-        qkv = qkv.reshape(qkv.shape[0], -1)
-        q, k, v = torch.split(
-            qkv,
-            [
-                self.head_dim_qk * self.local_head_num,
-                self.head_dim_qk * self.local_kv_head_num,
-                self.head_dim_vo * self.local_kv_head_num,
-            ],
-            dim=-1,
-        )
-        q = q.reshape(q.shape[0], self.local_head_num, self.head_dim_qk)
-        k = k.reshape(k.shape[0], self.local_kv_head_num, self.head_dim_qk)
-        v = v.reshape(v.shape[0], self.local_kv_head_num, self.head_dim_vo)
+        if isinstance(qkv, tuple):
+            q, k, v = qkv
+        else:
+            qkv = qkv.reshape(qkv.shape[0], -1)
+            q, k, v = torch.split(
+                qkv,
+                [
+                    self.head_dim_qk * self.local_head_num,
+                    self.head_dim_qk * self.local_kv_head_num,
+                    self.head_dim_vo * self.local_kv_head_num,
+                ],
+                dim=-1,
+            )
+            q = q.reshape(q.shape[0], self.local_head_num, self.head_dim_qk)
+            k = k.reshape(k.shape[0], self.local_kv_head_num, self.head_dim_qk)
+            v = v.reshape(v.shape[0], self.local_kv_head_num, self.head_dim_vo)
         return self.prefill_wrapper.run(q, k, v)
 
 
@@ -600,29 +605,9 @@ class PyFlashinferPrefillImpl(PyFlashinferPrefillImplBase):
 
     def _prepare_fmha_input(
         self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
-    ) -> torch.Tensor:
-        """For ragged layout, reconstruct full qkv tensor from q, k, v."""
-        # query: [total_tokens, num_heads, head_dim]
-        # key: [total_tokens, num_kv_heads, head_dim]
-        # value: [total_tokens, num_kv_heads, head_dim]
-
-        # Flatten to 2D and concatenate
-        q_flat = query.reshape(
-            query.shape[0], -1
-        )  # [total_tokens, num_heads * head_dim]
-        k_flat = key.reshape(
-            key.shape[0], -1
-        )  # [total_tokens, num_kv_heads * head_dim]
-        v_flat = value.reshape(
-            value.shape[0], -1
-        )  # [total_tokens, num_kv_heads * head_dim]
-
-        # Concatenate along feature dimension
-        qkv = torch.cat(
-            [q_flat, k_flat, v_flat], dim=-1
-        )  # [total_tokens, (num_heads + 2*num_kv_heads) * head_dim]
-
-        return qkv
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pass split tensors through without materializing another full QKV."""
+        return query, key, value
 
     @staticmethod
     def support(attn_configs: AttentionConfigs, attn_inputs: PyAttentionInputs) -> bool:

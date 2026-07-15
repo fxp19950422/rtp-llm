@@ -84,6 +84,7 @@ class CausalAttention(nn.Module):
         if self.qk_fuse_norm is not None:
             qkv = self.qk_fuse_norm(qkv)
         attn_output = fmha_impl.forward(qkv, kv_cache, self.layer_idx)
+        del qkv
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         if gate is not None:
             attn_output = attn_output * torch.sigmoid(gate)

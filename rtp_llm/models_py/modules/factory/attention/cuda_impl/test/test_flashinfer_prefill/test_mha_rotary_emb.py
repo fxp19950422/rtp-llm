@@ -16,8 +16,9 @@ from rtp_llm.models_py.modules.factory.attention.cuda_impl.flashinfer_rotary_emb
 from rtp_llm.models_py.modules.factory.attention.cuda_impl.kv_cache_write_op import (
     KVCacheWriteOp,
 )
-from rtp_llm.ops import AttentionConfigs, RopeStyle
+from rtp_llm.ops import AttentionConfigs, KvCacheDataType, RopeStyle
 from rtp_llm.ops.compute_ops import (
+    FusedRopeKVCacheDecodeOp,
     FusedRopeKVCachePrefillOpQOut,
     LayerKVCache,
     PyAttentionInputs,
@@ -567,6 +568,332 @@ class TestMhaRotaryEmbeddingOp(unittest.TestCase):
             "\n✓ All implementations (Reference, Python, C++) produce consistent results"
         )
         print("=" * 80)
+
+    def test_fused_rope_writes_fp8_kv_cache(self):
+        """FP8 cache writes must match a direct PyTorch E4M3 cast."""
+        if not self.device_initialized:
+            self.skipTest(
+                "Device not initialized - required for FusedRopeKVCachePrefillOpQOut"
+            )
+
+        num_tokens = 18
+        num_heads = 96
+        num_kv_heads = 8
+        head_dim = 128
+        tokens_per_block = 64
+        num_pages = 2
+        physical_page = 1
+
+        attn_config = create_test_attn_config(
+            head_num=num_heads,
+            kv_head_num=num_kv_heads,
+            size_per_head=head_dim,
+            tokens_per_block=tokens_per_block,
+            dtype=torch.bfloat16,
+        )
+        attn_config.kv_cache_dtype = KvCacheDataType.FP8
+
+        qkv = torch.randn(
+            num_tokens,
+            (num_heads + 2 * num_kv_heads) * head_dim,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        q_size = num_heads * head_dim
+        kv_size = num_kv_heads * head_dim
+        k = qkv[:, q_size : q_size + kv_size].reshape(
+            num_tokens, num_kv_heads, head_dim
+        )
+        v = qkv[:, q_size + kv_size :].reshape(num_tokens, num_kv_heads, head_dim)
+
+        positions = torch.arange(num_tokens, dtype=torch.int32, device=self.device)
+        cos_sin_cache = create_cos_sin_cache(
+            head_dim=head_dim,
+            max_seq_len=attn_config.max_seq_len,
+            device=str(self.device),
+        )
+        q = qkv[:, :q_size].reshape(num_tokens, num_heads, head_dim)
+        _, k_ref = apply_rope_reference(q.float(), k.float(), cos_sin_cache, positions)
+        k_ref = k_ref.to(torch.bfloat16)
+
+        expected = torch.zeros(
+            num_pages,
+            2,
+            num_kv_heads,
+            tokens_per_block,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        expected[physical_page, 0, :, :num_tokens] = k_ref.permute(1, 0, 2)
+        expected[physical_page, 1, :, :num_tokens] = v.permute(1, 0, 2)
+        expected = expected.to(torch.float8_e4m3fn)
+
+        kv_cache = LayerKVCache()
+        kv_cache.kv_cache_base = torch.zeros(
+            num_pages,
+            2 * num_kv_heads * tokens_per_block * head_dim,
+            dtype=torch.float8_e4m3fn,
+            device=self.device,
+        )
+        kv_cache.kv_scale_base = torch.zeros(
+            num_pages,
+            2,
+            num_kv_heads,
+            tokens_per_block,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        block_ids = torch.tensor([[physical_page]], dtype=torch.int32)
+        attn_inputs = PyAttentionInputs()
+        attn_inputs.is_prefill = True
+        attn_inputs.input_lengths = torch.tensor(
+            [num_tokens], dtype=torch.int32, device=self.device
+        )
+        attn_inputs.prefix_lengths = torch.zeros(
+            1, dtype=torch.int32, device=self.device
+        )
+        attn_inputs.sequence_lengths = torch.tensor(
+            [num_tokens], dtype=torch.int32, device=self.device
+        )
+        attn_inputs.dtype = get_typemeta(qkv)
+        attn_inputs.cu_seqlens_device = torch.tensor(
+            [0, num_tokens], dtype=torch.int32, device=self.device
+        )
+        attn_inputs.cu_kv_seqlens_device = attn_inputs.cu_seqlens_device.clone()
+        attn_inputs.kv_cache_block_id = block_ids
+        attn_inputs.kv_cache_block_id_device = block_ids.to(self.device)
+        attn_inputs.kv_cache_kernel_block_id = block_ids
+        attn_inputs.kv_cache_kernel_block_id_device = block_ids.to(self.device)
+
+        op = FusedRopeKVCachePrefillOpQOut(attn_config)
+        params = op.prepare(attn_inputs)
+        op.forward(qkv, kv_cache, params)
+        torch.cuda.synchronize()
+
+        actual = kv_cache.kv_cache_base.reshape(
+            num_pages, 2, num_kv_heads, tokens_per_block, head_dim
+        )
+        actual_k = actual[:, 0].float()
+        actual_v = actual[:, 1].float()
+        torch.testing.assert_close(
+            actual_v,
+            expected[:, 1].float(),
+            rtol=0,
+            atol=0,
+            equal_nan=True,
+            msg="V cache differs from a direct BF16-to-E4M3 cast",
+        )
+        torch.testing.assert_close(
+            actual_k,
+            expected[:, 0].float(),
+            rtol=0.15,
+            atol=0.25,
+            equal_nan=True,
+            msg="K cache differs from reference RoPE followed by E4M3 cast",
+        )
+        expected_scale = torch.zeros_like(kv_cache.kv_scale_base)
+        expected_scale[physical_page, :, :, :num_tokens] = 1
+        torch.testing.assert_close(
+            kv_cache.kv_scale_base,
+            expected_scale,
+            rtol=0,
+            atol=0,
+            msg="Direct-cast FP8 KV cache must use unit scales",
+        )
+
+    def test_flashinfer_page_append_writes_fp8_kv_cache(self):
+        """The production prefill writer must convert every BF16 KV element."""
+        if not self.device_initialized:
+            self.skipTest("Device not initialized - required for KVCacheWriteOp")
+
+        num_tokens = 18
+        num_kv_heads = 8
+        head_dim = 128
+        tokens_per_block = 64
+        num_pages = 2
+        physical_page = 1
+
+        key = torch.randn(
+            num_tokens,
+            num_kv_heads,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        value = torch.randn_like(key)
+        kv_cache = LayerKVCache()
+        kv_cache.kv_cache_base = torch.zeros(
+            num_pages,
+            2,
+            num_kv_heads,
+            tokens_per_block,
+            head_dim,
+            dtype=torch.float8_e4m3fn,
+            device=self.device,
+        )
+
+        params = RopeParams(
+            batch_indice_d=torch.zeros(
+                num_tokens, dtype=torch.int32, device=self.device
+            ),
+            positions_d=torch.arange(num_tokens, dtype=torch.int32, device=self.device),
+            page_indice_d=torch.tensor(
+                [physical_page], dtype=torch.int32, device=self.device
+            ),
+            decode_page_indptr_d=torch.tensor(
+                [0, 1], dtype=torch.int32, device=self.device
+            ),
+            paged_kv_last_page_len_d=torch.tensor(
+                [num_tokens], dtype=torch.int32, device=self.device
+            ),
+        )
+        op = KVCacheWriteOp(num_kv_heads, head_dim, tokens_per_block)
+        op.set_params(params)
+        op.forward(key, value, kv_cache)
+        torch.cuda.synchronize()
+
+        actual = kv_cache.kv_cache_base[physical_page].float()
+        expected = torch.zeros(
+            2,
+            num_kv_heads,
+            tokens_per_block,
+            head_dim,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        expected[0, :, :num_tokens] = key.permute(1, 0, 2)
+        expected[1, :, :num_tokens] = value.permute(1, 0, 2)
+        expected = expected.to(torch.float8_e4m3fn).float()
+        torch.testing.assert_close(
+            actual,
+            expected,
+            rtol=0,
+            atol=0,
+            equal_nan=True,
+        )
+
+    def test_fused_rope_decode_appends_fp8_kv_cache(self):
+        """Decode must rotate Q/K and append one FP8 KV token correctly."""
+        if not self.device_initialized:
+            self.skipTest(
+                "Device not initialized - required for FusedRopeKVCacheDecodeOp"
+            )
+
+        num_heads = 32
+        num_kv_heads = 8
+        head_dim = 128
+        tokens_per_block = 64
+        position = 32
+
+        attn_config = create_test_attn_config(
+            head_num=num_heads,
+            kv_head_num=num_kv_heads,
+            size_per_head=head_dim,
+            tokens_per_block=tokens_per_block,
+            dtype=torch.bfloat16,
+        )
+        attn_config.kv_cache_dtype = KvCacheDataType.FP8
+
+        qkv = torch.randn(
+            1,
+            (num_heads + 2 * num_kv_heads) * head_dim,
+            dtype=torch.bfloat16,
+            device=self.device,
+        )
+        q_size = num_heads * head_dim
+        kv_size = num_kv_heads * head_dim
+        q = qkv[:, :q_size].reshape(1, num_heads, head_dim)
+        k = qkv[:, q_size : q_size + kv_size].reshape(1, num_kv_heads, head_dim)
+        v = qkv[:, q_size + kv_size :].reshape(1, num_kv_heads, head_dim)
+        positions = torch.tensor([position], dtype=torch.int32, device=self.device)
+        cos_sin_cache = create_cos_sin_cache(
+            head_dim=head_dim,
+            max_seq_len=attn_config.max_seq_len,
+            device=str(self.device),
+        )
+        q_ref, k_ref = apply_rope_reference(
+            q.float(), k.float(), cos_sin_cache, positions
+        )
+        q_ref = q_ref.to(torch.bfloat16)
+        k_ref = k_ref.to(torch.bfloat16).to(torch.float8_e4m3fn).float()
+        v_ref = v.to(torch.float8_e4m3fn).float()
+
+        kv_cache = LayerKVCache()
+        kv_cache.kv_cache_base = torch.zeros(
+            1,
+            2,
+            num_kv_heads,
+            tokens_per_block,
+            head_dim,
+            dtype=torch.float8_e4m3fn,
+            device=self.device,
+        )
+        kv_cache.kv_scale_base = torch.zeros(
+            1,
+            2,
+            num_kv_heads,
+            tokens_per_block,
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        block_ids = torch.zeros(1, 1, dtype=torch.int32)
+        attn_inputs = PyAttentionInputs()
+        attn_inputs.is_prefill = False
+        attn_inputs.input_lengths = torch.ones(1, dtype=torch.int32).pin_memory()
+        attn_inputs.prefix_lengths = torch.zeros(1, dtype=torch.int32).pin_memory()
+        attn_inputs.sequence_lengths = torch.tensor(
+            [position], dtype=torch.int32
+        ).pin_memory()
+        attn_inputs.dtype = get_typemeta(qkv)
+        attn_inputs.cu_seqlens_device = torch.tensor(
+            [0, 1], dtype=torch.int32, device=self.device
+        )
+        attn_inputs.cu_kv_seqlens_device = torch.tensor(
+            [0, position + 1], dtype=torch.int32, device=self.device
+        )
+        attn_inputs.kv_cache_block_id = block_ids
+        attn_inputs.kv_cache_block_id_device = block_ids.to(self.device)
+        attn_inputs.kv_cache_kernel_block_id = block_ids
+        attn_inputs.kv_cache_kernel_block_id_device = block_ids.to(self.device)
+
+        op = FusedRopeKVCacheDecodeOp(attn_config)
+        params = op.prepare(attn_inputs)
+        q_actual = op.forward(qkv, kv_cache, params)
+        torch.cuda.synchronize()
+
+        torch.testing.assert_close(
+            q_actual,
+            q_ref,
+            rtol=0.01,
+            atol=0.01,
+            msg="Decode Q differs from reference RoPE",
+        )
+        torch.testing.assert_close(
+            kv_cache.kv_cache_base[0, 0, :, position].float(),
+            k_ref[0],
+            rtol=0.15,
+            atol=0.25,
+            equal_nan=True,
+            msg="Decode K append differs from reference RoPE followed by E4M3 cast",
+        )
+        torch.testing.assert_close(
+            kv_cache.kv_cache_base[0, 1, :, position].float(),
+            v_ref[0],
+            rtol=0,
+            atol=0,
+            equal_nan=True,
+            msg="Decode V append differs from a direct BF16-to-E4M3 cast",
+        )
+        torch.testing.assert_close(
+            kv_cache.kv_scale_base[:, :, :, position],
+            torch.ones_like(kv_cache.kv_scale_base[:, :, :, position]),
+            rtol=0,
+            atol=0,
+            msg="Decode FP8 KV append must use unit scales",
+        )
 
 
 if __name__ == "__main__":
