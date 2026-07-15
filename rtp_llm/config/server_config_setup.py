@@ -78,10 +78,7 @@ def auto_configure_deepep(
     prefill_cp_enabled = parallelism_config.prefill_cp_config.is_enabled()
     is_single_gpu = ep_size == 1
     is_pure_tp = (
-        tp_size > 1
-        and dp_size == 1
-        and ep_size == tp_size
-        and not prefill_cp_enabled
+        tp_size > 1 and dp_size == 1 and ep_size == tp_size and not prefill_cp_enabled
     )
     # Explicit opt-in via --moe_strategy must preserve use_all_gather, otherwise
     # the matching strategy's check_conditions (which requires use_all_gather)
@@ -94,7 +91,7 @@ def auto_configure_deepep(
         and ep_size == dp_size
     )
     explicit_pure_cp = (
-        moe_config.moe_strategy == "fp8_per_block_pure_cp"
+        moe_config.moe_strategy in ("fp8_per_block_pure_cp", "int8_per_channel_pure_cp")
         and tp_size > 1
         and dp_size == 1
         and ep_size == tp_size

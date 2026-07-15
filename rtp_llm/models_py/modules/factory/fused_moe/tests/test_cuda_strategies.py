@@ -32,6 +32,7 @@ from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.strategy import (
     CudaNoQuantEpLowLatencyStrategy,
     CudaW4a8Int4PerChannelNoDPStrategy,
 )
+from rtp_llm.models_py.utils.arch import get_num_device_sms
 from rtp_llm.ops import CPRotateMethod, MoeConfig, ParallelismConfig
 
 
@@ -185,6 +186,60 @@ class TestCudaNoQuantSingleGpuStrategy(unittest.TestCase):
 
 
 class TestCudaNoQuantEpLowLatencyStrategy(unittest.TestCase):
+    @patch("rtp_llm.models_py.utils.arch.torch.cuda.get_device_properties")
+    @patch("rtp_llm.models_py.utils.arch.torch.cuda.current_device", return_value=0)
+    @patch("rtp_llm.models_py.utils.arch.torch.cuda.is_available", return_value=True)
+    @patch("rtp_llm.models_py.utils.arch.is_ppu", return_value=True)
+    @patch("rtp_llm.models_py.utils.arch.is_cuda", return_value=False)
+    def test_ppu_reports_device_sm_count(
+        self,
+        _mock_is_cuda: Any,
+        _mock_is_ppu: Any,
+        _mock_is_available: Any,
+        _mock_current_device: Any,
+        mock_get_properties: Any,
+    ) -> None:
+        mock_get_properties.return_value.multi_processor_count = 64
+        self.assertEqual(get_num_device_sms(), 64)
+
+    @patch(
+        "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.deepep_low_latency_router.DeepEPWrapper.supported",
+        return_value=True,
+    )
+    @patch(
+        "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.deepep_low_latency_router.DeepEpLowLatencyRouterNoQuant._sm_check",
+        return_value=True,
+    )
+    @patch(
+        "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.deepgemm_masked_executor.DeepGemmMaskedExecutorNoQuant._sm_check",
+        return_value=True,
+    )
+    @patch(
+        "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.deepgemm_masked_executor.DeepGemmMaskedExecutorNoQuant._kernel_check",
+        return_value=True,
+    )
+    def test_can_handle_no_quant_low_latency_on_ppu(
+        self,
+        _mock_kernel_check: Any,
+        _mock_executor_sm_check: Any,
+        _mock_router_sm_check: Any,
+        _mock_deepep_supported: Any,
+    ) -> None:
+        model_config = create_model_config_without_quant()
+        model_config.data_type = "bf16"
+        config = create_moe_config_adapter(
+            model_config=model_config,
+            parallelism_config=create_parallelism_config(
+                ep_size=2, tp_size=1, dp_size=2
+            ),
+            moe_config=create_moe_config(
+                use_deepep_low_latency=True, moe_strategy="auto"
+            ),
+            enable_cuda_graph=True,
+        )
+
+        self.assertTrue(CudaNoQuantEpLowLatencyStrategy().can_handle(config))
+
     def test_logs_graph_safe_path_when_cuda_graph_is_enabled(self) -> None:
         config = create_moe_config_adapter(
             model_config=create_model_config_without_quant(),

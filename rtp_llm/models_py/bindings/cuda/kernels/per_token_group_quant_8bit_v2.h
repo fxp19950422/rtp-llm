@@ -16,4 +16,12 @@ void sgl_per_token_group_quant_8bit_v2(torch::Tensor                       input
                                        bool                                scale_ue8m0,
                                        bool                                fuse_silu_and_mul,
                                        const std::optional<torch::Tensor>& masked_m);
-}
+
+void silu_mul_quant_int8_glm(torch::Tensor input,
+                             torch::Tensor output_q,
+                             torch::Tensor output_s,
+                             int64_t       hidden_size,
+                             double        eps,
+                             double        int8_min,
+                             double        int8_max);
+}  // namespace rtp_llm

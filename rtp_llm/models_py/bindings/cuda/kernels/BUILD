@@ -103,6 +103,7 @@ cc_library(
         "per_token_group_quant_8bit_v2.h",
     ],
     deps = [
+        ":scaled_fp8_quant",
         "//rtp_llm/models_py/bindings/cuda:cuda_host_utils",
         "//rtp_llm/models_py/bindings/cuda:cuda_utils_cu",
         ":cuda_utils_common",

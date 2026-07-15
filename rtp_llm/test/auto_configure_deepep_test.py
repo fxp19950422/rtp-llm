@@ -804,6 +804,26 @@ class AutoConfigureDeepepTest(TestCase):
         self.assertTrue(self.moe_config.use_all_gather)
         self._assert_deepep_config(moe=False, low_latency=False, internode=False)
 
+    def test_explicit_int8_pure_cp_preserves_allgather(self):
+        """INT8 Pure-CP uses the same allgather router gate as FP8 Pure-CP."""
+        self._setup_parallel_info(
+            world_size=2, tp_size=2, ep_size=2, local_world_size=8
+        )
+        self.parallel_config.dp_size = 1
+        self.parallel_config.prefill_cp_config.method = CPRotateMethod.ALL_GATHER
+        self.moe_config.use_all_gather = True
+        self.moe_config.moe_strategy = "int8_per_channel_pure_cp"
+
+        auto_configure_deepep(
+            moe_config=self.moe_config,
+            deep_ep_config=self.deep_ep_config,
+            parallelism_config=self.parallel_config,
+            role_type=RoleType.PDFUSION,
+        )
+
+        self.assertTrue(self.moe_config.use_all_gather)
+        self._assert_deepep_config(moe=False, low_latency=False, internode=False)
+
     def test_explicit_pure_dp_wrong_topology_falls_back(self):
         """--moe_strategy=fp8_per_block_pure_dp on mixed tp+dp must NOT preserve use_all_gather."""
         # tp>1 fails explicit_pure_dp (requires tp==1); dp>1 fails is_pure_tp (requires dp==1).

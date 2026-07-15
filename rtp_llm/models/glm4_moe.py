@@ -489,4 +489,150 @@ class Glm4Moe(DeepSeekV2):
         return Glm4MoeWeight
 
 
+class Glm4MoeMTPWeight(Glm4MoeWeight):
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.mtp_layer_offset = getattr(self.model_config, "mtp_layer_offset", 0)
+
+    def _process_meta(self, meta_dict, weight_keys):
+        for layer_id in range(self._num_layers):
+            checkpoint_layer_id = layer_id + self.mtp_layer_offset
+            if (
+                f"model.layers.{checkpoint_layer_id}.mlp.gate.e_score_correction_bias"
+                in weight_keys
+            ):
+                logging.info(
+                    "found e_score_correction_bias in MTP layer %d",
+                    checkpoint_layer_id,
+                )
+                self.has_e_score_correction_bias = True
+                break
+
+    def _offset_ckpt_weight(self, weight: CkptWeightInfo, layer_id: int):
+        # Materialize the appended MTP layer id before quant wrappers derive
+        # companion keys such as *.weight_scale from CkptWeightInfo.name.
+        name = weight.name.replace(
+            "{i_1}", str(layer_id + self.mtp_layer_offset + 1)
+        ).replace("{i}", str(layer_id + self.mtp_layer_offset))
+        return CkptWeightInfo(name, weight.merge_fun)
+
+    def _offset_layer_weights(self, layer_weights: List[WeightModule], layer_id: int):
+        for module in layer_weights:
+            for component in module.get_components():
+                if hasattr(component, "weights"):
+                    component.weights = [
+                        self._offset_ckpt_weight(weight, layer_id)
+                        for weight in component.weights
+                    ]
+        return layer_weights
+
+    def _get_weight_info(self):
+        assert self._num_layers == 1, "GLM4 MoE MTP supports one draft layer only"
+        layer_weights: List[List[WeightModule]] = []
+        weights = [
+            AtomicWeight(
+                W.embedding,
+                [CkptWeightInfo("model.embed_tokens.weight", identity)],
+                identity,
+            ),
+            AtomicWeight(
+                W.lm_head,
+                [
+                    CkptWeightInfo(
+                        f"model.layers.{self.mtp_layer_offset}.shared_head.head.weight",
+                        identity,
+                    )
+                ],
+                identity,
+            ),
+        ]
+        for layer in range(self._num_layers):
+            layer_weights_tmp = self._offset_layer_weights(
+                self._get_hf_layer_weight_info(layer), layer
+            )
+            layer_weights_tmp.extend(
+                [
+                    AtomicWeight(
+                        W.multi_tokens_predict_final_ln_gamma,
+                        [
+                            CkptWeightInfo(
+                                f"model.layers.{self.mtp_layer_offset}.shared_head.norm.weight",
+                                identity,
+                            )
+                        ],
+                        identity,
+                    ),
+                    AtomicWeight(
+                        W.multi_tokens_predict_enorm,
+                        [
+                            CkptWeightInfo(
+                                f"model.layers.{self.mtp_layer_offset}.enorm.weight",
+                                identity,
+                            )
+                        ],
+                        identity,
+                    ),
+                    AtomicWeight(
+                        W.multi_tokens_predict_hnorm,
+                        [
+                            CkptWeightInfo(
+                                f"model.layers.{self.mtp_layer_offset}.hnorm.weight",
+                                identity,
+                            )
+                        ],
+                        identity,
+                    ),
+                    AtomicWeight(
+                        W.multi_tokens_predict_eh_proj,
+                        [
+                            CkptWeightInfo(
+                                f"model.layers.{self.mtp_layer_offset}.eh_proj.weight",
+                                identity,
+                            )
+                        ],
+                        transpose,
+                    ),
+                ]
+            )
+            layer_weights.append(layer_weights_tmp)
+        return ModelWeightInfo(layer_weights=layer_weights, weights=weights)
+
+
+class Glm4MoeMTP(Glm4Moe):
+    @classmethod
+    def _create_config(cls, ckpt_path: str):
+        config = super()._create_config(ckpt_path)
+        mtp_layer_count = getattr(config, "num_nextn_predict_layers", 1)
+        config.mtp_layer_offset = config.num_layers
+        config.num_layers = mtp_layer_count
+        config.moe_layer_index = list(range(config.num_layers))
+        # GLM-4.7 MTP fuses embed/hidden as eh_proj(cat([enorm(embed), hnorm(hidden)])),
+        # matching SGLang glm4_moe_nextn. reverse_e_h_norm=True (DeepSeek order) feeds
+        # the halves swapped -> draft proposes wrong tokens -> MTP accept=0. Verified on
+        # PPU DP16+EP16: rev=True accept=0 vs rev=False accept 17-28% (gen1).
+        config.reverse_e_h_norm = False
+        config.is_mtp = True
+        return config
+
+    def _create_python_model(self):
+        from rtp_llm.models_py.model_desc.glm4_moe_mtp import Glm4MoeMtpModel
+
+        self.py_model = Glm4MoeMtpModel(
+            self.model_config,
+            self.parallelism_config,
+            self.weight,
+            self.moe_config,
+            max_generate_batch_size=self.max_generate_batch_size,
+            fmha_config=self.fmha_config,
+            py_hw_kernel_config=self.hw_kernel_config,
+            device_resource_config=self.device_resource_config,
+        )
+
+    @staticmethod
+    def get_weight_cls() -> type[Glm4MoeMTPWeight]:
+        return Glm4MoeMTPWeight
+
+
 register_model("glm4_moe", Glm4Moe, [], ["Glm4MoeForCausalLM"])
+register_model("glm4_moe-mtp", Glm4MoeMTP, [], ["Glm4MoeForCausalLMNextN"])
+register_model("glm4_moe_mtp", Glm4MoeMTP)

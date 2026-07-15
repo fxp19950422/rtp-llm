@@ -59,6 +59,20 @@ py_test (
 )
 
 py_test(
+    name = "silu_mul_quant_int8_glm_test",
+    srcs = ["silu_mul_quant_int8_glm_test.py"],
+    deps = py_test_deps,
+    tags = ["manual"],
+)
+
+py_test(
+    name = "ppu_int8_quant_test",
+    srcs = ["ppu_int8_quant_test.py"],
+    deps = py_test_deps,
+    tags = ["manual"],
+)
+
+py_test(
     name = "test_xqa_batch_decode",
     srcs = ["test_xqa_batch_decode.py"],
     deps = py_test_deps + select({
@@ -69,4 +83,3 @@ py_test(
     tags = ["open_skip", "H20"],
     exec_properties = {'gpu':'H20'},
 )
-

@@ -97,8 +97,11 @@ class BackendManager(object):
             deepep_init_success = False
             moriep_init_success = False
 
-            # Initialize DeepEP if enabled
-            if engine_config.moe_config.use_deepep_moe:
+            # Initialize DeepEP if enabled (normal or low-latency mode)
+            if (
+                engine_config.moe_config.use_deepep_moe
+                or engine_config.moe_config.use_deepep_low_latency
+            ):
                 try:
                     from rtp_llm.models_py.distributed.deepep_wrapper import (
                         init_deepep_wrapper,
@@ -123,7 +126,10 @@ class BackendManager(object):
                     logging.error(f"Failed to initialize MoriEP wrapper: {e}")
 
             # Raise if a requested EP backend failed to initialize
-            if engine_config.moe_config.use_deepep_moe and not deepep_init_success:
+            if (
+                engine_config.moe_config.use_deepep_moe
+                or engine_config.moe_config.use_deepep_low_latency
+            ) and not deepep_init_success:
                 raise RuntimeError("DeepEP was requested but failed to initialize")
             if engine_config.moe_config.use_mori_ep and not moriep_init_success:
                 raise RuntimeError(

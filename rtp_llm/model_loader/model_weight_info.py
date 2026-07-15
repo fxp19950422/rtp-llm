@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 import torch
 
 from rtp_llm.config.quant_config import (
+    CompressedInt8PerChannelQuantConfig,
     Fp8PerTensorQuantConfig,
     ModelOptFp4Config,
     QuantizationConfig,
@@ -42,6 +43,15 @@ if TYPE_CHECKING:
 
 def create_scalar_ones(ts: List[torch.Tensor]):
     return torch.ones([1], dtype=torch.float32).to(ts[0].device)
+
+
+def _should_use_python_quant_loader(
+    quant_algo: Any, quant_config: Optional[QuantizationConfig]
+) -> bool:
+    cpp_quant_enabled = quant_algo is not None and quant_algo.isQuant()
+    return cpp_quant_enabled or isinstance(
+        quant_config, CompressedInt8PerChannelQuantConfig
+    )
 
 
 class ModelWeightInfo:
@@ -321,7 +331,10 @@ class ModelDeployWeightInfo:
                 weight_info
             )
 
-        if self._quant_algo is not None and self._quant_algo.isQuant():
+        # PPU executes compressed INT8 through Python DeepGEMM while leaving the
+        # C++ quant algorithm disabled. Weight conversion must therefore not be
+        # gated solely by the C++ quant state.
+        if _should_use_python_quant_loader(self._quant_algo, self._quant_config):
             weight_info = weight_info.to_quant_weight_info(self._quant_config)
 
         if self.tie_word_embeddings:

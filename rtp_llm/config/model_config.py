@@ -8,6 +8,7 @@ import torch
 
 from rtp_llm.config.py_config_modules import VitConfig
 from rtp_llm.config.quant_config import (
+    CompressedInt8PerChannelQuantConfig,
     Fp8BlockWiseQuantConfig,
     QuantizationConfig,
     W4a8Int4PerChannelQuantConfig,
@@ -20,6 +21,10 @@ from rtp_llm.ops import TaskType
 from rtp_llm.utils.base_model_datatypes import VitParameters
 from rtp_llm.utils.util import get_config_from_path, to_torch_dtype
 from rtp_llm.utils.weight_type import WEIGHT_TYPE
+
+# INT8 KV cache is an optional feature. The C++ KvCacheDataType enum may not
+# have an INT8 member in all builds, so use getattr for safe access.
+_INT8_KV_CACHE = getattr(KvCacheDataType, "INT8", None)
 
 
 def kv_cache_dtype_to_torch_dtype(
@@ -34,7 +39,9 @@ def kv_cache_dtype_to_torch_dtype(
     Returns:
         torch.dtype value
     """
-    if kv_cache_dtype == KvCacheDataType.FP8:
+    if _INT8_KV_CACHE is not None and kv_cache_dtype == _INT8_KV_CACHE:
+        return torch.int8
+    elif kv_cache_dtype == KvCacheDataType.FP8:
         return torch.float8_e4m3fn
     else:  # BASE
         return data_type.to_torch_dtype()
@@ -73,6 +80,7 @@ class ModelConfig(CppModelConfig):
         "phy2log_path",
         "lora_infos",
         "headwise_config",
+        "mtp_layer_offset",
     }
 
     # Known C++ ModelConfig members (from ModelConfig.h)
@@ -238,7 +246,12 @@ class ModelConfig(CppModelConfig):
             return 0
         # Get kv_cache_dtype from attn_config
         kv_cache_dtype_enum = self.attn_config.kv_cache_dtype
-        kv_cache_bytes = 1 if kv_cache_dtype_enum == KvCacheDataType.FP8 else 2
+        _is_int8_kv = (
+            _INT8_KV_CACHE is not None and kv_cache_dtype_enum == _INT8_KV_CACHE
+        )
+        kv_cache_bytes = (
+            1 if (kv_cache_dtype_enum == KvCacheDataType.FP8 or _is_int8_kv) else 2
+        )
         kv_cache_size = (
             2
             * self.num_layers
@@ -581,8 +594,27 @@ class ModelConfig(CppModelConfig):
                 quant_config = init_quant_config(self.quantization)
                 logging.info(f"need_load_quant by {quant_config.get_method()}")
 
-        # Set quant_algo if quant_config exists
-        if quant_config:
+        # Set quant_algo if quant_config exists.
+        # Impact chain for CompressedInt8PerChannel:
+        #   PPU: skip_quant_algo=True → C++ quant_algo NOT set → C++ uses BF16 GEMM
+        #        → Python Int8PerChannelLinear receives INT8 weights + scale
+        #        → Uses deep_gemm gemm_int8_int8_bf16_nt for HW INT8 GEMM.
+        #   Non-PPU: skip_quant_algo=False → C++ quant_algo IS set (smooth_quant)
+        #        → _postprocess dequantizes INT8→BF16 at load time → C++ uses BF16 GEMM.
+        skip_quant_algo = False
+        if quant_config and isinstance(
+            quant_config, CompressedInt8PerChannelQuantConfig
+        ):
+            from rtp_llm.device.device_type import DeviceType, get_device_type
+
+            if get_device_type() == DeviceType.Ppu:
+                skip_quant_algo = True
+                logging.info(
+                    "PPU detected: skipping quant_algo for CompressedInt8PerChannel. "
+                    "Dense layers will use deep_gemm INT8 GEMM (weights stay INT8)."
+                )
+
+        if quant_config and not skip_quant_algo:
             self.quant_algo.setQuantAlgo(
                 quant_config.get_algo().lower(),
                 quant_config.bits,
@@ -644,7 +676,20 @@ class ModelConfig(CppModelConfig):
 
         # Set attn_config.kv_cache_dtype based on kv_cache_config
         if kv_cache_config is not None:
-            if kv_cache_config.fp8_kv_cache:
+            if (
+                getattr(kv_cache_config, "int8_kv_cache", 0)
+                and _INT8_KV_CACHE is not None
+            ):
+                self.attn_config.kv_cache_dtype = _INT8_KV_CACHE
+                logging.info(
+                    "Setting attn_config.kv_cache_dtype to INT8 based on kv_cache_config.int8_kv_cache"
+                )
+            elif getattr(kv_cache_config, "int8_kv_cache", 0):
+                logging.warning(
+                    "kv_cache_config.int8_kv_cache is set but KvCacheDataType.INT8 "
+                    "is not available in this build; falling through to default"
+                )
+            elif kv_cache_config.fp8_kv_cache:
                 self.attn_config.kv_cache_dtype = KvCacheDataType.FP8
                 logging.info(
                     "Setting attn_config.kv_cache_dtype to FP8 based on kv_cache_config.fp8_kv_cache"
@@ -652,7 +697,7 @@ class ModelConfig(CppModelConfig):
             else:
                 self.attn_config.kv_cache_dtype = KvCacheDataType.BASE
                 logging.info(
-                    "Setting attn_config.kv_cache_dtype to BASE (default, no fp8 kv_cache specified)"
+                    "Setting attn_config.kv_cache_dtype to BASE (default, no int8/fp8 kv_cache specified)"
                 )
 
         if quant_config and quant_config.get_method().lower() == "fp8":

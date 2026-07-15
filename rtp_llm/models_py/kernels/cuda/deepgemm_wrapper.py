@@ -6,6 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
+from rtp_llm.device.device_type import is_ppu
 from rtp_llm.utils.module_util import has_module, resolve_symbol
 
 __all__ = [
@@ -15,7 +16,11 @@ __all__ = [
     "bf16_gemm_nt",
     "m_grouped_bf16_gemm_nt_contiguous",
     "m_grouped_bf16_gemm_nt_masked",
+    "m_grouped_int8_gemm_nt_masked",
+    "grouped_gemm_nt_i8i8bf16_nopad",
+    "int8_gemm_nt",
     "has_deep_gemm",
+    "has_bf16_masked_deep_gemm",
     "is_deep_gemm_e8m0_used",
     "configure_deep_gemm_num_sms",
     "maybe_pack_ue8m0_scale",
@@ -28,15 +33,21 @@ _deep_gemm_impl_new_map = {
     "bf16_gemm_nt": "bf16_gemm_nt",
     "m_grouped_bf16_gemm_nt_contiguous": "m_grouped_bf16_gemm_nt_contiguous",
     "m_grouped_bf16_gemm_nt_masked": "m_grouped_bf16_gemm_nt_masked",
+    "m_grouped_int8_gemm_nt_masked": "m_grouped_gemm_int8_int8_bf16_nt_masked",
+    "grouped_gemm_nt_i8i8bf16_nopad": "m_grouped_gemm_int8_int8_bf16_nt_nopad",
+    "int8_gemm_nt": "gemm_int8_int8_bf16_nt",
 }
 
 _deep_gemm_impl_old_map = {
     "fp8_gemm_nt": "fp8_gemm_nt",
     "m_grouped_fp8_gemm_nt_contiguous": "m_grouped_fp8_gemm_nt_contiguous",
     "m_grouped_fp8_gemm_nt_masked": "fp8_m_grouped_gemm_nt_masked",
-    "bf16_gemm_nt": "bf16_gemm_nt",
-    "m_grouped_bf16_gemm_nt_contiguous": "m_grouped_bf16_gemm_nt_contiguous",
-    "m_grouped_bf16_gemm_nt_masked": "m_grouped_bf16_gemm_nt_masked",
+    "bf16_gemm_nt": "gemm_bf16_bf16_bf16_nt",
+    "m_grouped_bf16_gemm_nt_contiguous": "m_grouped_gemm_bf16_bf16_bf16_nt_contiguous",
+    "m_grouped_bf16_gemm_nt_masked": "m_grouped_gemm_bf16_bf16_bf16_nt_masked",
+    "m_grouped_int8_gemm_nt_masked": "m_grouped_gemm_int8_int8_bf16_nt_masked",
+    "grouped_gemm_nt_i8i8bf16_nopad": "m_grouped_gemm_int8_int8_bf16_nt_nopad",
+    "int8_gemm_nt": "gemm_int8_int8_bf16_nt",
 }
 
 
@@ -46,6 +57,9 @@ _m_grouped_fp8_gemm_nt_masked_impl: Callable[..., Any] | None = None
 _bf16_gemm_nt_impl: Callable[..., Any] | None = None
 _m_grouped_bf16_gemm_nt_contiguous_impl: Callable[..., Any] | None = None
 _m_grouped_bf16_gemm_nt_masked_impl: Callable[..., Any] | None = None
+_m_grouped_int8_gemm_nt_masked_impl: Callable[..., Any] | None = None
+_grouped_gemm_nt_i8i8bf16_nopad_impl: Callable[..., Any] | None = None
+_int8_gemm_nt_impl: Callable[..., Any] | None = None
 
 
 @functools.cache
@@ -90,6 +104,9 @@ def _lazy_init_deep_gemm(symbols: List[str]) -> None:
     """Import deep_gemm and resolve symbols on first use."""
     global _fp8_gemm_nt_impl, _m_grouped_fp8_gemm_nt_contiguous_impl, _m_grouped_fp8_gemm_nt_masked_impl
     global _bf16_gemm_nt_impl, _m_grouped_bf16_gemm_nt_contiguous_impl, _m_grouped_bf16_gemm_nt_masked_impl
+    global _m_grouped_int8_gemm_nt_masked_impl
+    global _grouped_gemm_nt_i8i8bf16_nopad_impl
+    global _int8_gemm_nt_impl
 
     symbol_impls = [f"_{symbol}_impl" for symbol in symbols]
     # check if the symbols are valid
@@ -131,11 +148,19 @@ def _lazy_init_deep_gemm_once():
             "bf16_gemm_nt",
             "m_grouped_bf16_gemm_nt_contiguous",
             "m_grouped_bf16_gemm_nt_masked",
+            "m_grouped_int8_gemm_nt_masked",
+            "grouped_gemm_nt_i8i8bf16_nopad",
+            "int8_gemm_nt",
         ]
     )
 
 
 _lazy_init_deep_gemm_once()
+
+
+def has_bf16_masked_deep_gemm() -> bool:
+    """Whether the installed DeepGEMM exports masked grouped BF16 GEMM."""
+    return _m_grouped_bf16_gemm_nt_masked_impl is not None
 
 
 @triton.jit
@@ -529,7 +554,12 @@ def bf16_gemm_nt(
     global _bf16_gemm_nt_impl
     if _bf16_gemm_nt_impl is None:
         return _missing_deep_gemm()
-    _bf16_gemm_nt_impl(a, b, output, c, compiled_dims)
+    if is_ppu():
+        if c is not None:
+            raise NotImplementedError("PPU BF16 DeepGEMM does not support bias")
+        _bf16_gemm_nt_impl(a, b, output)
+    else:
+        _bf16_gemm_nt_impl(a, b, output, c, compiled_dims)
 
 
 def m_grouped_bf16_gemm_nt_contiguous(
@@ -552,13 +582,16 @@ def m_grouped_bf16_gemm_nt_contiguous(
     global _m_grouped_bf16_gemm_nt_contiguous_impl
     if _m_grouped_bf16_gemm_nt_contiguous_impl is None:
         return _missing_deep_gemm()
-    _m_grouped_bf16_gemm_nt_contiguous_impl(
-        a,
-        b,
-        output,
-        m_indices,
-        compiled_dims,
-    )
+    if is_ppu():
+        _m_grouped_bf16_gemm_nt_contiguous_impl(a, b, output, m_indices)
+    else:
+        _m_grouped_bf16_gemm_nt_contiguous_impl(
+            a,
+            b,
+            output,
+            m_indices,
+            compiled_dims,
+        )
 
 
 def m_grouped_bf16_gemm_nt_masked(
@@ -582,11 +615,76 @@ def m_grouped_bf16_gemm_nt_masked(
     global _m_grouped_bf16_gemm_nt_masked_impl
     if _m_grouped_bf16_gemm_nt_masked_impl is None:
         return _missing_deep_gemm()
-    _m_grouped_bf16_gemm_nt_masked_impl(
+    if is_ppu():
+        _m_grouped_bf16_gemm_nt_masked_impl(a, b, output, masked_m, expected_m)
+    else:
+        _m_grouped_bf16_gemm_nt_masked_impl(
+            a,
+            b,
+            output,
+            masked_m,
+            expected_m,
+            compiled_dims,
+        )
+
+
+def m_grouped_int8_gemm_nt_masked(
+    a: Tuple[torch.Tensor, torch.Tensor],
+    b: Tuple[torch.Tensor, torch.Tensor],
+    output: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+) -> None:
+    """Execute grouped INT8 GEMM (A * B^T) with masked layout.
+
+    Args:
+        a (Tuple[torch.Tensor, torch.Tensor]): INT8 data and per-token scales for the first matrix.
+        b (Tuple[torch.Tensor, torch.Tensor]): INT8 data and per-channel scales for the second matrix.
+        output (torch.Tensor): Output tensor (BF16).
+        masked_m (torch.Tensor): The number of valid tokens in each group.
+        expected_m (int): Expected number of valid tokens in each group.
+    """
+    global _m_grouped_int8_gemm_nt_masked_impl
+    if _m_grouped_int8_gemm_nt_masked_impl is None:
+        return _missing_deep_gemm()
+    _m_grouped_int8_gemm_nt_masked_impl(
         a,
         b,
         output,
         masked_m,
         expected_m,
-        compiled_dims,
     )
+
+
+def grouped_gemm_nt_i8i8bf16_nopad(
+    a: Tuple[torch.Tensor, torch.Tensor],
+    b: Tuple[torch.Tensor, torch.Tensor],
+    output: torch.Tensor,
+    m_indices: torch.Tensor,
+    m_rows: Optional[torch.Tensor] = None,
+) -> None:
+    """Run grouped INT8 GEMM on contiguous expert rows without padding."""
+    global _grouped_gemm_nt_i8i8bf16_nopad_impl
+    if _grouped_gemm_nt_i8i8bf16_nopad_impl is None:
+        return _missing_deep_gemm()
+    _grouped_gemm_nt_i8i8bf16_nopad_impl(a, b, output, m_indices, m_rows)
+
+
+def int8_gemm_nt(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+) -> None:
+    """Execute single INT8 GEMM (A * B^T) with per-token/per-channel scales.
+
+    Computes: out[M,N] = dequant(lhs_int8[M,K]) @ dequant(rhs_int8[N,K]).T
+
+    Args:
+        lhs (Tuple[torch.Tensor, torch.Tensor]): (activation_int8 [M, K], per_token_scale [M])
+        rhs (Tuple[torch.Tensor, torch.Tensor]): (weight_int8 [N, K], per_channel_scale [N])
+        out (torch.Tensor): BF16 output tensor [M, N]
+    """
+    global _int8_gemm_nt_impl
+    if _int8_gemm_nt_impl is None:
+        return _missing_deep_gemm()
+    _int8_gemm_nt_impl(lhs, rhs, out)

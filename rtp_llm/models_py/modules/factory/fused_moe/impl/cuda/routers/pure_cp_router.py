@@ -23,9 +23,7 @@ from rtp_llm.models_py.distributed.collective_torch import (
     reduce_scatter,
 )
 from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import is_deep_gemm_e8m0_used
-from rtp_llm.models_py.kernels.cuda.fp8_kernel import (
-    sgl_per_token_group_quant_fp8,
-)
+from rtp_llm.models_py.kernels.cuda.fp8_kernel import sgl_per_token_group_quant_fp8
 from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
     MoEConfigAdapter,
 )
@@ -165,3 +163,35 @@ class PureCpRouterFp8PerBlock(PureCpRouterBase):
             )
         else:
             return trt_fp8_quantize_128(a1, False)
+
+
+class PureCpRouterInt8PerChannel(PureCpRouterBase):
+    """Pure CP router for compressed INT8 per-channel MoE weights."""
+
+    @classmethod
+    def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
+        super().check_conditions(checker, config)
+        resolver = MoeConfigResolver()
+        checker.check(
+            resolver.get_quant_method(config) == "INT8_PER_CHANNEL_COMPRESSED"
+        )
+
+    def prepare(
+        self,
+        a1: torch.Tensor,
+        a1_scale: Optional[torch.Tensor],
+        a2_scale: Optional[torch.Tensor],
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> ExpertForwardPayload:
+        payload = super().prepare(a1, a1_scale, a2_scale, topk_weights, topk_ids)
+        # INT8 executor expects local expert ids (recompute_topk_ids_sum_expert_count
+        # in the base class already converts global ids to local). Set this flag
+        # so the executor skips its own global-to-local conversion.
+        payload.expert_ids_are_local = True
+        return payload
+
+    def _do_quant(
+        self, a1: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        return a1, None

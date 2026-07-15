@@ -3,10 +3,12 @@ import itertools
 import os
 import random
 import time
+from dataclasses import replace
 from functools import partial
+from types import SimpleNamespace
 from typing import Any, Dict, Tuple
 from unittest import TestCase, main
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 import torch.distributed as dist
@@ -37,6 +39,7 @@ from rtp_llm.ops import (
     MoeConfig,
     NcclCommConfig,
     ParallelismConfig,
+    SpeculativeType,
 )
 from rtp_llm.server.server_args.server_args import setup_args
 from rtp_llm.test.utils.bench_util import bench, bench_kineto
@@ -91,6 +94,55 @@ class DeepEPTest(TestCase):
 
     def setUp(self) -> None:
         pass
+
+    @patch(
+        "rtp_llm.models_py.distributed.deepep_wrapper.allow_mnnvl",
+        return_value=False,
+    )
+    @patch.object(DeepEPWrapper, "create")
+    @patch.object(DeepEPWrapper, "supported", return_value=True)
+    def test_mtp_low_latency_allocates_for_bf16_draft(
+        self,
+        _mock_supported: Any,
+        mock_create: Any,
+        _mock_allow_mnnvl: Any,
+    ) -> None:
+        model_config = ModelConfig()
+        model_config.hidden_size = 5120
+        model_config.expert_num = 160
+        model_config.moe_k = 8
+        model_config.quant_config = MagicMock()
+        model_config.quant_config.is_quanted.return_value = True
+        model_config.quant_config.get_method.return_value = (
+            "INT8_PER_CHANNEL_COMPRESSED"
+        )
+
+        parallelism_config = ParallelismConfig()
+        parallelism_config.tp_size = 1
+        parallelism_config.dp_size = 8
+        parallelism_config.ep_size = 8
+        parallelism_config.world_size = 8
+        moe_config = MoeConfig()
+        moe_config.use_deepep_low_latency = True
+        moe_config.ll_num_max_token = 48
+        engine_config = SimpleNamespace(
+            hw_kernel_config=None,
+            parallelism_config=parallelism_config,
+            moe_config=moe_config,
+            runtime_config=SimpleNamespace(max_generate_batch_size=8),
+            sp_config=SimpleNamespace(
+                type=SpeculativeType.MTP,
+                gen_num_per_cycle=5,
+            ),
+        )
+
+        init_deepep_wrapper(engine_config, model_config)
+
+        initialized_config = mock_create.call_args.args[0]
+        self.assertEqual(initialized_config.ll_num_max_token_per_rank, 64)
+        target_request = replace(initialized_config, ll_num_max_token_per_rank=48)
+        self.assertTrue(initialized_config.can_serve(target_request))
+        self.assertFalse(target_request.can_serve(initialized_config))
 
     @staticmethod
     def _test_intranode_main(

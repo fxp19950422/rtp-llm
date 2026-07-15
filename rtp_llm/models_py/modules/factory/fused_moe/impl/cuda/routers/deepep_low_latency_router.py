@@ -1,8 +1,10 @@
+import logging
 import os
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 
+from rtp_llm.device.device_type import is_ppu
 from rtp_llm.models_py.distributed.collective_torch import Group, all_gather
 from rtp_llm.models_py.distributed.deepep_wrapper import (
     DeepEPMode,
@@ -25,6 +27,8 @@ from rtp_llm.models_py.modules.factory.fused_moe.defs.quant_config import (
 from rtp_llm.models_py.modules.factory.fused_moe.defs.type import RouterType
 from rtp_llm.models_py.utils.arch import get_sm
 
+logger = logging.getLogger(__name__)
+
 # DeepEP kernels quantize dispatch inputs in 128 element chunks.
 DEEPEP_QUANT_BLOCK_SIZE = 128
 # DeepEP Low-Latency supports hidden sizes
@@ -43,6 +47,14 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
         return RouterType.DEEPEP_LOW_LATENCY
 
     @classmethod
+    def _sm_check(cls) -> bool:
+        """SM version check for DeepEP support.
+
+        Override in subclasses to relax for specific hardware (e.g. PPU).
+        """
+        return get_sm()[0] >= 9
+
+    @classmethod
     def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
         """Check if DeepEpLowLatencyRouter can handle the configuration"""
         from rtp_llm.models_py.modules.factory.fused_moe.utils.config_resolver import (
@@ -50,7 +62,7 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
         )
 
         resolver = MoeConfigResolver()
-        checker.check(get_sm()[0] >= 9)
+        checker.check(cls._sm_check())
         checker.check(resolver.is_ep_enabled(config))
         checker.check(resolver.use_low_latency(config))
         checker.check(DeepEPWrapper.supported())
@@ -86,6 +98,11 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
         self._num_topk = wrapper.num_topk
         self._num_max_dispatch_tokens_per_rank = wrapper.ll_num_max_token_per_rank
         self._use_fp8_dispatch = use_fp8_dispatch
+        # M2: INT8 dispatch passthrough (transmit int8+scale over DeepEP LL to halve
+        # comm and skip re-quant in the masked executor). Base default off; the int8
+        # subclass turns it on under an env gate. quant_size=hidden means channel-wise.
+        self._use_int8_dispatch = False
+        self._int8_quant_size = 0
         self._zero_copy = False
         self._async_finish = False
         self._return_recv_hook = False
@@ -152,6 +169,12 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
         )
         if self._use_fp8_dispatch:
             assert isinstance(expert_x, tuple), "expert_x should be a tuple"
+            expert_x, expert_x_scale = expert_x[0], expert_x[1]
+        elif self._use_int8_dispatch:
+            # DeepEP LL int8 dispatch returns (int8_tensor, scale_tensor).
+            assert isinstance(
+                expert_x, tuple
+            ), "int8 dispatch expert_x should be a tuple"
             expert_x, expert_x_scale = expert_x[0], expert_x[1]
         else:
             assert isinstance(expert_x, torch.Tensor), "expert_x should be a tensor"
@@ -229,6 +252,11 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
             dispatch_args.update({"round_scale": True, "use_ue8m0": True})
         elif self.quant_config.is_per_act_token:
             dispatch_args.update({"pertoken_quant": True})
+        # M2: enable int8 dispatch passthrough (channel-wise, quant_size=hidden_size)
+        if self._use_int8_dispatch:
+            dispatch_args.update(
+                {"use_int8": True, "quant_size": self._int8_quant_size or hidden_size}
+            )
 
         # Normal prepare
         expert_payload = self._normal_prepare(dispatch_args, tp_topk_weights)
@@ -310,7 +338,21 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
             "async_finish": self._async_finish,
             "return_recv_hook": self._return_recv_hook,
         }
-        if self._use_accl_ep:
+        if self._use_int8_dispatch:
+            combine_args.update(
+                {
+                    "use_int8": True,
+                    "quant_size": self._int8_quant_size
+                    or payload.fused_expert_output.size(-1),
+                }
+            )
+        # PPU's DeepEP low_latency_combine() does not accept opt_level parameter.
+        # This is a known limitation of the PPU DeepEP build (ppu2.1.0, SM 8.0).
+        # TODO: Remove this workaround once PPU DeepEP build is upgraded to support opt_level.
+        # The opt_level parameter controls kernel optimization level in DeepEP's
+        # All-to-All combine. On non-PPU (SM >= 90) devices, it enables fused kernel
+        # optimizations. PPU uses a different code path that doesn't support it.
+        if self._use_accl_ep and not is_ppu():
             combine_args.update({"opt_level": self._opt_level})
 
         # Normal finalize
@@ -322,3 +364,43 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
         self._handle = None
 
         return combined_x
+
+
+class DeepEpLowLatencyRouterNoQuant(DeepEpLowLatencyRouter):
+    """BF16 DeepEP low-latency router with PPU hardware support."""
+
+    @classmethod
+    def _sm_check(cls) -> bool:
+        return is_ppu() or get_sm()[0] >= 9
+
+
+class DeepEpLowLatencyRouterInt8PerChannel(DeepEpLowLatencyRouter):
+    """DeepEP Low Latency router for INT8 per-channel quantization.
+
+    Relaxes the SM >= 9 requirement for PPU devices, since the INT8
+    executor (Int8PerChannelMaskedExecutor) has no SM version requirement.
+    """
+
+    @classmethod
+    def _sm_check(cls) -> bool:
+        # PPU has its own DeepEP build (ppu2.1.0) that works on SM 8.0;
+        # INT8 executor has no SM >= 9 requirement, so allow PPU.
+        return is_ppu() or get_sm()[0] >= 9
+
+    def __init__(
+        self,
+        config: MoEConfigAdapter,
+        quant_config: FusedMoEQuantConfig,
+    ):
+        super().__init__(config, quant_config)
+        # M2: opt-in int8 dispatch passthrough (halves DeepEP LL comm, skips executor
+        # re-quant). Env-gated (default off) to preserve the verified M1 bf16-dispatch
+        # path; channel-wise quant uses quant_size=hidden_size.
+        self._use_int8_dispatch = os.environ.get("RTP_PPU_INT8_DISPATCH", "0") == "1"
+        self._int8_quant_size = getattr(config, "hidden_size", 0) or 0
+        if self._use_int8_dispatch:
+            logger.info(
+                "DeepEP LL INT8 dispatch and combine passthrough ENABLED "
+                "(quant_size=%d)",
+                self._int8_quant_size,
+            )

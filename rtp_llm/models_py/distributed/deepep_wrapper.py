@@ -9,7 +9,7 @@ import logging
 import os
 import platform
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from enum import IntEnum, auto
 from typing import Optional, Tuple
 
@@ -176,11 +176,23 @@ class DeepepWrapperConfig:
             and self.ll_num_max_token_per_rank == other.ll_num_max_token_per_rank
         )
 
+    def can_serve(self, requested: "DeepepWrapperConfig") -> bool:
+        """Return whether this initialized buffer can serve a router request."""
+        same_non_capacity_fields = all(
+            getattr(self, field.name) == getattr(requested, field.name)
+            for field in fields(self)
+            if field.name != "ll_num_max_token_per_rank"
+        )
+        return (
+            same_non_capacity_fields
+            and self.ll_num_max_token_per_rank >= requested.ll_num_max_token_per_rank
+        )
+
     @staticmethod
     def calc_low_latency_max_token_per_rank(
         ll_num_max_token: int,
         tp_size: int,
-        quant_config: QuantizationConfig,
+        quant_config: Optional[QuantizationConfig],
     ) -> int:
         ll_num_max_token_per_rank = (ll_num_max_token + tp_size - 1) // tp_size
         # deepgemm masked with max_m < 64 get incorrect result, related: https://github.com/deepseek-ai/DeepGEMM/issues/268
@@ -193,6 +205,7 @@ class DeepepWrapperConfig:
             "FP8_DYNAMIC_PER_TENSOR",
             "W4A8_INT4_PER_CHANNEL",
             "W4A8_INT4_PER_CHANNEL_COMPRESSED",
+            "INT8_PER_CHANNEL_COMPRESSED",
         )
         is_per_group_fp4 = (
             quant_config is not None and quant_config.get_method() == "modelopt_fp4"
@@ -308,7 +321,7 @@ class DeepEPWrapper:
                 raise RuntimeError(
                     "DeepEP state is inconsistent, _initialized is True but _instance is None"
                 )
-            if not cls._instance._config.equal(config):
+            if not cls._instance._config.can_serve(config):
                 raise RuntimeError(
                     "DeepEP already initialized with different config, origin: {}, new: {}".format(
                         cls._instance._config, config
@@ -661,6 +674,19 @@ def init_deepep_wrapper(
                 model_config.quant_config,
             )
         )
+        if engine_config.sp_config.type != SpeculativeType.NONE:
+            # The target and BF16 draft share one DeepEP singleton. Allocate the
+            # larger aligned capacity so both router configurations are safe.
+            draft_max_token_per_rank = (
+                DeepepWrapperConfig.calc_low_latency_max_token_per_rank(
+                    ll_num_max_token,
+                    engine_config.parallelism_config.tp_size,
+                    None,
+                )
+            )
+            ll_num_max_token_per_rank = max(
+                ll_num_max_token_per_rank, draft_max_token_per_rank
+            )
 
     deepep_config = DeepepWrapperConfig.from_config_adapter(
         deepep_config_adapter, ll_num_max_token_per_rank

@@ -353,6 +353,12 @@ def per_token_group_quant_int8(input: torch.Tensor, output_q: torch.Tensor, outp
     """
     Int8 Gemm Per Token Group
     """
+def per_token_group_quant_int8_v2(input: torch.Tensor, output_q: torch.Tensor, output_s: torch.Tensor, group_size: int, eps: float, int8_min: float, int8_max: float, scale_ue8m0: bool, fuse_silu_and_mul: bool, masked_m: torch.Tensor | None) -> None:
+    """
+    Int8 Gemm Per Token Group v2 (fused SiLU+mul)
+    """
+def silu_mul_quant_int8_glm(input: torch.Tensor, output_q: torch.Tensor, output_s: torch.Tensor, hidden_size: int, eps: float, int8_min: float, int8_max: float) -> None:
+    """GLM INT8 fused SiLU(gate)*up and per-token quant."""
 def per_token_quant_fp8(input: torch.Tensor, output_q: torch.Tensor, output_s: torch.Tensor) -> None:
     ...
 def prepare_sparse_mla_params(attention_inputs: librtp_compute_ops.PyAttentionInputs, seq_size_per_block: int) -> SparseMlaParams:
@@ -427,4 +433,3 @@ class TrtllmArFusionHandle:
         """
         AllReduce kernel
         """
-

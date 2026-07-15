@@ -364,6 +364,35 @@ class DeepepNormalRouterW4a8Int4PerChannel(DeepepNormalRouterBase):
         )
 
 
+class DeepepNormalRouterInt8PerChannel(DeepepNormalRouterBase):
+    """DeepEP normal router for INT8 per-channel quantization.
+
+    Dispatches BF16 activations (no quantization during dispatch).
+    INT8 quantization happens inside the executor for GEMM computation.
+    """
+
+    @classmethod
+    def _sm_check(cls) -> bool:
+        # PPU has its own DeepEP build (ppu2.1.0) that works on SM 8.0;
+        # INT8 executor has no SM >= 9 requirement, so allow PPU.
+        return is_ppu() or get_sm()[0] >= 9
+
+    def __init__(
+        self,
+        config: MoEConfigAdapter,
+        quant_config: FusedMoEQuantConfig,
+    ):
+        super().__init__(config, quant_config, expert_alignment=1)
+
+    @classmethod
+    def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
+        """Check if DeepepNormalRouterInt8PerChannel can handle the configuration"""
+        super().check_conditions(checker, config)
+        resolver = MoeConfigResolver()
+        quant_method = resolver.get_quant_method(config)
+        checker.check(quant_method == "INT8_PER_CHANNEL_COMPRESSED")
+
+
 class DeepepNormalRouterFp4PerGroup(DeepepNormalRouterBase):
     """DeepEP normal router with FP4 per-group quantization."""
 

@@ -1,6 +1,8 @@
 # type: ignore
 import logging
 import os
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 import torch.distributed
@@ -28,6 +30,7 @@ from rtp_llm.models_py.modules.factory.fused_moe.defs.quant_config import (
 )
 from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.deepep_low_latency_router import (
     DeepEpLowLatencyRouter,
+    DeepEpLowLatencyRouterInt8PerChannel,
 )
 from rtp_llm.ops import MoeConfig, NcclCommConfig, ParallelismConfig, RuntimeConfig
 from rtp_llm.test.utils.numeric_util import per_token_cast_back
@@ -37,6 +40,106 @@ NUM_TOKEN_PER_RANK = 64
 HIDDEN_SIZE = 7168
 TOPK = 8
 NUM_EXPERTS = 128
+
+
+class _RecordingLowLatencyBuffer:
+    def __init__(self):
+        self.dispatch_args = None
+        self.combine_args = None
+
+    def low_latency_dispatch(self, **kwargs):
+        self.dispatch_args = kwargs
+        hidden_size = kwargs["x"].size(-1)
+        expert_x = torch.ones((1, 1, hidden_size), dtype=torch.int8)
+        expert_x_scale = torch.ones((1, 1, 1), dtype=torch.float32)
+        return (
+            (expert_x, expert_x_scale),
+            torch.ones(1, dtype=torch.int32),
+            ("handle",),
+            None,
+            None,
+        )
+
+    def low_latency_combine(self, **kwargs):
+        self.combine_args = kwargs
+        hidden_size = kwargs["x"].size(-1)
+        combined_x = torch.ones((1, hidden_size), dtype=torch.bfloat16)
+        return combined_x, None, None
+
+
+def _make_int8_contract_router(hidden_size=5120):
+    router = object.__new__(DeepEpLowLatencyRouter)
+    router.config = SimpleNamespace(tp_size=1, tp_rank=0, ep_size=8)
+    router.quant_config = FusedMoEQuantConfig(quant_dtype=None)
+    router._buffer = _RecordingLowLatencyBuffer()
+    router._num_topk = TOPK
+    router._num_experts = 160
+    router._num_max_dispatch_tokens_per_rank = 1
+    router._use_fp8_dispatch = False
+    router._use_int8_dispatch = True
+    router._int8_quant_size = hidden_size
+    router._zero_copy = False
+    router._async_finish = False
+    router._return_recv_hook = False
+    router._use_accl_ep = True
+    router._opt_level = 1
+    router._handle = None
+    return router
+
+
+def test_int8_passthrough_forwards_dispatch_and_combine_contract():
+    hidden_size = 5120
+    router = _make_int8_contract_router(hidden_size)
+    hidden_states = torch.ones((1, hidden_size), dtype=torch.bfloat16)
+    topk_ids = torch.arange(TOPK, dtype=torch.int32).reshape(1, TOPK)
+    topk_weights = torch.full((1, TOPK), 1.0 / TOPK, dtype=torch.float32)
+
+    payload = router.prepare(hidden_states, None, None, topk_weights, topk_ids)
+
+    assert payload.expert_x.dtype == torch.int8
+    assert payload.expert_x_scale is not None
+    assert router._buffer.dispatch_args["use_int8"] is True
+    assert router._buffer.dispatch_args["quant_size"] == hidden_size
+
+    with mock.patch(
+        "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers."
+        "deepep_low_latency_router.is_ppu",
+        return_value=True,
+    ):
+        combined_x = router.finalize(
+            CombineForwardPayload(
+                fused_expert_output=torch.ones(
+                    (1, 1, hidden_size), dtype=torch.bfloat16
+                )
+            ),
+            topk_weights,
+            topk_ids,
+            False,
+            {"original_num_tokens": 1},
+        )
+
+    assert combined_x.shape == (1, hidden_size)
+    assert router._buffer.combine_args["use_int8"] is True
+    assert router._buffer.combine_args["quant_size"] == hidden_size
+    assert "opt_level" not in router._buffer.combine_args
+    assert router.handle is None
+
+
+def test_int8_passthrough_env_gate_defaults_off_and_accepts_one():
+    def initialize_base(instance, config, quant_config):
+        instance._use_int8_dispatch = False
+        instance._int8_quant_size = 0
+
+    config = SimpleNamespace(hidden_size=5120)
+    with mock.patch.object(DeepEpLowLatencyRouter, "__init__", initialize_base):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            router = DeepEpLowLatencyRouterInt8PerChannel(config, mock.Mock())
+            assert router._use_int8_dispatch is False
+
+        with mock.patch.dict(os.environ, {"RTP_PPU_INT8_DISPATCH": "1"}):
+            router = DeepEpLowLatencyRouterInt8PerChannel(config, mock.Mock())
+            assert router._use_int8_dispatch is True
+            assert router._int8_quant_size == 5120
 
 
 def _init_router(

@@ -11,8 +11,10 @@ from rtp_llm.models_py.utils.arch import get_sm, is_cuda
 
 # Register CUDA strategies
 from .f16_linear import CudaF16Linear
+from .int8_per_channel_linear import Int8PerChannelLinear
 
 LinearFactory.register(CudaF16Linear)
+LinearFactory.register(Int8PerChannelLinear)
 
 if is_cuda():
     from .fp8_gemm_linear import CudaFp8GEMMLinear

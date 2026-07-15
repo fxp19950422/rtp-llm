@@ -142,6 +142,31 @@ void registerBasicCudaOps(py::module& rtp_ops_m) {
                   py::arg("fuse_silu_and_mul"),
                   py::arg("masked_m"));
 
+    rtp_ops_m.def("per_token_group_quant_int8_v2",
+                  &per_token_group_quant_int8_v2,
+                  "Int8 Gemm Per Token Group v2 (fused SiLU+mul)",
+                  py::arg("input"),
+                  py::arg("output_q"),
+                  py::arg("output_s"),
+                  py::arg("group_size"),
+                  py::arg("eps"),
+                  py::arg("int8_min"),
+                  py::arg("int8_max"),
+                  py::arg("scale_ue8m0"),
+                  py::arg("fuse_silu_and_mul"),
+                  py::arg("masked_m"));
+
+    rtp_ops_m.def("silu_mul_quant_int8_glm",
+                  &silu_mul_quant_int8_glm,
+                  "GLM INT8 fused SiLU(gate)*up and per-token quant",
+                  py::arg("input"),
+                  py::arg("output_q"),
+                  py::arg("output_s"),
+                  py::arg("hidden_size"),
+                  py::arg("eps"),
+                  py::arg("int8_min"),
+                  py::arg("int8_max"));
+
     rtp_ops_m.def("embedding",
                   &embedding,
                   "Embedding lookup kernel",

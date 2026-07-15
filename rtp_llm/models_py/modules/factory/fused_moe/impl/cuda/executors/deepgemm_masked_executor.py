@@ -2,6 +2,7 @@ from typing import Any, Dict, Optional
 
 import torch
 
+from rtp_llm.device.device_type import is_ppu
 from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import (
     configure_deep_gemm_num_sms,
     is_deep_gemm_e8m0_used,
@@ -42,19 +43,28 @@ class DeepGemmMaskedExecutor(FusedMoeExpertExecutor):
         return ExecutorType.DEEPGEMM_MASKED
 
     @classmethod
+    def _sm_check(cls) -> bool:
+        return get_sm()[0] >= 9
+
+    @classmethod
+    def _kernel_check(cls) -> bool:
+        from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import has_deep_gemm
+
+        return has_deep_gemm()
+
+    @classmethod
     def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
         """Check if DeepGemmMaskedExecutor can handle the configuration"""
-        from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import has_deep_gemm
         from rtp_llm.models_py.modules.factory.fused_moe.utils.config_resolver import (
             MoeConfigResolver,
         )
 
         resolver = MoeConfigResolver()
-        checker.check(has_deep_gemm())
+        checker.check(cls._kernel_check())
         checker.check(resolver.is_bf16(config))
         quant_method = resolver.get_quant_method(config)
         checker.check(quant_method in [None, "FP8_PER_BLOCK"])
-        checker.check(get_sm()[0] >= 9)
+        checker.check(cls._sm_check())
 
     def __init__(
         self,
@@ -502,3 +512,19 @@ class DeepGemmMaskedExecutor(FusedMoeExpertExecutor):
                 apply_router_weight_on_input,
                 extra_expert_args,
             )
+
+
+class DeepGemmMaskedExecutorNoQuant(DeepGemmMaskedExecutor):
+    """BF16 masked DeepGEMM executor with PPU hardware support."""
+
+    @classmethod
+    def _sm_check(cls) -> bool:
+        return is_ppu() or get_sm()[0] >= 9
+
+    @classmethod
+    def _kernel_check(cls) -> bool:
+        from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import (
+            has_bf16_masked_deep_gemm,
+        )
+
+        return has_bf16_masked_deep_gemm()

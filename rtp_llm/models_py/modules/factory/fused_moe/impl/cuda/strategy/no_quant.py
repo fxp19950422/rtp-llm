@@ -43,16 +43,16 @@ class CudaNoQuantEpLowLatencyStrategy(MoeStrategy):
 
     def get_attributes(self) -> StrategyAttributes:
         from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.deepgemm_masked_executor import (
-            DeepGemmMaskedExecutor,
+            DeepGemmMaskedExecutorNoQuant,
         )
         from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.deepep_low_latency_router import (
-            DeepEpLowLatencyRouter,
+            DeepEpLowLatencyRouterNoQuant,
         )
 
         quant_config = FusedMoEQuantConfig(quant_dtype=None)
         return StrategyAttributes(
-            router_class=DeepEpLowLatencyRouter,
-            executor_class=DeepGemmMaskedExecutor,
+            router_class=DeepEpLowLatencyRouterNoQuant,
+            executor_class=DeepGemmMaskedExecutorNoQuant,
             quant_config=quant_config,
         )
 

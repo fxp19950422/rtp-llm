@@ -8,6 +8,7 @@
 // #include "utils.h"
 #include "vec_dtypes.cuh"
 #include "util.h"
+#include "scaled_fp8_quant_utils.h"
 namespace rtp_llm {
 
 template<int THREADS_PER_SUBWARP>
@@ -530,5 +531,99 @@ void sgl_per_token_group_quant_8bit_v2(
 
 #undef LAUNCH_KERNEL
 #undef LAUNCH_KERNEL_INNER
+}
+
+template<typename T, typename DST_DTYPE>
+__global__ void silu_mul_quant_int8_glm_kernel(const T* __restrict__ input,
+                                               DST_DTYPE* __restrict__ output_q,
+                                               float* __restrict__ output_s,
+                                               const int   hidden_size,
+                                               const float eps,
+                                               const float min_8bit,
+                                               const float max_8bit) {
+    constexpr int VEC_SIZE = 16 / sizeof(T);
+    const int     row_id   = blockIdx.x;
+
+    const T*   row_input = input + static_cast<int64_t>(row_id) * hidden_size * 2;
+    DST_DTYPE* row_out   = output_q + static_cast<int64_t>(row_id) * hidden_size;
+    // GLM-4.7 checkpoint conversion stores GEMM1 output as [up, gate].
+    const T* up_input   = row_input;
+    const T* gate_input = row_input + hidden_size;
+
+    const int num_vec_elems = hidden_size / VEC_SIZE;
+    float     local_absmax  = eps;
+    for (int i = threadIdx.x; i < num_vec_elems; i += blockDim.x) {
+        rtp_llm::vec_t<T, VEC_SIZE> up_vec;
+        rtp_llm::vec_t<T, VEC_SIZE> gate_vec;
+        up_vec.cast_load(up_input + i * VEC_SIZE);
+        gate_vec.cast_load(gate_input + i * VEC_SIZE);
+#pragma unroll
+        for (int j = 0; j < VEC_SIZE; ++j) {
+            const float value = silu(static_cast<float>(gate_vec[j])) * static_cast<float>(up_vec[j]);
+            local_absmax      = fmaxf(local_absmax, fabsf(value));
+        }
+    }
+
+    local_absmax = blockReduceMax(local_absmax);
+    __shared__ float row_scale;
+    if (threadIdx.x == 0) {
+        row_scale        = fmaxf(local_absmax / max_8bit, eps);
+        output_s[row_id] = row_scale;
+    }
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < num_vec_elems; i += blockDim.x) {
+        rtp_llm::vec_t<T, VEC_SIZE> up_vec;
+        rtp_llm::vec_t<T, VEC_SIZE> gate_vec;
+        up_vec.cast_load(up_input + i * VEC_SIZE);
+        gate_vec.cast_load(gate_input + i * VEC_SIZE);
+#pragma unroll
+        for (int j = 0; j < VEC_SIZE; ++j) {
+            const float value         = silu(static_cast<float>(gate_vec[j])) * static_cast<float>(up_vec[j]);
+            const float quantized     = fminf(fmaxf(value / row_scale, min_8bit), max_8bit);
+            row_out[i * VEC_SIZE + j] = DST_DTYPE(quantized);
+        }
+    }
+}
+
+void silu_mul_quant_int8_glm(torch::Tensor input,
+                             torch::Tensor output_q,
+                             torch::Tensor output_s,
+                             int64_t       hidden_size,
+                             double        eps,
+                             double        int8_min,
+                             double        int8_max) {
+    CHECK_INPUT(input);
+    CHECK_INPUT(output_q);
+    CHECK_INPUT(output_s);
+    TORCH_CHECK(input.numel() > 0);
+    TORCH_CHECK(input.dim() == 2, "input must be 2D [M, 2 * hidden_size]");
+    TORCH_CHECK(output_q.dim() == 2, "output_q must be 2D [M, hidden_size]");
+    TORCH_CHECK(output_s.dim() == 2, "output_s must be 2D [M, 1]");
+    TORCH_CHECK(input.size(0) == output_q.size(0));
+    TORCH_CHECK(output_s.size(0) == output_q.size(0) && output_s.size(1) == 1);
+    TORCH_CHECK(input.size(1) == hidden_size * 2);
+    TORCH_CHECK(output_q.size(1) == hidden_size);
+    TORCH_CHECK(hidden_size % (16 / input.element_size()) == 0);
+    TORCH_CHECK(output_q.scalar_type() == at::ScalarType::Char);
+    TORCH_CHECK(output_s.scalar_type() == at::ScalarType::Float);
+    CHECK_EQ(-128.0, int8_min);
+    CHECK_EQ(127.0, int8_max);
+
+    const int    rows = static_cast<int>(input.size(0));
+    const dim3   grid(rows);
+    const dim3   block(256);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    DISPATCH_PYTORCH_DTYPE_TO_CTYPE_FLOAT_FP16(input.scalar_type(), scalar_t, [&] {
+        silu_mul_quant_int8_glm_kernel<scalar_t, int8_t>
+            <<<grid, block, 0, stream>>>(static_cast<scalar_t*>(input.data_ptr()),
+                                         static_cast<int8_t*>(output_q.data_ptr()),
+                                         static_cast<float*>(output_s.data_ptr()),
+                                         static_cast<int>(hidden_size),
+                                         static_cast<float>(eps),
+                                         static_cast<float>(int8_min),
+                                         static_cast<float>(int8_max));
+        return true;
+    });
 }
 }  // namespace rtp_llm

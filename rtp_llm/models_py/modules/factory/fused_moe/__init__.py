@@ -47,9 +47,9 @@ if device_type == DeviceType.ROCm:
         RocmBf16PureTPStrategy,
         RocmEpLowLatencyStrategy,
         RocmEpNormalStrategy,
-        RocmMXFp4PureTPStrategy,
         RocmFp8PerBlockPureTPStrategy,
         RocmFp8PerChannelPureTPStrategy,
+        RocmMXFp4PureTPStrategy,
     )
 
     registry = StrategyRegistry()
@@ -67,15 +67,19 @@ else:
 
     # MoE strategies
     from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.strategy import (
-        CudaFp8PerBlockPureCPStrategy,
-        CudaFp8PerBlockPureDPStrategy,
         CudaFp8PerBlockEpLowLatencyStrategy,
         CudaFp8PerBlockEpNormalStrategy,
         CudaFp8PerBlockNoDPMaskedStrategy,
         CudaFp8PerBlockNoDPStrategy,
+        CudaFp8PerBlockPureCPStrategy,
+        CudaFp8PerBlockPureDPStrategy,
         CudaFp8PerTensorEpLowLatencyStrategy,
         CudaFp8PerTensorEpNormalStrategy,
         CudaFp8PerTensorNoDPStrategy,
+        CudaInt8PerChannelCppStrategy,
+        CudaInt8PerChannelEpLowLatencyStrategy,
+        CudaInt8PerChannelEpNormalStrategy,
+        CudaInt8PerChannelPureCPStrategy,
         CudaNoQuantCppStrategy,
         CudaNoQuantDpNormalStrategy,
         CudaNoQuantEpLowLatencyStrategy,
@@ -98,6 +102,10 @@ else:
     registry.register(CudaNoQuantDpNormalStrategy())
     registry.register(CudaNoQuantCppStrategy())
     registry.register(BatchedTritonStrategy())
+    registry.register(CudaInt8PerChannelEpLowLatencyStrategy())
+    registry.register(CudaInt8PerChannelEpNormalStrategy())
+    registry.register(CudaInt8PerChannelPureCPStrategy())
+    registry.register(CudaInt8PerChannelCppStrategy())
     registry.register(CudaW4a8Int4PerChannelEpLowLatencyStrategy())
     registry.register(CudaW4a8Int4PerChannelEpNormalStrategy())
     registry.register(CudaW4a8Int4PerChannelNoDPStrategy())
