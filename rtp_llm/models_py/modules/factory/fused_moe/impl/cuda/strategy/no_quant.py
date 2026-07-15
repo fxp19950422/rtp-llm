@@ -1,5 +1,6 @@
 """CUDA strategies without quantization"""
 
+import logging
 from typing import Any
 
 import torch
@@ -18,9 +19,11 @@ from rtp_llm.models_py.modules.factory.fused_moe.utils.config_resolver import (
     MoeConfigResolver,
 )
 
+logger = logging.getLogger(__name__)
+
 
 class CudaNoQuantEpLowLatencyStrategy(MoeStrategy):
-    """CUDA EP low latency mode without quantization strategy"""
+    """Graph-safe BF16 DeepEP low-latency strategy used by MTP draft decode."""
 
     @classmethod
     def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
@@ -31,6 +34,12 @@ class CudaNoQuantEpLowLatencyStrategy(MoeStrategy):
             config.moe_strategy == "no_auant_ep_low_latency"
             or config.moe_strategy == "auto"
         )
+        if quant_method is None and config.enable_cuda_graph:
+            logger.info(
+                "BF16 EP Low Latency MoE with CUDA Graph enabled. "
+                "DeepGEMM masked execution has no host synchronization or fallback, "
+                "DeepEP LL uses static buffers, and TP=1 bypasses the post-combine all_gather."
+            )
 
     def get_attributes(self) -> StrategyAttributes:
         from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.deepgemm_masked_executor import (

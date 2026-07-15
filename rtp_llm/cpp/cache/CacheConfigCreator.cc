@@ -100,7 +100,8 @@ CacheConfig CacheConfigCreator::createSpConfig(const ModelConfig&               
 
     int num_mtp_modules = 1;
     if (is_mtp) {
-        num_mtp_modules = sp_config.gen_num_per_cycle;
+        // Decode steps reuse the same physical draft layers; they do not need separate KV caches.
+        num_mtp_modules = static_cast<int>(propose_config.layer_num);
         if (is_eagle) {
             num_mtp_modules = 1;
         }

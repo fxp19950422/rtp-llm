@@ -440,7 +440,12 @@ class DeepGemmMaskedExecutor(FusedMoeExpertExecutor):
         apply_router_weight_on_input: bool,
         extra_expert_args: Optional[dict[str, Any]],
     ) -> CombineForwardPayload:
-        """Execute Bf16 experts computation.
+        """Execute BF16 experts computation with CUDA Graph-safe tensor operations.
+
+        This path keeps token counts on device and delegates directly to the masked
+        DeepGEMM kernels. It must not add data-dependent CPU reads, ``.item()``,
+        ``nonzero()``, or Python fallback loops because MTP draft decode captures it.
+
         Args:
             payload (ExpertForwardPayload): Payload for expert computation.
             activation (str): Activation function.

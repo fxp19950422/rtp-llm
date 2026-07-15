@@ -252,10 +252,18 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
                 "[speculative decoding] enable_cuda_graph=%d (set ENABLE_CUDA_GRAPH=1 when starting server to enable sp_prefill_draft_model_)",
                 static_cast<int>(enable_cuda_graph));
             if (enable_cuda_graph) {
+#if USE_PPU
+                // Accepted token counts vary per request, while the draft-prefill graph is keyed only by the total
+                // token count. PPU FlashInfer requires an exact Q/qo_indptr layout, so reuse draft_model_'s eager
+                // prefill fallback here. Its single-token draft decode graph and the target verify graph stay enabled.
+                RTP_LLM_LOG_WARNING(
+                    "[speculative decoding] PPU uses eager MTP draft prefill because variable accept lengths are not graph-safe; draft decode and target verify CUDA graphs remain enabled");
+#else
                 RTP_LLM_LOG_INFO(
                     "[speculative decoding] creating separate prefill draft model with CUDA graph support");
                 sp_prefill_draft_model_.reset(new PyWrappedModel(
                     model_params, params.py_sp_model, true, false, draft_cache_layer_layout.layer_to_groups));
+#endif
             }
         }
         break;  // NOTE: only support one mtp model now

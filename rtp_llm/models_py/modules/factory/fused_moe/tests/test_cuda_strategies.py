@@ -28,6 +28,8 @@ from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.strategy import (
     CudaFp8PerBlockPureCPStrategy,
     CudaFp8PerBlockPureDPStrategy,
     CudaFp8PerTensorNoDPStrategy,
+    CudaNoQuantDpNormalStrategy,
+    CudaNoQuantEpLowLatencyStrategy,
     CudaW4a8Int4PerChannelNoDPStrategy,
 )
 from rtp_llm.ops import CPRotateMethod, MoeConfig, ParallelismConfig
@@ -180,6 +182,51 @@ class TestCudaNoQuantSingleGpuStrategy(unittest.TestCase):
 
         strategy = BatchedTritonStrategy()
         self.assertTrue(strategy.can_handle(config))
+
+
+class TestCudaNoQuantEpLowLatencyStrategy(unittest.TestCase):
+    def test_logs_graph_safe_path_when_cuda_graph_is_enabled(self) -> None:
+        config = create_moe_config_adapter(
+            model_config=create_model_config_without_quant(),
+            parallelism_config=create_parallelism_config(
+                ep_size=2, tp_size=1, dp_size=2
+            ),
+            moe_config=create_moe_config(moe_strategy="no_auant_ep_low_latency"),
+            enable_cuda_graph=True,
+        )
+
+        with patch(
+            "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.strategy.no_quant.logger"
+        ) as mock_logger:
+            CudaNoQuantEpLowLatencyStrategy.check_conditions(MagicMock(), config)
+
+        mock_logger.info.assert_called_once()
+
+    @patch(
+        "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.deepep_normal_router.DeepEPWrapper.supported",
+        return_value=True,
+    )
+    @patch(
+        "rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.deepep_normal_router.is_ppu",
+        return_value=True,
+    )
+    def test_can_handle_no_quant_normal_on_ppu(
+        self,
+        _mock_is_ppu: Any,
+        _mock_deepep_supported: Any,
+    ) -> None:
+        config = create_moe_config_adapter(
+            model_config=create_model_config_without_quant(),
+            parallelism_config=create_parallelism_config(
+                ep_size=8, tp_size=8, dp_size=1
+            ),
+            moe_config=create_moe_config(
+                use_deepep_low_latency=False, moe_strategy="auto"
+            ),
+            enable_cuda_graph=False,
+        )
+
+        self.assertTrue(CudaNoQuantDpNormalStrategy().can_handle(config))
 
 
 class TestCudaFp8PerBlockNoDPStrategy(unittest.TestCase):
@@ -566,7 +613,9 @@ class TestCudaFp8PerBlockPureCPStrategy(unittest.TestCase):
         self.assertTrue(strategy.can_handle(config))
 
     @patch("rtp_llm.models_py.kernels.cuda.deepgemm_wrapper.has_deep_gemm")
-    def test_can_handle_false_auto_falls_back_to_deepep(self, mock_has_deep_gemm: Any) -> None:
+    def test_can_handle_false_auto_falls_back_to_deepep(
+        self, mock_has_deep_gemm: Any
+    ) -> None:
         """moe_strategy=auto + pure CP+EP topology should NOT auto-select PureCP (falls back to DeepEP)."""
         mock_has_deep_gemm.return_value = True
 
@@ -685,7 +734,9 @@ class TestCudaFp8PerBlockPureDPStrategy(unittest.TestCase):
         self.assertTrue(strategy.can_handle(config))
 
     @patch("rtp_llm.models_py.kernels.cuda.deepgemm_wrapper.has_deep_gemm")
-    def test_can_handle_false_auto_falls_back_to_deepep(self, mock_has_deep_gemm: Any) -> None:
+    def test_can_handle_false_auto_falls_back_to_deepep(
+        self, mock_has_deep_gemm: Any
+    ) -> None:
         """moe_strategy=auto + pure DP+EP topology should NOT auto-select PureDP (falls back to DeepEP)."""
         mock_has_deep_gemm.return_value = True
 

@@ -2,6 +2,7 @@ from typing import Any, Dict, Optional, Tuple
 
 import torch
 
+from rtp_llm.device.device_type import is_ppu
 from rtp_llm.models_py.distributed.collective_torch import Group, all_gather
 from rtp_llm.models_py.distributed.deepep_wrapper import (
     DeepEPMode,
@@ -41,10 +42,18 @@ class DeepepNormalRouterBase(FusedMoeDataRouter):
         return RouterType.DEEPEP_NORMAL
 
     @classmethod
+    def _sm_check(cls) -> bool:
+        """SM version check for DeepEP support.
+
+        Override in subclasses to relax for specific hardware (e.g. PPU).
+        """
+        return get_sm()[0] >= 9
+
+    @classmethod
     def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
         """Check if DeepepNormalRouter can handle the configuration"""
         resolver = MoeConfigResolver()
-        checker.check(get_sm()[0] >= 9)
+        checker.check(cls._sm_check())
         checker.check(resolver.is_ep_enabled(config))
         checker.check(not resolver.use_low_latency(config))
         checker.check(DeepEPWrapper.supported())
@@ -271,6 +280,11 @@ class DeepepNormalRouterBase(FusedMoeDataRouter):
 
 class DeepepNormalRouterNoQuant(DeepepNormalRouterBase):
     """DeepEP normal router without quantization (for f16/bf16)."""
+
+    @classmethod
+    def _sm_check(cls) -> bool:
+        # PPU ships a DeepEP normal implementation for SM 8.0.
+        return is_ppu() or get_sm()[0] >= 9
 
     def __init__(
         self,
