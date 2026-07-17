@@ -488,13 +488,29 @@ class DeepEPWrapper:
     def _init_normal_buffer(self, group: ProcessGroup) -> DeepEPBuffer:
         """Initialize buffer for normal mode."""
         config = self._config
+        normal_nvl_bytes_text = os.environ.get(
+            "DEEPEP_NORMAL_NUM_NVL_BYTES", str(int(2e9))
+        )
+        try:
+            normal_nvl_bytes = int(normal_nvl_bytes_text)
+        except ValueError as error:
+            raise ValueError(
+                "DEEPEP_NORMAL_NUM_NVL_BYTES must be a positive integer, got "
+                f"{normal_nvl_bytes_text!r}"
+            ) from error
+        if normal_nvl_bytes <= 0:
+            raise ValueError(
+                "DEEPEP_NORMAL_NUM_NVL_BYTES must be positive, got "
+                f"{normal_nvl_bytes}"
+            )
+
         num_nvl_bytes = 0
         num_rdma_bytes = 0
         num_qps_per_rank = 1
 
         # Normal-kernel internode
         if config.use_deepep_internode:
-            num_nvl_bytes = int(2e9)
+            num_nvl_bytes = normal_nvl_bytes
             num_rdma_bytes = int(1e9)
             # Normal IBGDA
             if os.environ.get("ACCL_NORMAL_MODE", "IBRC") == "IBGDA":
@@ -508,8 +524,16 @@ class DeepEPWrapper:
                 num_qps_per_rank = config.deep_ep_num_sm // 2
         # Normal-kernel intranode
         else:
-            num_nvl_bytes = int(2e9)
+            num_nvl_bytes = normal_nvl_bytes
             num_qps_per_rank = 1
+
+        if config.local_rank == 0:
+            logging.info(
+                "Allocating DeepEP normal buffer: num_nvl_bytes=%d, "
+                "num_rdma_bytes=%d",
+                num_nvl_bytes,
+                num_rdma_bytes,
+            )
 
         init_kwargs = {
             "group": group,
@@ -667,10 +691,34 @@ def init_deepep_wrapper(
         ll_num_max_token = engine_config.runtime_config.max_generate_batch_size
         if engine_config.sp_config.type != SpeculativeType.NONE:
             ll_num_max_token *= engine_config.sp_config.gen_num_per_cycle + 1
+        ll_num_max_token_text = os.environ.get("DEEPEP_LL_NUM_MAX_TOKEN")
+        if ll_num_max_token_text is not None:
+            try:
+                ll_num_max_token = int(ll_num_max_token_text)
+            except ValueError as error:
+                raise ValueError(
+                    "DEEPEP_LL_NUM_MAX_TOKEN must be a positive integer, got "
+                    f"{ll_num_max_token_text!r}"
+                ) from error
+            if ll_num_max_token <= 0:
+                raise ValueError(
+                    "DEEPEP_LL_NUM_MAX_TOKEN must be positive, got "
+                    f"{ll_num_max_token}"
+                )
+            logging.info(
+                "Overriding DeepEP low-latency token capacity with "
+                "DEEPEP_LL_NUM_MAX_TOKEN=%d",
+                ll_num_max_token,
+            )
+        # Keep singleton initialization consistent with the router's MoE input
+        # view.  Prefill CP collapses attention TP to one in MoEConfigAdapter,
+        # so using the physical TP here would allocate a different aligned
+        # low-latency capacity than DeepEpLowLatencyRouter requests later.
+        moe_input_tp_size = deepep_config_adapter.tp_size
         ll_num_max_token_per_rank = (
             DeepepWrapperConfig.calc_low_latency_max_token_per_rank(
                 ll_num_max_token,
-                engine_config.parallelism_config.tp_size,
+                moe_input_tp_size,
                 model_config.quant_config,
             )
         )
@@ -680,7 +728,7 @@ def init_deepep_wrapper(
             draft_max_token_per_rank = (
                 DeepepWrapperConfig.calc_low_latency_max_token_per_rank(
                     ll_num_max_token,
-                    engine_config.parallelism_config.tp_size,
+                    moe_input_tp_size,
                     None,
                 )
             )

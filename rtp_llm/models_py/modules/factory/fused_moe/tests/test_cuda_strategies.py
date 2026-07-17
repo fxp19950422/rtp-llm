@@ -30,6 +30,7 @@ from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.strategy import (
     CudaFp8PerTensorNoDPStrategy,
     CudaNoQuantDpNormalStrategy,
     CudaNoQuantEpLowLatencyStrategy,
+    CudaNoQuantPureCPStrategy,
     CudaW4a8Int4PerChannelNoDPStrategy,
 )
 from rtp_llm.models_py.utils.arch import get_num_device_sms
@@ -183,6 +184,45 @@ class TestCudaNoQuantSingleGpuStrategy(unittest.TestCase):
 
         strategy = BatchedTritonStrategy()
         self.assertTrue(strategy.can_handle(config))
+
+
+class TestCudaNoQuantPureCPStrategy(unittest.TestCase):
+
+    def test_auto_selects_no_quant_pure_cp_for_mtp_topology(self) -> None:
+        config = create_moe_config_adapter(
+            model_config=create_model_config_without_quant(),
+            parallelism_config=create_parallelism_config(
+                ep_size=16, tp_size=16, dp_size=1, enable_cp=True
+            ),
+            moe_config=create_moe_config(use_all_gather=True, moe_strategy="auto"),
+            enable_cuda_graph=True,
+        )
+
+        strategy = CudaNoQuantPureCPStrategy()
+        self.assertTrue(strategy.can_handle(config))
+        self.assertGreater(strategy.priority, CudaNoQuantDpNormalStrategy().priority)
+
+    def test_rejects_topology_without_context_parallelism(self) -> None:
+        config = create_moe_config_adapter(
+            model_config=create_model_config_without_quant(),
+            parallelism_config=create_parallelism_config(
+                ep_size=16, tp_size=16, dp_size=1, enable_cp=False
+            ),
+            moe_config=create_moe_config(use_all_gather=True, moe_strategy="auto"),
+        )
+
+        self.assertFalse(CudaNoQuantPureCPStrategy().can_handle(config))
+
+    def test_rejects_topology_without_all_gather(self) -> None:
+        config = create_moe_config_adapter(
+            model_config=create_model_config_without_quant(),
+            parallelism_config=create_parallelism_config(
+                ep_size=16, tp_size=16, dp_size=1, enable_cp=True
+            ),
+            moe_config=create_moe_config(use_all_gather=False, moe_strategy="auto"),
+        )
+
+        self.assertFalse(CudaNoQuantPureCPStrategy().can_handle(config))
 
 
 class TestCudaNoQuantEpLowLatencyStrategy(unittest.TestCase):

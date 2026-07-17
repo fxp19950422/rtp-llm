@@ -24,6 +24,8 @@ from rtp_llm.models_py.modules.factory.fused_moe.defs.config_adapter import (
 )
 from rtp_llm.models_py.modules.factory.fused_moe.defs.fused_moe import (
     CombineForwardPayload,
+    ExpertForwardPayload,
+    FusedMoe,
 )
 from rtp_llm.models_py.modules.factory.fused_moe.defs.quant_config import (
     FusedMoEQuantConfig,
@@ -123,6 +125,100 @@ def test_int8_passthrough_forwards_dispatch_and_combine_contract():
     assert router._buffer.combine_args["quant_size"] == hidden_size
     assert "opt_level" not in router._buffer.combine_args
     assert router.handle is None
+
+
+def test_graph_dispatch_uses_capture_shape_while_eager_keeps_buffer_capacity():
+    hidden_size = 5120
+    router = _make_int8_contract_router(hidden_size)
+    router.config.tp_size = 2
+    router._num_max_dispatch_tokens_per_rank = 512
+    hidden_states = torch.ones((5, hidden_size), dtype=torch.bfloat16)
+    topk_ids = torch.arange(5 * TOPK, dtype=torch.int32).reshape(5, TOPK) % 160
+    topk_weights = torch.full((5, TOPK), 1.0 / TOPK, dtype=torch.float32)
+
+    with mock.patch.object(
+        torch.cuda, "is_current_stream_capturing", return_value=True
+    ):
+        router.prepare(hidden_states, None, None, topk_weights, topk_ids)
+
+    assert router._buffer.dispatch_args["x"].shape[0] == 3
+    assert router._buffer.dispatch_args["num_max_dispatch_tokens_per_rank"] == 3
+
+    router._handle = None
+    with mock.patch.object(
+        torch.cuda, "is_current_stream_capturing", return_value=False
+    ):
+        router.prepare(hidden_states, None, None, topk_weights, topk_ids)
+
+    assert router._buffer.dispatch_args["num_max_dispatch_tokens_per_rank"] == 512
+
+
+def test_fused_moe_chunks_eager_inputs_before_low_latency_dispatch():
+    router = mock.Mock()
+    router.eager_prefill_chunk_size = 2
+    router.prepare.side_effect = lambda a1, a1_scale, a2_scale, weights, ids: (
+        ExpertForwardPayload(
+            expert_x=a1,
+            expert_topk_ids=ids,
+            expert_topk_weights=weights,
+        )
+    )
+    router.finalize.side_effect = (
+        lambda payload, weights, ids, apply_weights, extra: payload.fused_expert_output
+    )
+    experts = mock.Mock()
+    experts.topk_ids_dtype = torch.int32
+    experts.execute.side_effect = lambda payload, **kwargs: CombineForwardPayload(
+        fused_expert_output=payload.expert_x + 1
+    )
+    fused_moe = FusedMoe(router, experts, 160)
+
+    hidden_states = torch.arange(20, dtype=torch.bfloat16).reshape(5, 4)
+    topk_ids = torch.arange(5 * TOPK, dtype=torch.int32).reshape(5, TOPK) % 160
+    topk_weights = torch.full((5, TOPK), 1.0 / TOPK, dtype=torch.float32)
+    a1_scale = torch.ones((5, 1), dtype=torch.float32)
+    token_bias = torch.arange(5, dtype=torch.float32)
+
+    with mock.patch.object(
+        torch.cuda, "is_current_stream_capturing", return_value=False
+    ):
+        output = fused_moe(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            a1_scale=a1_scale,
+            extra_expert_args={"token_bias": token_bias},
+            extra_finalize_args={"request": "keep"},
+        )
+
+    assert torch.equal(output, hidden_states + 1)
+    assert [call.args[0].shape[0] for call in router.prepare.call_args_list] == [
+        2,
+        2,
+        1,
+    ]
+    assert [call.args[1].shape[0] for call in router.prepare.call_args_list] == [
+        2,
+        2,
+        1,
+    ]
+    assert [
+        call.kwargs["extra_expert_args"]["token_bias"].shape[0]
+        for call in experts.execute.call_args_list
+    ] == [2, 2, 1]
+    assert [
+        call.args[4]["original_num_tokens"] for call in router.finalize.call_args_list
+    ] == [2, 2, 1]
+
+    router.reset_mock()
+    experts.reset_mock()
+    with mock.patch.object(
+        torch.cuda, "is_current_stream_capturing", return_value=True
+    ):
+        fused_moe(hidden_states, topk_weights, topk_ids)
+
+    assert router.prepare.call_count == 1
+    assert router.prepare.call_args.args[0].shape[0] == 5
 
 
 def test_int8_passthrough_env_gate_defaults_off_and_accepts_one():

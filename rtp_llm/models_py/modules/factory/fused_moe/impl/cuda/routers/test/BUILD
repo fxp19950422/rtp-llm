@@ -21,3 +21,9 @@ py_test (
     tags = ["open_skip", "H20"],
     exec_properties = {'gpu':'H20', 'gpu_count':'2'},
 )
+
+py_test(
+    name = "pure_cp_router_test",
+    srcs = ["pure_cp_router_test.py"],
+    deps = ["//rtp_llm/models_py/standalone:py_standalone_testlib"],
+)

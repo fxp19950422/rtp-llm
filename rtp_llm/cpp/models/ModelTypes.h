@@ -8,6 +8,7 @@
 #include "rtp_llm/cpp/cache/Types.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/models_py/bindings/core/DeviceData.h"
+#include "rtp_llm/models_py/bindings/core/CommonDefines.h"
 #include <string>
 #include <utility>
 #include <memory>
@@ -51,6 +52,7 @@ struct GptModelInitParams {
     int32_t                               kv_cache_group_num      = 1;
     std::vector<int32_t>                  kv_cache_layer_to_group;
     std::shared_ptr<KVCacheManager>       cache_manager;
+    CpKvLayoutConfig                      cp_kv_layout_config;
 };
 
 enum GptModelInputIndex : size_t {

@@ -7,6 +7,7 @@
 
 #include "rtp_llm/cpp/cache/CacheGroupType.h"
 #include "rtp_llm/cpp/cache/KVCacheSpec.h"
+#include "rtp_llm/models_py/bindings/core/CommonDefines.h"
 #include "rtp_llm/models_py/bindings/core/Types.h"
 #include "rtp_llm/cpp/utils/StringUtil.h"
 
@@ -59,6 +60,11 @@ struct CacheConfig {
     int group_layer_num  = 1;  // Number of layers per group for hybrid attention
     int linear_group_num = 0;  // Number of linear attention groups
     int full_group_num   = 0;  // Number of full attention groups
+
+    // A CP-sharded cache stores only this rank's pages. The scheduler still
+    // reasons in global tokens, so admission capacity is scaled by this value.
+    int              cp_shard_size = 1;
+    CpKvLayoutConfig cp_kv_layout;
 
     // mtp-model configurations
     std::vector<std::shared_ptr<CacheConfig>> mtp_sub_configs;

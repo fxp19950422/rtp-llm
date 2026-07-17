@@ -10,6 +10,27 @@ using namespace std;
 
 namespace rtp_llm {
 
+namespace detail {
+
+torch::Tensor restoreContextParallelOutputs(const torch::Tensor& decode_hidden,
+                                            const torch::Tensor& gathered_prefill_hidden,
+                                            const torch::Tensor& restore_indices,
+                                            const torch::Tensor& padding_mask) {
+    if (gathered_prefill_hidden.size(0) == 0) {
+        return decode_hidden;
+    }
+
+    auto valid_indices    = torch::nonzero(padding_mask).squeeze(-1);
+    auto combined_indices = restore_indices.index_select(0, valid_indices);
+    auto restored_prefill = gathered_prefill_hidden.index_select(0, combined_indices);
+    if (decode_hidden.size(0) == 0) {
+        return restored_prefill;
+    }
+    return torch::cat({decode_hidden, restored_prefill}, 0);
+}
+
+}  // namespace detail
+
 bool ZigZagProcessor::plan(const std::vector<int>& total_input_tokens,
                            std::vector<int>&       input_tokens,
                            std::vector<int>&       shuffle_indices,
@@ -131,19 +152,37 @@ size_t ZigZagProcessor::handleOutputs(torch::Tensor&                            
     RTP_LLM_FAIL("Context parallel not supported on ROCm");
     return 0;
 #else
-    int prefill_cp_size = parallelism_config_.tp_size;
+    const int64_t num_decode_streams = inputs.sequence_lengths.size(0);
+    const int64_t num_model_streams  = inputs.input_lengths.size(0);
+    RTP_LLM_CHECK_WITH_INFO(num_model_streams >= num_decode_streams,
+                            "input stream count %ld is smaller than decode stream count %ld",
+                            num_model_streams,
+                            num_decode_streams);
+    RTP_LLM_CHECK_WITH_INFO(hidden_states.size(0) >= num_decode_streams,
+                            "hidden rows %ld is smaller than decode stream count %ld",
+                            hidden_states.size(0),
+                            num_decode_streams);
 
-    auto all_hidden_t =
-        torch::empty({hidden_states.size(0) * prefill_cp_size, hidden_states.size(1)}, hidden_states.options());
-    execAllGather({{all_hidden_t}, ParallelMode::TP, {hidden_states}, false});
+    // Decode tokens are replicated across the CP ranks and must remain one row
+    // per request. Only the local prefill suffix is CP-sharded and needs an
+    // all-gather followed by zig-zag restoration.
+    auto decode_hidden = hidden_states.narrow(0, 0, num_decode_streams);
+    if (num_model_streams == num_decode_streams) {
+        hidden_states = decode_hidden;
+        return hidden_states.size(0);
+    }
 
-    auto          prefill_qkv_restore_indice = cp_params.prefill_qkv_restore_indice;
-    auto          prefill_qkv_padding_mask   = cp_params.prefill_qkv_padding_mask;
-    torch::Tensor valid_indices              = torch::nonzero(prefill_qkv_padding_mask).squeeze(-1);
-    int64_t       num_valid_tokens           = valid_indices.size(0);
-    torch::Tensor combined_indices           = prefill_qkv_restore_indice.index_select(0, valid_indices);
-    hidden_states                            = all_hidden_t.index_select(0, combined_indices);
-    return num_valid_tokens;
+    auto local_prefill_hidden = hidden_states.narrow(0, num_decode_streams, hidden_states.size(0) - num_decode_streams);
+    const int prefill_cp_size = parallelism_config_.tp_size;
+    auto      gathered_prefill_hidden =
+        torch::empty({local_prefill_hidden.size(0) * prefill_cp_size, hidden_states.size(1)}, hidden_states.options());
+    execAllGather({{gathered_prefill_hidden}, ParallelMode::TP, {local_prefill_hidden}, false});
+
+    hidden_states = detail::restoreContextParallelOutputs(decode_hidden,
+                                                          gathered_prefill_hidden,
+                                                          cp_params.prefill_qkv_restore_indice,
+                                                          cp_params.prefill_qkv_padding_mask);
+    return hidden_states.size(0);
 #endif
 }
 

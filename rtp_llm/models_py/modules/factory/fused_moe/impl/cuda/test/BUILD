@@ -10,6 +10,12 @@ py_test (
     exec_properties = {'gpu':'H20'},
 )
 
+py_test (
+    name = "int8_ep_normal_chunking_test",
+    srcs = ["int8_ep_normal_chunking_test.py"],
+    deps = py_test_deps,
+)
+
 # TODO: Fix this test
 # py_test (
 #     name = "fused_silu_mul_token_quant_batched_test",
@@ -32,4 +38,3 @@ py_test (
     tags = ["open_skip", "H20"],
     exec_properties = {'gpu':'H20'},
 )
-

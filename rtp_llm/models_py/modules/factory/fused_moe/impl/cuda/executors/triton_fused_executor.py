@@ -1,3 +1,4 @@
+import os
 from typing import Any, Dict, Optional
 
 import torch
@@ -25,6 +26,25 @@ from rtp_llm.models_py.triton_kernels.moe.fused_moe_kernel import (
     moe_align_block_size_torch,
 )
 from rtp_llm.utils.model_weight import W
+
+_PREFILL_CHUNK_SIZE = int(os.environ.get("MOE_TRITON_PREFILL_CHUNK_SIZE", "0") or "0")
+
+
+def _normalize_expert_routes(
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    *,
+    start_expert_id: int,
+    num_experts_per_partition: int,
+    expert_ids_are_local: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert global or sentinel-bearing local routes into safe local routes."""
+    local_ids = topk_ids if expert_ids_are_local else topk_ids - start_expert_id
+    local_mask = (local_ids >= 0) & (local_ids < num_experts_per_partition)
+    return (
+        local_ids.clamp(min=0, max=num_experts_per_partition - 1),
+        topk_weights * local_mask,
+    )
 
 
 class TritonFusedMoeExecutor(FusedMoeExpertExecutor):
@@ -83,11 +103,38 @@ class TritonFusedMoeExecutor(FusedMoeExpertExecutor):
         assert topk_weights is not None
 
         if self.ep_size > 1:
-            local_ids = topk_ids - self.start_expert_id
-            local_mask = (local_ids >= 0) & (local_ids < self.num_experts_per_partition)
-            topk_ids = local_ids.clamp(min=0, max=self.num_experts_per_partition - 1)
-            topk_weights = topk_weights * local_mask
+            topk_ids, topk_weights = _normalize_expert_routes(
+                topk_ids,
+                topk_weights,
+                start_expert_id=self.start_expert_id,
+                num_experts_per_partition=self.num_experts_per_partition,
+                expert_ids_are_local=payload.expert_ids_are_local,
+            )
 
+        if (
+            _PREFILL_CHUNK_SIZE > 0
+            and not torch.cuda.is_current_stream_capturing()
+            and hidden_states.shape[0] > _PREFILL_CHUNK_SIZE
+        ):
+            output = torch.empty_like(hidden_states)
+            for start in range(0, hidden_states.shape[0], _PREFILL_CHUNK_SIZE):
+                end = min(start + _PREFILL_CHUNK_SIZE, hidden_states.shape[0])
+                chunk_output = self._execute_rows(
+                    hidden_states[start:end],
+                    topk_ids[start:end],
+                    topk_weights[start:end],
+                )
+                output[start:end].copy_(chunk_output.fused_expert_output)
+            return CombineForwardPayload(fused_expert_output=output)
+
+        return self._execute_rows(hidden_states, topk_ids, topk_weights)
+
+    def _execute_rows(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> CombineForwardPayload:
         M, K = hidden_states.shape
         top_k = topk_ids.size(1)
         device = hidden_states.device

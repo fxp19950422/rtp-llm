@@ -12,6 +12,16 @@ namespace rtp_llm {
 
 struct GptModelInputs;
 
+namespace detail {
+
+torch::Tensor selectContextParallelHiddenStates(const torch::Tensor& global_hidden,
+                                                size_t               num_decode_streams,
+                                                const torch::Tensor& original_input_lengths,
+                                                const torch::Tensor& prefill_chunk_lengths,
+                                                const torch::Tensor& prefill_shuffle_indices);
+
+}  // namespace detail
+
 enum class ProcessorType {
     ZIG_ZAG,
     // Future extensions: ROUND_ROBIN, BLOCK_WISE, etc.

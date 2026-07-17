@@ -23,6 +23,31 @@
 
 namespace rtp_llm {
 
+namespace {
+
+PyWrappedModel* asPyWrappedModel(ModelBase* model) {
+    return dynamic_cast<PyWrappedModel*>(model);
+}
+
+void setMtpTraceContext(ModelBase* model, const std::string& phase, int64_t cycle, int64_t step) {
+    if (auto* py_model = asPyWrappedModel(model)) {
+        py_model->setMtpLayerTraceContext(phase, cycle, step);
+    }
+}
+
+void recordMtpDecision(ModelBase*                                                       model,
+                       const std::string&                                               event,
+                       int64_t                                                          cycle,
+                       int64_t                                                          step,
+                       const std::vector<std::pair<std::string, torch::Tensor>>&        tensors,
+                       const std::vector<std::pair<std::string, std::vector<int64_t>>>& integer_lists = {}) {
+    if (auto* py_model = asPyWrappedModel(model)) {
+        py_model->recordMtpDecisionTrace(event, cycle, step, tensors, integer_lists);
+    }
+}
+
+}  // namespace
+
 bool MtpExecutor::isTpRank0() const {
     return tp_rank_ == 0;
 }
@@ -193,7 +218,8 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
          params.model_config_.attn_config.kernel_tokens_per_block,
          kv_cache_group_num,
          kv_cache_layer_to_group,
-         cache_manager});
+         cache_manager,
+         cache_manager ? cache_manager->cacheConfig().cp_kv_layout : CpKvLayoutConfig{}});
 
     if (params.ffn_disaggregate_config.enable_ffn_disaggregate) {
         RTP_LLM_LOG_INFO("using ffn as service");
@@ -219,29 +245,30 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
     cudaProfilerBegin();
 
     for (auto& mtp_params : *propose_params->mtp_model_params_) {
-        auto model_params =
-            GptModelInitParams({mtp_params->gpt_weights,
-                                Executor::genModelDescription(mtp_params->model_config_,
-                                                              mtp_params->parallelism_config,
-                                                              mtp_params->eplb_config,
-                                                              mtp_params->moe_config),
-                                cache_manager ? std::make_optional(draft_cache_layer_layout) : std::nullopt,
-                                mtp_params->model_id,
-                                mtp_params->parallelism_config,
-                                params.hw_kernel_config,
-                                params.profiling_debug_logging_config,
-                                params.runtime_config,
-                                params.concurrency_config,
-                                params.sp_config,
-                                params.device_resource_config,
-                                mla_ops_type,
-                                mtp_params->model_config_.max_seq_len,
-                                mtp_params->model_config_.hidden_size,
-                                mtp_params->model_config_.attn_config.tokens_per_block,
-                                mtp_params->model_config_.attn_config.kernel_tokens_per_block,
-                                kv_cache_group_num,
-                                kv_cache_layer_to_group,
-                                cache_manager});
+        auto model_params = GptModelInitParams(
+            {mtp_params->gpt_weights,
+             Executor::genModelDescription(mtp_params->model_config_,
+                                           mtp_params->parallelism_config,
+                                           mtp_params->eplb_config,
+                                           mtp_params->moe_config),
+             cache_manager ? std::make_optional(draft_cache_layer_layout) : std::nullopt,
+             mtp_params->model_id,
+             mtp_params->parallelism_config,
+             params.hw_kernel_config,
+             params.profiling_debug_logging_config,
+             params.runtime_config,
+             params.concurrency_config,
+             params.sp_config,
+             params.device_resource_config,
+             mla_ops_type,
+             mtp_params->model_config_.max_seq_len,
+             mtp_params->model_config_.hidden_size,
+             mtp_params->model_config_.attn_config.tokens_per_block,
+             mtp_params->model_config_.attn_config.kernel_tokens_per_block,
+             kv_cache_group_num,
+             kv_cache_layer_to_group,
+             cache_manager,
+             cache_manager ? cache_manager->getMTPModuleCacheConfig(0).cp_kv_layout : CpKvLayoutConfig{}});
         if (!params.py_sp_model.is_none()) {
             RTP_LLM_LOG_INFO("[speculative decoding] using py model");
             draft_model_.reset(new PyWrappedModel(
@@ -604,17 +631,23 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     model_->releaseBuffers();
 
     if (propose_step_ > 1) {
+        const int64_t trace_cycle           = mtp_trace_cycle_++;
         model_input.kv_cache_layer_to_group = draft_kv_cache_layer_to_group;
         RTP_LLM_LOG_DEBUG("[MTP decode] draftModelDecode start");
-        draftModelDecode(model_input, stream_groups, draft_probs_list, draft_token_ids_t);
+        draftModelDecode(model_input, stream_groups, draft_probs_list, draft_token_ids_t, trace_cycle);
         RTP_LLM_LOG_DEBUG("[MTP decode] draftModelDecode end");
+    } else {
+        mtp_trace_cycle_++;
     }
+
+    const int64_t trace_cycle = mtp_trace_cycle_ - 1;
 
     {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(target_model_verify)");
         maybePrintModelInput(model_input, "decode target model");
         model_input.is_target_verify        = true;
         model_input.kv_cache_layer_to_group = target_kv_cache_layer_to_group;
+        setMtpTraceContext(model_.get(), "target_verify", trace_cycle, -1);
         RTP_LLM_LOG_DEBUG(
             "[MTP decode] target model verify forward start, input_lengths_size=%ld, prefix_lengths_size=%ld, seq_lengths_size=%ld",
             model_input.input_lengths.size(0),
@@ -671,6 +704,29 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
             // rejection sampling
             speculative_sampler_output = speculative_sampler_->forward(streams, draft_sampler_output, sampler_output);
         }
+        if (!model_input.is_fake_stream) {
+            std::vector<std::pair<std::string, torch::Tensor>> trace_tensors = {
+                {"draft_token_ids", draft_sampler_output.token_ids},
+                {"draft_all_probs", draft_sampler_output.all_probs},
+                {"target_token_ids", sampler_output.token_ids},
+                {"target_all_probs", sampler_output.all_probs},
+            };
+            for (size_t index = 0; index < speculative_sampler_output.accept_tokens.size(); ++index) {
+                trace_tensors.emplace_back("accept_tokens_" + std::to_string(index),
+                                           speculative_sampler_output.accept_tokens[index]);
+            }
+            std::vector<int64_t> accept_lengths;
+            accept_lengths.reserve(speculative_sampler_output.accept_len.size());
+            for (const auto length : speculative_sampler_output.accept_len) {
+                accept_lengths.push_back(static_cast<int64_t>(length));
+            }
+            recordMtpDecision(model_.get(),
+                              "mtp_rejection_sampling",
+                              trace_cycle,
+                              -1,
+                              trace_tensors,
+                              {{"accept_lengths", std::move(accept_lengths)}});
+        }
         // NOTE: here will have cuda device sync before update model input
         batch_stream_processor_->updateDecodePostDraftModelInput(
             model_input, model_output, speculative_sampler_output, batch_size, hidden_states_d_t, total_accept_len);
@@ -692,6 +748,9 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
 
     {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(draft_model_forward)");
+        model_input.is_mtp_draft_extend = true;
+        ModelBase* draft_extend_model   = sp_prefill_draft_model_ ? sp_prefill_draft_model_.get() : draft_model_.get();
+        setMtpTraceContext(draft_extend_model, "draft_extend", trace_cycle, -1);
         // Use sp_prefill_draft_model_ if CUDA graph is enabled, otherwise use draft_model_
         if (sp_prefill_draft_model_) {
             // All currently supported draft models are non-MRoPE and do not use
@@ -700,6 +759,7 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         } else {
             draft_prefill_model_output = std::move(draft_model_->forward(model_input));
         }
+        model_input.is_mtp_draft_extend = false;
     }
 
     if (!isTpRank0() || warm_up_ || streams.size() == 0 || model_input.is_fake_stream) {
@@ -715,6 +775,13 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         fast_topk_sampler_output               = fast_topk_sampler_->forward(draft_prefill_model_output.logits);
         draft_prefill_sampler_output.all_probs = fast_topk_sampler_output.all_probs;
         draft_prefill_sampler_output.token_ids = fast_topk_sampler_output.token_ids;
+        ModelBase* draft_extend_model = sp_prefill_draft_model_ ? sp_prefill_draft_model_.get() : draft_model_.get();
+        recordMtpDecision(draft_extend_model,
+                          "draft_extend_sample",
+                          trace_cycle,
+                          -1,
+                          {{"token_ids", draft_prefill_sampler_output.token_ids},
+                           {"all_probs", draft_prefill_sampler_output.all_probs}});
     }
 
     // collect metrics
@@ -837,7 +904,8 @@ bool MtpExecutor::updateEplbConfig(const EPLBConfig& config) {
 void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
                                    const StreamGroups&         stream_groups,
                                    std::vector<torch::Tensor>& draft_probs_list,
-                                   torch::Tensor&              draft_token_ids_t) {
+                                   torch::Tensor&              draft_token_ids_t,
+                                   int64_t                     trace_cycle) {
     RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.draft_model_decode(batch_size=%zu)", model_input.combo_tokens.size(0));
 
     // clear host buffers holder
@@ -876,6 +944,7 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
     for (int i = 0; i < propose_step_ - 1; i++) {
         RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.draft_model_decode(loop_iter=%d)", i);
         RTP_LLM_LOG_DEBUG("[MTP draftDecode] loop step %d/%d start, batch_size %zu", i, propose_step_ - 1, batch_size);
+        setMtpTraceContext(draft_model_.get(), "draft_decode", trace_cycle, i);
         draft_decode_model_output = std::move(draft_model_->forward(model_input));
         RTP_LLM_LOG_DEBUG("[MTP draftDecode] loop step %d forward done", i);
 
@@ -884,6 +953,12 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         auto draft_probs              = fast_topk_sampler_output.all_probs;
         auto draft_probs_reshape      = draft_probs.reshape({(int)batch_size, 1, -1});
         auto draft_token_ids          = fast_topk_sampler_output.token_ids;
+        recordMtpDecision(
+            draft_model_.get(),
+            "draft_decode_sample",
+            trace_cycle,
+            i,
+            {{"input_tokens", model_input.combo_tokens}, {"token_ids", draft_token_ids}, {"all_probs", draft_probs}});
 
         if (model_input.is_fake_stream) {
             draft_token_ids.zero_();

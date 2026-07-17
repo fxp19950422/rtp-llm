@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <unordered_map>
 #include <vector>
 #include <pybind11/embed.h>
@@ -16,6 +17,12 @@ namespace py = pybind11;
 
 namespace rtp_llm {
 
+void resetPaddedPrefillMetadata(torch_ext::PyAttentionInputs& inputs,
+                                size_t                        active_batch_size,
+                                size_t                        max_batch_size,
+                                int                           last_valid_q,
+                                int                           last_valid_kv);
+
 class CudaGraphRunner: public GraphBase {
 public:
     CudaGraphRunner(const GraphParams& graph_params, py::object py_instance):
@@ -25,7 +32,12 @@ public:
         is_target_verify_(graph_params.is_target_verify),
         capture_stream_(cuda_graph::graphGetStreamFromPool(true)),
         enable_cuda_graph_debug_mode_(graph_params.enable_cuda_graph_debug_mode),
-        num_tokens_per_bs_(graph_params.num_tokens_per_bs),
+        num_tokens_per_bs_(targetVerifyGraphTokensPerRequest(
+            graph_params.num_tokens_per_bs,
+            graph_params.is_target_verify ? graph_params.target_verify_context_parallel_size : 0)),
+        target_verify_tokens_per_bs_(graph_params.is_target_verify ? graph_params.num_tokens_per_bs : 0),
+        target_verify_context_parallel_size_(
+            graph_params.is_target_verify ? graph_params.target_verify_context_parallel_size : 0),
         max_seq_len_(graph_params.max_seq_len),
         seq_size_per_block_(graph_params.tokens_per_block),
         kernel_seq_size_per_block_(graph_params.kernel_tokens_per_block),
@@ -36,6 +48,7 @@ public:
         model_data_type_(graph_params.model_data_type),
         kv_cache_layer_to_group_(graph_params.kv_cache_layer_to_group),
         kv_cache_group_num_(graph_params.kv_cache_group_num),
+        cp_kv_layout_(graph_params.cp_kv_layout),
         position_id_len_factor_(graph_params.position_id_len_factor) {
         py::gil_scoped_acquire gil;
         if (!py_instance_ || py_instance_.is_none()) {
@@ -62,6 +75,12 @@ public:
                          num_tokens_per_bs_,
                          is_prefill_cuda_graph_mode_,
                          is_target_verify_);
+        if (is_target_verify_) {
+            RTP_LLM_LOG_INFO("target-verify CUDA graph widths: local=%d global=%d cp_size=%d",
+                             num_tokens_per_bs_,
+                             target_verify_tokens_per_bs_,
+                             target_verify_context_parallel_size_);
+        }
     }
 
     ~CudaGraphRunner() {
@@ -128,6 +147,8 @@ private:
     bool                    enable_cuda_graph_debug_mode_{false};
     size_t                  max_bs_{1};
     int                     num_tokens_per_bs_{1};
+    int                     target_verify_tokens_per_bs_{0};
+    int                     target_verify_context_parallel_size_{0};
     int                     max_num_token_{1};
     int                     max_seq_len_{0};
     int                     seq_size_per_block_{0};
@@ -151,8 +172,10 @@ private:
     cuda_graph::GraphPoolHandle            shared_graph_pool_{};
 
     std::vector<int32_t> kv_cache_layer_to_group_;
-    int32_t              kv_cache_group_num_     = 0;
+    int32_t              kv_cache_group_num_ = 0;
+    CpKvLayoutConfig     cp_kv_layout_;
     int                  position_id_len_factor_ = 0;  // 0 = model has no combo_position_ids
+    std::atomic<bool>    target_verify_width_fallback_logged_{false};
 
     // event to record forward done
     torch::Event forward_event_ = cuda_graph::makeGraphEvent();

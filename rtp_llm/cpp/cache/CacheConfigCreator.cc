@@ -1,6 +1,8 @@
 #include "rtp_llm/cpp/cache/CacheConfigCreator.h"
 
+#include <cstdlib>
 #include <numeric>
+#include <string>
 
 #include "rtp_llm/cpp/cache/HybridConfigCreator.h"
 #include "rtp_llm/cpp/cache/MemoryEvaluationHelper.h"
@@ -9,6 +11,69 @@
 #include "rtp_llm/cpp/utils/AssertUtils.h"
 
 namespace rtp_llm {
+
+namespace {
+
+bool envEnabled(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) {
+        return false;
+    }
+    const std::string normalized(value);
+    return normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on";
+}
+
+void configureCpKvLayout(CacheConfig&             config,
+                         const ModelConfig&       model_config,
+                         const ParallelismConfig& parallelism_config) {
+    const bool        shard_enabled = envEnabled("RTP_LLM_CP_KV_SHARD_DECODE");
+    const char*       layout_env    = std::getenv("RTP_LLM_CP_KV_LAYOUT");
+    const std::string requested     = layout_env == nullptr ? "" : std::string(layout_env);
+    if (!shard_enabled && requested.empty()) {
+        return;
+    }
+
+    const bool cp_enabled = parallelism_config.prefill_cp_config.is_enabled() && parallelism_config.tp_size > 1;
+    RTP_LLM_CHECK_WITH_INFO(shard_enabled && cp_enabled,
+                            "CP KV shard requires RTP_LLM_CP_KV_SHARD_DECODE=1 and enabled CP with tp_size>1");
+
+    config.cp_shard_size                  = static_cast<int>(parallelism_config.tp_size);
+    config.cp_kv_layout.kind              = CpKvLayoutKind::LEGACY_DYNAMIC_CONTIGUOUS;
+    config.cp_kv_layout.cp_size           = static_cast<int>(parallelism_config.tp_size);
+    config.cp_kv_layout.cp_rank           = static_cast<int>(parallelism_config.tp_rank);
+    config.cp_kv_layout.page_size         = static_cast<int>(config.seq_size_per_block);
+    config.cp_kv_layout.layout_version    = 0;
+    config.cp_kv_layout.max_global_length = model_config.max_seq_len;
+
+    if (requested.empty()) {
+        return;
+    }
+    RTP_LLM_CHECK_WITH_INFO(
+        requested == "page_interleaved", "unsupported RTP_LLM_CP_KV_LAYOUT='%s'", requested.c_str());
+    RTP_LLM_CHECK_WITH_INFO(CacheConfigCreator::supportsPageInterleavedCpKv(model_config, parallelism_config),
+                            "page_interleaved CP KV is only supported for GLM4.7 PPU MHA CP-shard");
+    RTP_LLM_CHECK_WITH_INFO(config.cp_kv_layout.page_size > 0, "page_interleaved CP KV requires a positive page size");
+
+    config.cp_kv_layout.kind            = CpKvLayoutKind::PAGE_INTERLEAVED;
+    config.cp_kv_layout.interleave_size = config.cp_kv_layout.page_size;
+    config.cp_kv_layout.layout_version  = 1;
+}
+
+}  // namespace
+
+bool CacheConfigCreator::supportsPageInterleavedCpKv(const ModelConfig&       model_config,
+                                                     const ParallelismConfig& parallelism_config) {
+#if USE_PPU
+    const bool is_glm4_moe = model_config.model_type == "glm4_moe" || model_config.model_type == "glm4_moe-mtp"
+                             || model_config.model_type == "glm4_moe_mtp";
+    return is_glm4_moe && !model_config.attn_config.use_mla && parallelism_config.prefill_cp_config.is_enabled()
+           && parallelism_config.tp_size > 1;
+#else
+    (void)model_config;
+    (void)parallelism_config;
+    return false;
+#endif
+}
 
 CacheConfig CacheConfigCreator::createBasicConfig(const ModelConfig&       model_config,
                                                   const ParallelismConfig& parallelism_config,
@@ -41,6 +106,16 @@ CacheConfig CacheConfigCreator::createConfig(const ModelConfig&                 
         config.kernel_seq_size_per_block = config.seq_size_per_block;
     }
 
+    configureCpKvLayout(config, model_config, parallelism_config);
+    if (config.cp_shard_size > 1) {
+        RTP_LLM_LOG_INFO("CP KV shard enabled: cp_size=%d cp_rank=%d layout=%d page_size=%d max_global_length=%ld",
+                         config.cp_kv_layout.cp_size,
+                         config.cp_kv_layout.cp_rank,
+                         static_cast<int>(config.cp_kv_layout.kind),
+                         config.cp_kv_layout.page_size,
+                         config.cp_kv_layout.max_global_length);
+    }
+
     if (kv_cache_config.test_block_num > 0) {
         RTP_LLM_LOG_INFO("KVCacheConfig explicitly specified kv cache block num %d", kv_cache_config.test_block_num);
         block_num = kv_cache_config.test_block_num;
@@ -54,8 +129,9 @@ CacheConfig CacheConfigCreator::createConfig(const ModelConfig&                 
                             block_num,
                             static_cast<long>(config.block_size_bytes / 1024 / 1024));
 
-    const auto kv_cache_seq_len = static_cast<size_t>(block_num) * config.seq_size_per_block;
-    config.block_num            = static_cast<int>(block_num);
+    const auto local_kv_cache_seq_len = static_cast<size_t>(block_num) * config.seq_size_per_block;
+    const auto kv_cache_seq_len       = local_kv_cache_seq_len * static_cast<size_t>(config.cp_shard_size);
+    config.block_num                  = static_cast<int>(block_num);
     RTP_LLM_LOG_INFO("kv cache block nums is %u, allows storing %ld tokens", block_num, kv_cache_seq_len);
     if (kv_cache_seq_len < model_config.max_seq_len) {
         RTP_LLM_LOG_WARNING("kv cache block nums %u can only store %ld tokens, less than max_seq_len %ld, "
@@ -96,6 +172,11 @@ CacheConfig CacheConfigCreator::createSpConfig(const ModelConfig&               
         // Default: kernel block size == physical block size (no split).
         score_config.kernel_seq_size_per_block   = score_config.seq_size_per_block;
         propose_config.kernel_seq_size_per_block = propose_config.seq_size_per_block;
+    }
+
+    configureCpKvLayout(score_config, score_model_config, parallelism_config);
+    if (is_mtp) {
+        configureCpKvLayout(propose_config, propose_model_config, parallelism_config);
     }
 
     int num_mtp_modules = 1;
@@ -201,7 +282,8 @@ CacheConfig CacheConfigCreator::createSpConfig(const ModelConfig&               
         config.mtp_sub_configs.push_back(sub_cfg);
     }
 
-    const auto kv_cache_seq_len = static_cast<size_t>(block_num) * config.seq_size_per_block;
+    const auto local_kv_cache_seq_len = static_cast<size_t>(block_num) * config.seq_size_per_block;
+    const auto kv_cache_seq_len       = local_kv_cache_seq_len * static_cast<size_t>(config.cp_shard_size);
     RTP_LLM_LOG_INFO("CacheConfig created: is_mtp=%d, total_layers=%u, num_mtp_modules=%d, block_num=%zu, "
                      "allows storing %zu tokens, total_block_size=%zu bytes (main=%zu + %d*propose=%zu)",
                      is_mtp,

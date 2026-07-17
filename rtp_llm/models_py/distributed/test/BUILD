@@ -12,6 +12,12 @@ py_test (
     exec_properties = {'gpu':'H20', 'gpu_count':'2'},
 )
 
+py_test(
+    name = "test_deepep_wrapper_cp_config",
+    srcs = ["test_deepep_wrapper_cp_config.py"],
+    deps = ["//rtp_llm/models_py/standalone:py_standalone_testlib"],
+)
+
 py_test (
     name = "moriep_test",
     srcs = ["moriep_test.py"],

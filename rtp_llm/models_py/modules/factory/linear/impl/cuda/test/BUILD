@@ -3,6 +3,12 @@ py_test_deps = [
 ]
 
 py_test(
+    name = "int8_per_channel_linear_test",
+    srcs = ["int8_per_channel_linear_test.py"],
+    deps = py_test_deps,
+)
+
+py_test(
     name = "fp8_linear_test",
     srcs = ["fp8_linear_test.py"],
     deps = py_test_deps,

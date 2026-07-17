@@ -88,6 +88,11 @@ struct GptModelInputs {
     // To select correct inference mode, we need to set this flag manually.
     bool is_target_verify = false;
 
+    // The post-verification MTP draft forward is a prefill-shaped cache extend,
+    // not a normal prompt prefill or target verify. Attention backends use this
+    // explicit phase to avoid inferring semantics from tensor shapes.
+    bool is_mtp_draft_extend = false;
+
     // not sync to other tp rank
     std::vector<std::string> trace_ids;
 

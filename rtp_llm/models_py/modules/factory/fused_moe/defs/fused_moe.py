@@ -82,6 +82,10 @@ class FusedMoeDataRouter(ABC):
         """
         raise NotImplementedError
 
+    @property
+    def eager_prefill_chunk_size(self) -> int:
+        return 0
+
     @abstractmethod
     def prepare(
         self,
@@ -188,6 +192,44 @@ class FusedMoe(torch.nn.Module):
         extra_finalize_args: Optional[Dict[str, Any]] = None,
     ) -> torch.Tensor:
 
+        chunk_size = self.router.eager_prefill_chunk_size
+        if (
+            chunk_size > 0
+            and not torch.cuda.is_current_stream_capturing()
+            and hidden_states.size(0) > chunk_size
+        ):
+            output_chunks = []
+            total_tokens = hidden_states.size(0)
+            for start in range(0, total_tokens, chunk_size):
+                end = min(start + chunk_size, total_tokens)
+                chunk_a1_scale = self._slice_token_aligned(
+                    a1_scale, start, end, total_tokens
+                )
+                chunk_expert_args = self._slice_extra_expert_args(
+                    extra_expert_args, start, end, total_tokens
+                )
+                chunk_finalize_args = (
+                    dict(extra_finalize_args)
+                    if extra_finalize_args is not None
+                    else None
+                )
+                output_chunks.append(
+                    self.forward(
+                        hidden_states[start:end],
+                        topk_weights[start:end],
+                        topk_ids[start:end],
+                        inplace=inplace,
+                        activation=activation,
+                        expert_map=expert_map,
+                        a1_scale=chunk_a1_scale,
+                        a2_scale=a2_scale,
+                        apply_router_weight_on_input=apply_router_weight_on_input,
+                        extra_expert_args=chunk_expert_args,
+                        extra_finalize_args=chunk_finalize_args,
+                    )
+                )
+            return torch.cat(output_chunks, dim=0)
+
         a1 = hidden_states
 
         expert_payload = self.router.prepare(
@@ -246,3 +288,30 @@ class FusedMoe(torch.nn.Module):
         ), f"output batch size mismatch: expected {hidden_states.shape}, got {output.shape}"
 
         return output
+
+    @staticmethod
+    def _slice_token_aligned(
+        value: Any, start: int, end: int, total_tokens: int
+    ) -> Any:
+        if (
+            isinstance(value, torch.Tensor)
+            and value.dim() > 0
+            and value.size(0) == total_tokens
+        ):
+            return value[start:end]
+        return value
+
+    @classmethod
+    def _slice_extra_expert_args(
+        cls,
+        extra_expert_args: Optional[Dict[str, Any]],
+        start: int,
+        end: int,
+        total_tokens: int,
+    ) -> Optional[Dict[str, Any]]:
+        if extra_expert_args is None:
+            return None
+        return {
+            key: cls._slice_token_aligned(value, start, end, total_tokens)
+            for key, value in extra_expert_args.items()
+        }

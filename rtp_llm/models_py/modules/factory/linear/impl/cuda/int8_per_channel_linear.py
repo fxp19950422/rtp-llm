@@ -192,6 +192,9 @@ class Int8PerChannelLinear(LinearBase):
         self._int8_gemm_nt((x_int8, x_scale), (self.weight, w_scale), out)
 
         if self.bias is not None:
-            out = out + self.bias
+            # ``out`` is a fresh BF16 GEMM destination.  Reuse it for bias so
+            # long-prefill QKV projection does not transiently hold two full
+            # [tokens, qkv_width] buffers.
+            out.add_(self.bias)
 
         return out.reshape(*orig_shape[:-1], N)

@@ -6,6 +6,9 @@
 #include <optional>
 #include <string>
 #include <mutex>
+#include <cstdlib>
+#include <utility>
+#include <vector>
 #include "rtp_llm/models_py/bindings/core/Types.h"
 #include "rtp_llm/models_py/bindings/core/DeviceData.h"
 #include <pybind11/pybind11.h>
@@ -42,6 +45,13 @@ public:
     GptModelOutputs forwardMicroBatched(const GptModelInputs& inputs);
     void            releaseBuffers() override;
 
+    void setMtpLayerTraceContext(const std::string& phase, int64_t cycle, int64_t step);
+    void recordMtpDecisionTrace(const std::string&                                               event,
+                                int64_t                                                          cycle,
+                                int64_t                                                          step,
+                                const std::vector<std::pair<std::string, torch::Tensor>>&        tensors,
+                                const std::vector<std::pair<std::string, std::vector<int64_t>>>& integer_lists = {});
+
 private:
     std::optional<PyCacheStoreInputs> prepareWriteCacheParams(const GptModelInputs& inputs);
 
@@ -57,6 +67,8 @@ private:
                                           bool                  skip_final_layernorm,
                                           size_t                num_valid_tokens = -1);
     torch::Tensor   tensorHoldHostAndToCuda(const torch::Tensor& tensor);
+    void            resetMtpLayerTrace();
+    void            maybeRecordMtpPostLayersTrace(const GptModelInputs& inputs, const GptModelOutputs& outputs);
 
     // Methods absorbed from GptModel
     torch::Tensor   tpSyncEmbeddingOrLogits(const torch::Tensor& input);
@@ -79,20 +91,25 @@ private:
     const rtp_llm::MlaOpsType                mla_ops_type_;
     const size_t                             layer_num_;
     const GptModelDescription                description_;
+    const CpKvLayoutConfig                   cp_kv_layout_config_;
     std::optional<rtp_llm::CacheLayerLayout> kv_cache_layer_layout_;
     std::shared_ptr<KVCacheManager>          cache_manager_;  // For cache_store access
     torch::Tensor                            residual_scale_fp32_;
     torch::Tensor                            residual_scale_;
     ModelBufferHolder                        buffer_holder_;
 
-    GraphBase* graph_runner_{nullptr};
-    py::object py_model_;
-    py::object held_attn_pyobj_;
-    bool       enable_cuda_graph_{false};
-    bool       is_prefill_cuda_graph_mode_{false};
-    bool       use_spec_decoding_{false};
-    bool       enable_device_perf_{false};
-    bool       check_nan_{false};
+    GraphBase*  graph_runner_{nullptr};
+    py::object  py_model_;
+    py::object  held_attn_pyobj_;
+    bool        enable_cuda_graph_{false};
+    bool        is_prefill_cuda_graph_mode_{false};
+    bool        use_spec_decoding_{false};
+    bool        enable_device_perf_{false};
+    bool        check_nan_{false};
+    bool        mtp_layer_trace_enabled_{false};
+    std::string mtp_layer_trace_phase_;
+    int64_t     mtp_layer_trace_cycle_{-1};
+    int64_t     mtp_layer_trace_step_{-1};
 
     std::unique_ptr<IContextParallelProcessor> context_parallel_processor_{nullptr};
     std::unique_ptr<CacheStoreAsyncWriter>     cache_store_async_writer_;
@@ -115,6 +132,7 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
     mla_ops_type_(params.mla_ops_type),
     layer_num_(params.weights.layers.size()),
     description_(params.description),
+    cp_kv_layout_config_(params.cp_kv_layout_config),
     cache_manager_(params.cache_manager),
     enable_cuda_graph_(params.hw_kernel_config.enable_cuda_graph),
     is_prefill_cuda_graph_mode_(is_prefill_cuda_graph_mode),
@@ -123,6 +141,9 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
     check_nan_(params.profile_debug_logging_config.check_nan) {
 
     c10::InferenceMode inference_guard(true);
+
+    const char* mtp_layer_trace_dir = std::getenv("RTP_LLM_MTP_LAYER_TRACE_DIR");
+    mtp_layer_trace_enabled_        = mtp_layer_trace_dir != nullptr && mtp_layer_trace_dir[0] != '\0';
 
     weights_               = params.weights;
     model_id_              = params.model_id;
@@ -188,18 +209,22 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
 
         // Create GraphParams from individual config fields
         GraphParams graph_params;
-        graph_params.enable_cuda_graph            = params.hw_kernel_config.enable_cuda_graph;
-        graph_params.enable_cuda_graph_debug_mode = params.hw_kernel_config.enable_cuda_graph_debug_mode;
-        graph_params.is_prefill_cuda_graph_mode   = is_prefill_cuda_graph_mode;
-        graph_params.max_seq_len                  = params.max_seq_len;
-        graph_params.tokens_per_block             = params.tokens_per_block;
-        graph_params.kernel_tokens_per_block      = params.kernel_tokens_per_block;
-        graph_params.hidden_size                  = params.hidden_size;
-        graph_params.model_data_type              = dtype;
-        graph_params.max_context_batch_size       = params.concurrency_config.concurrency_limit;
-        graph_params.prefill_capture_seq_lens     = params.hw_kernel_config.prefill_capture_seq_lens;
-        graph_params.decode_capture_batch_sizes   = params.hw_kernel_config.decode_capture_batch_sizes;
-        graph_params.kv_cache_group_num           = params.kv_cache_group_num;
+        graph_params.enable_cuda_graph                   = params.hw_kernel_config.enable_cuda_graph;
+        graph_params.enable_cuda_graph_debug_mode        = params.hw_kernel_config.enable_cuda_graph_debug_mode;
+        graph_params.is_prefill_cuda_graph_mode          = is_prefill_cuda_graph_mode;
+        graph_params.max_seq_len                         = params.max_seq_len;
+        graph_params.tokens_per_block                    = params.tokens_per_block;
+        graph_params.kernel_tokens_per_block             = params.kernel_tokens_per_block;
+        graph_params.hidden_size                         = params.hidden_size;
+        graph_params.model_data_type                     = dtype;
+        graph_params.max_context_batch_size              = params.concurrency_config.concurrency_limit;
+        graph_params.prefill_capture_seq_lens            = params.hw_kernel_config.prefill_capture_seq_lens;
+        graph_params.decode_capture_batch_sizes          = params.hw_kernel_config.decode_capture_batch_sizes;
+        graph_params.kv_cache_group_num                  = params.kv_cache_group_num;
+        graph_params.cp_kv_layout                        = params.cp_kv_layout_config;
+        graph_params.target_verify_context_parallel_size = use_spec_decoding && device_props_.enable_prefill_cp ?
+                                                               static_cast<int>(params.parallelism_config.tp_size) :
+                                                               0;
         // Derive combo_position_ids capture-buffer factor from the C++ rope_config:
         // 0 = model has no combo_position_ids (no buffer allocated, capture skips it);
         // >0 = factor (Mrope models such as qwen3-vl / qwen35-moe set rope_config.style
@@ -223,9 +248,10 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
         // | Embedding Model (prefill) | true                     | SP_TYPE_NONE   | -        | max_seq_len             |
         // | Draft Model (prefill)     | true                     | != SP_TYPE_NONE| 1        | gen_num_per_cycle + 1   |
         // | Normal Model (decode)     | false                    | SP_TYPE_NONE   | -        | 1 (default)             |
-        // | Target Model (verify)     | false                    | != SP_TYPE_NONE| 0        | gen_num_per_cycle + 1   |
+        // | Target Model (verify)     | false                    | != SP_TYPE_NONE| 0        | gen_num_per_cycle + 1*  |
         // | Draft Model (decode)      | false                    | != SP_TYPE_NONE| 1        | 1 (default)             |
         // +---------------------------+--------------------------+----------------+----------+-------------------------+
+        // * The graph runner converts target verify to the CP planner's rank-local padded width when CP is enabled.
         // clang-format on
 
         if (is_prefill_cuda_graph_mode && params.sp_config.type == SP_TYPE_NONE) {
@@ -265,6 +291,7 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
         auto py_initialize_method = py_instance.attr("initialize");
         py_init_result            = py_initialize_method(init_resources);
         graph_runner_->initCapture();
+        resetMtpLayerTrace();
     }
 
     auto py_init_success = py_init_result.cast<bool>();

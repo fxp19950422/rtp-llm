@@ -24,12 +24,12 @@ using namespace std;
 namespace spec = speculative;
 
 struct MtpExecutorTestConfig {
-    size_t max_seq_len         = 2048;
-    size_t vocab_size          = 4;
-    size_t num_layers          = 1;
-    size_t gen_num_per_cycle   = 4;
-    size_t vocab_size_override = 0;  // 0 means use vocab_size
-    int64_t mm_position_ids_style = 0;
+    size_t  max_seq_len            = 2048;
+    size_t  vocab_size             = 4;
+    size_t  num_layers             = 1;
+    size_t  gen_num_per_cycle      = 4;
+    size_t  vocab_size_override    = 0;  // 0 means use vocab_size
+    int64_t mm_position_ids_style  = 0;
     int     position_id_len_factor = 1;
 };
 
@@ -114,12 +114,13 @@ vector<T> catVectors(const vector<vector<T>>& vectors) {
 
 class FakeModel: public ModelBase {
 public:
-    FakeModel(const GptModelInitParams& params) {
+    FakeModel(const GptModelInitParams& params, std::string name): name_(std::move(name)) {
         weights_  = params.weights;
         model_id_ = params.model_id;
     }
 
     GptModelOutputs forward(const GptModelInputs& inputs) override {
+        SCOPED_TRACE(name_ + " model forward call " + std::to_string(forward_count_++));
         checkInputs(inputs);
         return output_holder.get();
     }
@@ -138,6 +139,8 @@ public:
         checkTensorField("lm_output_indexes", inputs.lm_output_indexes, expected_inputs.lm_output_indexes);
         checkTensorField("last_hidden_states", inputs.last_hidden_states, expected_inputs.last_hidden_states);
         checkTensorField("combo_position_ids", inputs.combo_position_ids, expected_inputs.combo_position_ids);
+        EXPECT_EQ(inputs.is_target_verify, expected_inputs.is_target_verify);
+        EXPECT_EQ(inputs.is_mtp_draft_extend, expected_inputs.is_mtp_draft_extend);
     }
 
     void setOutputs(const vector<GptModelOutputs>& outputs) {
@@ -151,6 +154,8 @@ public:
 private:
     TestDataHolder<GptModelInputs>  input_holder;
     TestDataHolder<GptModelOutputs> output_holder;
+    std::string                     name_;
+    size_t                          forward_count_ = 0;
 };
 
 class FakeFastTopKSampler: public spec::FastTopKSampler {
@@ -188,6 +193,7 @@ public:
     spec::SpeculativeSamplerOutput forward(const std::list<GenerateStreamPtr>& streams,
                                            SamplerOutput&                      draft_sampler_output,
                                            SamplerOutput&                      target_sampler_output) override {
+        checkInputs(streams, draft_sampler_output, target_sampler_output);
         return output_holder.get();
     }
 
@@ -319,12 +325,12 @@ public:
         ResourceContext            resource_context;
         SpeculativeExecutionConfig sp_config;
 
-        model_config.max_seq_len    = test_config.max_seq_len;
-        model_config.vocab_size     = test_config.vocab_size;
-        model_config.num_layers     = test_config.num_layers;
+        model_config.max_seq_len                           = test_config.max_seq_len;
+        model_config.vocab_size                            = test_config.vocab_size;
+        model_config.num_layers                            = test_config.num_layers;
         model_config.mm_model_config.mm_position_ids_style = test_config.mm_position_ids_style;
         model_config.attn_config.rope_config.index_factor  = test_config.position_id_len_factor;
-        sp_config.gen_num_per_cycle = test_config.gen_num_per_cycle;
+        sp_config.gen_num_per_cycle                        = test_config.gen_num_per_cycle;
 
         resource_context.cache_manager =
             std::make_shared<KVCacheManager>(test::makeSimpleMhaCacheConfig(/*layer_num=*/1,
@@ -389,8 +395,8 @@ public:
              params.model_id,
              params.parallelism_config});
 
-        auto fake_target_model        = std::make_unique<FakeModel>(target_model_params);
-        auto fake_draft_model         = std::make_unique<FakeModel>(draft_model_params);
+        auto fake_target_model        = std::make_unique<FakeModel>(target_model_params, "target");
+        auto fake_draft_model         = std::make_unique<FakeModel>(draft_model_params, "draft");
         auto fake_fast_topk_sampler   = std::make_unique<FakeFastTopKSampler>();
         auto fake_speculative_sampler = std::make_unique<FakeSpeculativeSampler>(sp_config.gen_num_per_cycle);
         auto fake_sampler             = std::make_unique<FakeSampler>(SamplerInitParams{});
@@ -637,11 +643,12 @@ TEST_F(MtpExecutorTest, testSingleBatchDecode) {
     next_draft_output.logits            = torch::tensor({1.9f, 1.10f, 1.11f, 1.12f}).reshape({(int64_t)batch_size, 4});
     next_draft_output.all_hidden_states = torch::tensor({0.1f, 0.1f, 0.2f, 0.22f, 0.3f, 0.33f}).reshape({3, 2});
 
-    next_draft_input.combo_tokens       = torch::tensor({3, 2, 0}, torch::kInt32);
-    next_draft_input.input_lengths      = torch::tensor({3}, torch::kInt32);
-    next_draft_input.prefix_lengths     = torch::tensor({2}, torch::kInt32);
-    next_draft_input.lm_output_indexes  = torch::tensor({2}, torch::kInt32);
-    next_draft_input.last_hidden_states = torch::tensor({0.01f, 0.02f, 0.03f, 0.04f, 0.05f, 0.06f}).reshape({3, 2});
+    next_draft_input.combo_tokens        = torch::tensor({3, 2, 0}, torch::kInt32);
+    next_draft_input.input_lengths       = torch::tensor({3}, torch::kInt32);
+    next_draft_input.prefix_lengths      = torch::tensor({2}, torch::kInt32);
+    next_draft_input.lm_output_indexes   = torch::tensor({2}, torch::kInt32);
+    next_draft_input.last_hidden_states  = torch::tensor({0.01f, 0.02f, 0.03f, 0.04f, 0.05f, 0.06f}).reshape({3, 2});
+    next_draft_input.is_mtp_draft_extend = true;
 
     components.fake_draft_model->setInputs({draft_input_1, draft_input_2, draft_input_3, next_draft_input});
     components.fake_draft_model->setOutputs({draft_output_1, draft_output_2, draft_output_3, next_draft_output});
@@ -653,6 +660,7 @@ TEST_F(MtpExecutorTest, testSingleBatchDecode) {
     target_input.input_lengths     = torch::tensor({5}, torch::kInt32);
     target_input.prefix_lengths    = torch::tensor({2}, torch::kInt32);
     target_input.lm_output_indexes = torch::tensor({0, 1, 2, 3, 4}, torch::kInt32);
+    target_input.is_target_verify  = true;
 
     target_output.logits = torch::tensor({0.1f, 0.2f, 0.3f, 0.4f, 1.1f, 1.2f, 1.3f, 1.4f, 2.1f, 2.2f,
                                           2.3f, 2.4f, 3.1f, 3.2f, 3.3f, 3.4f, 4.1f, 4.2f, 4.3f, 4.4f})
@@ -702,15 +710,117 @@ TEST_F(MtpExecutorTest, testSingleBatchDecode) {
 
     vector<vector<float>> draft_all_probs_list;
     draft_all_probs_list.push_back(toVec<float>(stream1_draft_token_probs));
-    draft_all_probs_list.push_back(toVec<float>(draft_output_1.logits));
-    draft_all_probs_list.push_back(toVec<float>(draft_output_2.logits));
-    draft_all_probs_list.push_back(toVec<float>(draft_output_3.logits));
+    draft_all_probs_list.push_back(toVec<float>(draft_sampler_output_1.all_probs));
+    draft_all_probs_list.push_back(toVec<float>(draft_sampler_output_2.all_probs));
+    draft_all_probs_list.push_back(toVec<float>(draft_sampler_output_3.all_probs));
     draft_spec_sample_input.token_ids  = torch::tensor({3, 2, 1, 3}, torch::kInt32).reshape({1, 4});
-    draft_spec_sample_input.all_probs  = torch::tensor(catVectors(draft_all_probs_list)).reshape({4, 4});
-    target_spec_sample_input.all_probs = draft_spec_sample_input.all_probs;
+    draft_spec_sample_input.all_probs  = torch::tensor(catVectors(draft_all_probs_list)).reshape({1, 4, 4});
+    target_spec_sample_input.all_probs = sampler_output.all_probs;
 
     components.fake_speculative_sampler->setInputs({draft_spec_sample_input, target_spec_sample_input});
     components.fake_speculative_sampler->setOutputs({speculative_sampler_output});
+
+    // Cycle 2 starts from cycle 1's dispatched stream state. This is the first
+    // cycle whose first accepted token becomes the fifth visible output token.
+    auto cycle2_draft_input_1  = GptModelInputs{};
+    auto cycle2_draft_input_2  = GptModelInputs{};
+    auto cycle2_draft_input_3  = GptModelInputs{};
+    auto cycle2_draft_output_1 = createRandomGptModelOutputs(1, vocab_size, 2);
+    auto cycle2_draft_output_2 = createRandomGptModelOutputs(1, vocab_size, 2);
+    auto cycle2_draft_output_3 = createRandomGptModelOutputs(1, vocab_size, 2);
+
+    cycle2_draft_input_1.combo_tokens       = torch::tensor({1}, torch::kInt32);
+    cycle2_draft_input_1.input_lengths      = torch::tensor({2}, torch::kInt32);
+    cycle2_draft_input_1.sequence_lengths   = torch::tensor({5}, torch::kInt32);
+    cycle2_draft_input_1.lm_output_indexes  = torch::tensor({0}, torch::kInt32);
+    cycle2_draft_input_1.last_hidden_states = torch::tensor({0.3f, 0.33f}).reshape({1, 2});
+
+    cycle2_draft_input_2.combo_tokens       = torch::tensor({2}, torch::kInt32);
+    cycle2_draft_input_2.input_lengths      = torch::tensor({2}, torch::kInt32);
+    cycle2_draft_input_2.sequence_lengths   = torch::tensor({6}, torch::kInt32);
+    cycle2_draft_input_2.lm_output_indexes  = torch::tensor({0}, torch::kInt32);
+    cycle2_draft_input_2.last_hidden_states = cycle2_draft_output_1.all_hidden_states;
+
+    cycle2_draft_input_3.combo_tokens       = torch::tensor({3}, torch::kInt32);
+    cycle2_draft_input_3.input_lengths      = torch::tensor({2}, torch::kInt32);
+    cycle2_draft_input_3.sequence_lengths   = torch::tensor({7}, torch::kInt32);
+    cycle2_draft_input_3.lm_output_indexes  = torch::tensor({0}, torch::kInt32);
+    cycle2_draft_input_3.last_hidden_states = cycle2_draft_output_2.all_hidden_states;
+
+    auto cycle2_target_input              = GptModelInputs{};
+    auto cycle2_target_output             = GptModelOutputs{};
+    cycle2_target_input.combo_tokens      = torch::tensor({0, 1, 2, 3, 0}, torch::kInt32);
+    cycle2_target_input.input_lengths     = torch::tensor({5}, torch::kInt32);
+    cycle2_target_input.prefix_lengths    = torch::tensor({5}, torch::kInt32);
+    cycle2_target_input.lm_output_indexes = torch::tensor({0, 1, 2, 3, 4}, torch::kInt32);
+    cycle2_target_input.is_target_verify  = true;
+    cycle2_target_output.logits = torch::tensor({10.1f, 10.2f, 10.3f, 10.4f, 11.1f, 11.2f, 11.3f, 11.4f, 12.1f, 12.2f,
+                                                 12.3f, 12.4f, 13.1f, 13.2f, 13.3f, 13.4f, 14.1f, 14.2f, 14.3f, 14.4f})
+                                      .reshape({(int64_t)(propose_step + 1), (int64_t)vocab_size});
+    cycle2_target_output.all_hidden_states =
+        torch::tensor({1.01f, 1.02f, 1.03f, 1.04f, 1.05f, 1.06f, 1.07f, 1.08f, 1.09f, 1.10f})
+            .reshape({(int64_t)(propose_step + 1), 2});
+
+    auto cycle2_next_draft_input              = GptModelInputs{};
+    auto cycle2_next_draft_output             = GptModelOutputs{};
+    cycle2_next_draft_input.combo_tokens      = torch::tensor({1, 2, 0}, torch::kInt32);
+    cycle2_next_draft_input.input_lengths     = torch::tensor({3}, torch::kInt32);
+    cycle2_next_draft_input.prefix_lengths    = torch::tensor({5}, torch::kInt32);
+    cycle2_next_draft_input.lm_output_indexes = torch::tensor({2}, torch::kInt32);
+    cycle2_next_draft_input.last_hidden_states =
+        torch::tensor({1.01f, 1.02f, 1.03f, 1.04f, 1.05f, 1.06f}).reshape({3, 2});
+    cycle2_next_draft_input.is_mtp_draft_extend = true;
+    cycle2_next_draft_output.logits             = torch::tensor({2.1f, 2.2f, 2.3f, 2.4f}).reshape({1, 4});
+    cycle2_next_draft_output.all_hidden_states = torch::tensor({1.1f, 1.11f, 1.2f, 1.22f, 1.3f, 1.33f}).reshape({3, 2});
+
+    components.fake_draft_model->setInputs(
+        {cycle2_draft_input_1, cycle2_draft_input_2, cycle2_draft_input_3, cycle2_next_draft_input});
+    components.fake_draft_model->setOutputs(
+        {cycle2_draft_output_1, cycle2_draft_output_2, cycle2_draft_output_3, cycle2_next_draft_output});
+    components.fake_target_model->setInputs({cycle2_target_input});
+    components.fake_target_model->setOutputs({cycle2_target_output});
+
+    auto cycle2_draft_sampler_output_1 =
+        spec::FastTopKSamplerOutput{torch::tensor({0.0f, 0.0f, 1.0f, 0.0f}).reshape({1, 4}).to(torch::kCUDA),
+                                    torch::tensor({2}, torch::kInt32).reshape({1, 1})};
+    auto cycle2_draft_sampler_output_2 =
+        spec::FastTopKSamplerOutput{torch::tensor({0.0f, 0.0f, 0.0f, 1.0f}).reshape({1, 4}).to(torch::kCUDA),
+                                    torch::tensor({3}, torch::kInt32).reshape({1, 1})};
+    auto cycle2_draft_sampler_output_3 =
+        spec::FastTopKSamplerOutput{torch::tensor({1.0f, 0.0f, 0.0f, 0.0f}).reshape({1, 4}).to(torch::kCUDA),
+                                    torch::tensor({0}, torch::kInt32).reshape({1, 1})};
+    auto cycle2_next_draft_sampler_output =
+        spec::FastTopKSamplerOutput{torch::tensor({0.0f, 0.0f, 0.0f, 1.0f}).reshape({1, 4}).to(torch::kCUDA),
+                                    torch::tensor({3}, torch::kInt32).reshape({1, 1})};
+    components.fake_fast_topk_sampler->setInputs({cycle2_draft_output_1.logits,
+                                                  cycle2_draft_output_2.logits,
+                                                  cycle2_draft_output_3.logits,
+                                                  cycle2_next_draft_output.logits});
+    components.fake_fast_topk_sampler->setOutputs({cycle2_draft_sampler_output_1,
+                                                   cycle2_draft_sampler_output_2,
+                                                   cycle2_draft_sampler_output_3,
+                                                   cycle2_next_draft_sampler_output});
+
+    auto cycle2_sampler_input       = SamplerInputs{cycle2_target_output.logits};
+    auto cycle2_sampler_output      = SamplerOutput{torch::tensor({1, 2, 0, 0, 0}, torch::kInt32).reshape({1, 5})};
+    cycle2_sampler_output.all_probs = torch::tensor(createRandomVector<float>((propose_step + 1) * vocab_size, 1))
+                                          .reshape({1, (int64_t)(propose_step + 1), (int64_t)vocab_size});
+    components.fake_sampler->setInputs({cycle2_sampler_input});
+    components.fake_sampler->setOutputs({cycle2_sampler_output});
+
+    auto cycle2_draft_spec_sample_input      = SamplerOutput{};
+    auto cycle2_target_spec_sample_input     = SamplerOutput{};
+    cycle2_draft_spec_sample_input.token_ids = torch::tensor({1, 2, 3, 0}, torch::kInt32).reshape({1, 4});
+    cycle2_draft_spec_sample_input.all_probs =
+        torch::cat({next_draft_sampler_output.all_probs.reshape({1, 1, 4}).to(torch::kCUDA),
+                    cycle2_draft_sampler_output_1.all_probs.reshape({1, 1, 4}),
+                    cycle2_draft_sampler_output_2.all_probs.reshape({1, 1, 4}),
+                    cycle2_draft_sampler_output_3.all_probs.reshape({1, 1, 4})},
+                   1);
+    cycle2_target_spec_sample_input.all_probs = cycle2_sampler_output.all_probs;
+    auto cycle2_accept_tokens                 = torch::tensor({{1, 2, 0}}, torch::kInt32);
+    components.fake_speculative_sampler->setInputs({cycle2_draft_spec_sample_input, cycle2_target_spec_sample_input});
+    components.fake_speculative_sampler->setOutputs({spec::SpeculativeSamplerOutput{{cycle2_accept_tokens}, {3}}});
 
     // Replace models with fake models
     setupFakeModels(components.executor.get(),
@@ -726,6 +836,10 @@ TEST_F(MtpExecutorTest, testSingleBatchDecode) {
 
     // check stream result
     checkOutput(stream1, {0, 1, 2, 3, 2, 0}, {0, 1}, {0.0, 1.0, 0.0, 0.0}, {0.3, 0.33});
+
+    status = components.executor->process({stream1});
+    ASSERT_TRUE(status.ok());
+    checkOutput(stream1, {0, 1, 2, 3, 2, 0, 1, 2, 0}, {0, 3}, {0.0, 0.0, 0.0, 1.0}, {1.3, 1.33});
 }
 
 TEST_F(MtpExecutorTest, testMultiBatchDecode) {
@@ -806,6 +920,7 @@ TEST_F(MtpExecutorTest, testMultiBatchDecode) {
     next_draft_input.last_hidden_states =
         torch::tensor({0.01f, 0.02f, 0.11f, 0.12f, 0.13f, 0.14f, 0.15f, 0.16f, 0.17f, 0.18f, 0.19f, 0.2f})
             .reshape({6, 2});
+    next_draft_input.is_mtp_draft_extend = true;
 
     components.fake_draft_model->setInputs({draft_input_1, draft_input_2, draft_input_3, next_draft_input});
     components.fake_draft_model->setOutputs({draft_output_1, draft_output_2, draft_output_3, next_draft_output});
@@ -818,6 +933,7 @@ TEST_F(MtpExecutorTest, testMultiBatchDecode) {
     target_input.input_lengths     = torch::tensor({5, 5}, torch::kInt32);
     target_input.prefix_lengths    = torch::tensor({3, 2}, torch::kInt32);
     target_input.lm_output_indexes = torch::tensor({0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, torch::kInt32);
+    target_input.is_target_verify  = true;
 
     target_output.logits =
         torch::tensor({0.1f,  0.2f,  0.3f,  0.4f,  1.1f,  1.2f,  1.3f,  1.4f,  2.1f,  2.2f,  2.3f,  2.4f,  3.1f,  3.2f,
@@ -875,13 +991,13 @@ TEST_F(MtpExecutorTest, testMultiBatchDecode) {
     auto draft_spec_sample_input    = SamplerOutput{};
     auto target_spec_sample_input   = SamplerOutput{};
 
-    vector<vector<float>> draft_all_probs_list;
-    draft_all_probs_list.push_back({0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0});
-    draft_all_probs_list.push_back(toVec<float>(draft_output_1.logits));
-    draft_all_probs_list.push_back(toVec<float>(draft_output_2.logits));
-    draft_all_probs_list.push_back(toVec<float>(draft_output_3.logits));
     draft_spec_sample_input.token_ids = torch::tensor({2, 1, 2, 3, 3, 0, 2, 2}, torch::kInt32).reshape({2, 4});
-    draft_spec_sample_input.all_probs = torch::tensor(catVectors(draft_all_probs_list)).reshape({4, 8});
+    draft_spec_sample_input.all_probs =
+        torch::cat({torch::stack({stream1_draft_token_probs, stream2_draft_token_probs}, 0),
+                    draft_sampler_output_1.all_probs.reshape({(int64_t)batch_size, 1, (int64_t)vocab_size}),
+                    draft_sampler_output_2.all_probs.reshape({(int64_t)batch_size, 1, (int64_t)vocab_size}),
+                    draft_sampler_output_3.all_probs.reshape({(int64_t)batch_size, 1, (int64_t)vocab_size})},
+                   1);
     target_spec_sample_input.all_probs =
         torch::tensor(target_sample_all_probs_data)
             .reshape({(int64_t)batch_size, (int64_t)(propose_step + 1), (int64_t)vocab_size});
@@ -918,11 +1034,11 @@ TEST_F(MtpExecutorTest, testDraftModelDecodeExpandsTargetVerifyPositionIds) {
     test_config.position_id_len_factor = 3;
     auto components                    = createMtpExecutorComponents(test_config);
 
-    auto stream_model_config = components.model_config;
+    auto stream_model_config                                  = components.model_config;
     stream_model_config.mm_model_config.mm_position_ids_style = MROPE;
     stream_model_config.attn_config.rope_config.index_factor  = 3;
-    auto stream1 =
-        createContextStream(stream_model_config, components.runtime_config, components.resource_context, {0, 1, 2, 3, 0, 1});
+    auto stream1                                              = createContextStream(
+        stream_model_config, components.runtime_config, components.resource_context, {0, 1, 2, 3, 0, 1});
     auto stream2 = createContextStream(
         stream_model_config, components.runtime_config, components.resource_context, {1, 2, 3, 0, 1, 2, 3, 0});
     stream1->setContextPositionIds(torch::tensor({0, 0, 0}, torch::kInt32));
@@ -975,24 +1091,20 @@ TEST_F(MtpExecutorTest, testDraftModelDecodeExpandsTargetVerifyPositionIds) {
 
     spec::FastTopKSamplerOutput draft_sampler_output_1;
     draft_sampler_output_1.token_ids = torch::tensor({12, 22}, torch::kInt32).reshape({(int64_t)batch_size, 1});
-    draft_sampler_output_1.all_probs =
-        torch::tensor({0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f}, torch::kFloat32)
-            .reshape({(int64_t)batch_size, (int64_t)vocab_size});
+    draft_sampler_output_1.all_probs = torch::tensor({0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f}, torch::kFloat32)
+                                           .reshape({(int64_t)batch_size, (int64_t)vocab_size});
 
     spec::FastTopKSamplerOutput draft_sampler_output_2;
     draft_sampler_output_2.token_ids = torch::tensor({13, 23}, torch::kInt32).reshape({(int64_t)batch_size, 1});
-    draft_sampler_output_2.all_probs =
-        torch::tensor({0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f}, torch::kFloat32)
-            .reshape({(int64_t)batch_size, (int64_t)vocab_size});
+    draft_sampler_output_2.all_probs = torch::tensor({0.0f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f, 1.0f}, torch::kFloat32)
+                                           .reshape({(int64_t)batch_size, (int64_t)vocab_size});
 
     spec::FastTopKSamplerOutput draft_sampler_output_3;
     draft_sampler_output_3.token_ids = torch::tensor({14, 24}, torch::kInt32).reshape({(int64_t)batch_size, 1});
-    draft_sampler_output_3.all_probs =
-        torch::tensor({0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f}, torch::kFloat32)
-            .reshape({(int64_t)batch_size, (int64_t)vocab_size});
+    draft_sampler_output_3.all_probs = torch::tensor({0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f}, torch::kFloat32)
+                                           .reshape({(int64_t)batch_size, (int64_t)vocab_size});
 
-    components.fake_fast_topk_sampler->setInputs(
-        {draft_output_1.logits, draft_output_2.logits, draft_output_3.logits});
+    components.fake_fast_topk_sampler->setInputs({draft_output_1.logits, draft_output_2.logits, draft_output_3.logits});
     components.fake_fast_topk_sampler->setOutputs(
         {draft_sampler_output_1, draft_sampler_output_2, draft_sampler_output_3});
 
@@ -1001,45 +1113,16 @@ TEST_F(MtpExecutorTest, testDraftModelDecodeExpandsTargetVerifyPositionIds) {
 
     std::vector<torch::Tensor> draft_probs_list;
     torch::Tensor              draft_token_ids_t;
-    components.executor->draftModelDecode(model_input, stream_groups, draft_probs_list, draft_token_ids_t);
+    components.executor->draftModelDecode(model_input, stream_groups, draft_probs_list, draft_token_ids_t, 0);
 
-    EXPECT_EQ((std::vector<int>{10, 11, 12, 13, 14, 20, 21, 22, 23, 24}),
-              toVec<int>(model_input.combo_tokens));
+    EXPECT_EQ((std::vector<int>{10, 11, 12, 13, 14, 20, 21, 22, 23, 24}), toVec<int>(model_input.combo_tokens));
     EXPECT_EQ((std::vector<int>{5, 5}), toVec<int>(model_input.input_lengths));
     EXPECT_EQ((std::vector<int>{5, 7}), toVec<int>(model_input.prefix_lengths));
     EXPECT_EQ(0, model_input.sequence_lengths.numel());
     EXPECT_EQ((std::vector<int>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}), toVec<int>(model_input.lm_output_indexes));
 
-    EXPECT_EQ((std::vector<int>{5,
-                                5,
-                                5,
-                                6,
-                                6,
-                                6,
-                                7,
-                                7,
-                                7,
-                                8,
-                                8,
-                                8,
-                                9,
-                                9,
-                                9,
-                                7,
-                                7,
-                                7,
-                                8,
-                                8,
-                                8,
-                                9,
-                                9,
-                                9,
-                                10,
-                                10,
-                                10,
-                                11,
-                                11,
-                                11}),
+    EXPECT_EQ((std::vector<int>{5, 5, 5, 6, 6, 6, 7, 7, 7, 8,  8,  8,  9,  9,  9,
+                                7, 7, 7, 8, 8, 8, 9, 9, 9, 10, 10, 10, 11, 11, 11}),
               toVec<int>(model_input.combo_position_ids));
 }
 

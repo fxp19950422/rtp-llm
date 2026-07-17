@@ -896,6 +896,29 @@ class AutoConfigureDeepepTest(TestCase):
         self.assertTrue(self.moe_config.use_deepep_moe)
         self.assertFalse(self.moe_config.use_deepep_low_latency)
 
+    def test_explicit_low_latency_survives_pdfusion_cp_configuration(self):
+        self._setup_parallel_info(
+            world_size=8, tp_size=8, ep_size=8, local_world_size=8
+        )
+        self.parallel_config.dp_size = 1
+        self.parallel_config.prefill_cp_config.method = CPRotateMethod.ALL_GATHER
+        self.deep_ep_config.use_deepep_moe = True
+        self.deep_ep_config.use_deepep_low_latency = True
+        self.moe_config.use_all_gather = False
+
+        auto_configure_deepep(
+            moe_config=self.moe_config,
+            deep_ep_config=self.deep_ep_config,
+            parallelism_config=self.parallel_config,
+            role_type=RoleType.PDFUSION,
+            ll_num_max_token=512,
+        )
+
+        self.assertFalse(self.moe_config.use_all_gather)
+        self.assertTrue(self.moe_config.use_deepep_moe)
+        self.assertTrue(self.moe_config.use_deepep_low_latency)
+        self.assertEqual(self.moe_config.ll_num_max_token, 512)
+
     def test_auto_strategy_does_not_preserve_allgather_on_dp(self):
         """Regression: moe_strategy=auto on DP topology must clear use_all_gather."""
         self._setup_parallel_info(

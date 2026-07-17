@@ -22,6 +22,35 @@ from rtp_llm.models_py.modules.factory.fused_moe.utils.config_resolver import (
 logger = logging.getLogger(__name__)
 
 
+class CudaNoQuantPureCPStrategy(MoeStrategy):
+    """Unquantized PureCP strategy for GLM MTP draft execution."""
+
+    @classmethod
+    def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
+        resolver = MoeConfigResolver()
+        checker.check(resolver.get_quant_method(config) is None)
+        checker.check(config.moe_strategy in ("no_quant_pure_cp", "auto"))
+        checker.check(config.dp_size == 1)
+        checker.check(resolver.is_cp_equal_ep(config))
+        checker.check(config.ep_size > 1)
+        checker.check(config.parallelism_config.prefill_cp_config.is_enabled())
+        checker.check(resolver.use_all_gather(config))
+
+    def get_attributes(self) -> StrategyAttributes:
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.executors.triton_fused_executor import (
+            TritonFusedMoeExecutor,
+        )
+        from rtp_llm.models_py.modules.factory.fused_moe.impl.cuda.routers.pure_cp_router import (
+            PureCpRouterNoQuant,
+        )
+
+        return StrategyAttributes(
+            router_class=PureCpRouterNoQuant,
+            executor_class=TritonFusedMoeExecutor,
+            quant_config=FusedMoEQuantConfig(quant_dtype=None),
+        )
+
+
 class CudaNoQuantEpLowLatencyStrategy(MoeStrategy):
     """Graph-safe BF16 DeepEP low-latency strategy used by MTP draft decode."""
 

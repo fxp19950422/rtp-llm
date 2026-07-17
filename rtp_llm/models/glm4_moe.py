@@ -1,3 +1,4 @@
+import copy
 import functools
 import json
 import logging
@@ -39,6 +40,13 @@ from rtp_llm.utils.model_weight import (
     transpose,
     transpose_pad,
 )
+
+
+def _create_mtp_moe_config(moe_config: Any) -> Any:
+    """Give the unquantized MTP draft an independently resolved strategy."""
+    draft_moe_config = copy.deepcopy(moe_config)
+    draft_moe_config.moe_strategy = "auto"
+    return draft_moe_config
 
 
 class Glm4MoeWeight(ModelDeployWeightInfo):
@@ -617,11 +625,12 @@ class Glm4MoeMTP(Glm4Moe):
     def _create_python_model(self):
         from rtp_llm.models_py.model_desc.glm4_moe_mtp import Glm4MoeMtpModel
 
+        draft_moe_config = _create_mtp_moe_config(self.moe_config)
         self.py_model = Glm4MoeMtpModel(
             self.model_config,
             self.parallelism_config,
             self.weight,
-            self.moe_config,
+            draft_moe_config,
             max_generate_batch_size=self.max_generate_batch_size,
             fmha_config=self.fmha_config,
             py_hw_kernel_config=self.hw_kernel_config,

@@ -930,6 +930,32 @@ class Int8PerChannelEpNormalExecutor(Int8PerChannelDequantExecutor):
         assert topk_ids is not None
         assert topk_weights is not None
 
+        if (
+            _PREFILL_CHUNK_SIZE > 0
+            and not torch.cuda.is_current_stream_capturing()
+            and hidden_states.shape[0] > _PREFILL_CHUNK_SIZE
+        ):
+            output = torch.empty_like(hidden_states)
+            for start in range(0, hidden_states.shape[0], _PREFILL_CHUNK_SIZE):
+                end = min(start + _PREFILL_CHUNK_SIZE, hidden_states.shape[0])
+                chunk_output = self._execute_rows(
+                    hidden_states[start:end],
+                    topk_ids[start:end],
+                    topk_weights[start:end],
+                )
+                output[start:end].copy_(chunk_output.fused_expert_output)
+            return CombineForwardPayload(fused_expert_output=output)
+
+        return self._execute_rows(hidden_states, topk_ids, topk_weights)
+
+    def _execute_rows(
+        self,
+        hidden_states: torch.Tensor,
+        topk_ids: torch.Tensor,
+        topk_weights: torch.Tensor,
+    ) -> CombineForwardPayload:
+        """Execute a bounded set of received rows for DeepEP normal prefill."""
+
         token_ids, local_expert_ids, route_weights = self._select_local_routes(
             topk_ids,
             topk_weights,
@@ -960,6 +986,16 @@ class Int8PerChannelEpNormalExecutor(Int8PerChannelDequantExecutor):
                         "DeepEP normal INT8 grouped GEMM failed during CUDA Graph "
                         f"capture and fallback is not graph-safe: {e} | "
                         f"M={hidden_states.shape[0]}, "
+                        f"local_routes={token_ids.numel()}, E={self.E}"
+                    ) from e
+                if (
+                    isinstance(e, torch.OutOfMemoryError)
+                    or "out of memory" in str(e).lower()
+                ):
+                    raise RuntimeError(
+                        "DeepEP normal INT8 grouped GEMM out of memory; "
+                        "refusing the higher-memory fallback path: "
+                        f"{e} | M={hidden_states.shape[0]}, "
                         f"local_routes={token_ids.numel()}, E={self.E}"
                     ) from e
                 logger.warning(

@@ -8,6 +8,15 @@ namespace rtp_llm {
 
 using namespace torch_ext;
 
+inline int targetVerifyGraphTokensPerRequest(int global_tokens_per_request, int context_parallel_size) {
+    if (context_parallel_size <= 0) {
+        return global_tokens_per_request;
+    }
+    // Match ContextParallelProcessor: pad to 2 * CP, then split evenly across ranks.
+    const int cp_alignment = context_parallel_size * 2;
+    return ((global_tokens_per_request + cp_alignment - 1) / cp_alignment) * 2;
+}
+
 // Current state of CUDA graph execution (used when calling canRun/forward with graph runner)
 struct CudaGraphState {
     int current_batch_size{1};
@@ -27,18 +36,20 @@ struct GraphParams {
     int                  kernel_tokens_per_block      = 0;  // must be explicitly configured
     int                  num_tokens_per_bs = 1;  // Number of tokens per batch (1 for decode, max_seq_len for prefill)
     int                  sp_steps          = 0;
-    size_t               max_context_batch_size = 128;
-    std::size_t          hidden_size            = 0;
-    c10::ScalarType      model_data_type        = c10::ScalarType::Float;
+    int                  target_verify_context_parallel_size = 0;  // 0 when target verify is not CP-sharded
+    size_t               max_context_batch_size              = 128;
+    std::size_t          hidden_size                         = 0;
+    c10::ScalarType      model_data_type                     = c10::ScalarType::Float;
     std::vector<int>     prefill_capture_seq_lens;
     std::vector<int>     decode_capture_batch_sizes;
     std::vector<int32_t> kv_cache_layer_to_group;  // layer index -> group id for hybrid kv cache
     int32_t              kv_cache_group_num = 0;   // number of kv cache groups
+    CpKvLayoutConfig     cp_kv_layout;
     // Per-token position-id factor for combo_position_ids capture buffer.
     // 0 = model does not use combo_position_ids (no buffer allocated, capture skips it).
     // >0 = factor (e.g. Mrope = rope_config.index_factor). Sourced from
     //     description_.attention_conf.rope_config in the model wrapper, not Python reflection.
-    int                  position_id_len_factor = 0;
+    int position_id_len_factor = 0;
 };
 
 class GraphBase {

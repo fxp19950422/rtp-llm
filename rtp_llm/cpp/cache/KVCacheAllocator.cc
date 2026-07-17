@@ -290,7 +290,11 @@ size_t KVCacheAllocator::totalBlocksNum() const {
 }
 
 size_t KVCacheAllocator::maxAvailableTokensNum() const {
-    return block_pool_ ? (block_pool_->totalBlocksNum() * seqSizePerBlock()) : 0;
+    if (!block_pool_) {
+        return 0;
+    }
+    const size_t shard_scale = config_.cp_shard_size > 1 ? static_cast<size_t>(config_.cp_shard_size) : 1;
+    return block_pool_->totalBlocksNum() * seqSizePerBlock() * shard_scale;
 }
 
 void KVCacheAllocator::regUserMr(size_t model_id, std::shared_ptr<CacheStore> cache_store) {

@@ -240,6 +240,12 @@ py_test(
 )
 
 py_test(
+    name = "glm4_moe_mtp_config_test",
+    srcs = ["glm4_moe_mtp_config_test.py"],
+    deps = ["//rtp_llm:testlib"],
+)
+
+py_test(
     name="qwen3_coder_detector_test",
     srcs=[
         "qwen3_coder_detector_test.py",

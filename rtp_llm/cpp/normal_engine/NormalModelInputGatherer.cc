@@ -48,7 +48,8 @@ GatherModelInputContext createGatherContext(const NormalModelInputGathererConfig
         config.input_vocab_size ? static_cast<int>(config.input_vocab_size) : static_cast<int>(config.vocab_size);
     ctx.need_cal_position_id =
         (config.mm_position_ids_style != PositionIdsStyle::DEFAULT) || config.has_positional_encoding;
-    ctx.max_blocks_num       = stream_groups.curBlocksNum();
+    ctx.max_blocks_num =
+        model_input.kv_cache_block_id.defined() ? static_cast<size_t>(model_input.kv_cache_block_id.size(2)) : 0;
     ctx.merged_tokens        = model_input.combo_tokens.data_ptr<int32_t>();
     ctx.input_lengths        = model_input.input_lengths.data_ptr<int32_t>();
     ctx.sequence_lengths     = model_input.sequence_lengths.data_ptr<int32_t>();
@@ -202,8 +203,23 @@ GptModelInputs NormalModelInputGatherer::allocateModelInputBuffers(const StreamG
     const size_t total_context_batch_size = stream_groups.totalContextBatchSize();
     const size_t total_block_copy_num     = stream_groups.totalBlockUpdateCopyNum();
     const size_t max_blocks_num           = stream_groups.curBlocksNum();
-    const size_t multimodal_features_len  = stream_groups.mmFeaturesLen();
-    const bool   has_multimodal_input     = config_.is_multimodal && stream_groups.has_multimodal_input();
+    size_t       block_table_blocks_num   = max_blocks_num;
+    if (max_blocks_num > 0 && config_.cp_kv_layout.kind == CpKvLayoutKind::PAGE_INTERLEAVED) {
+        RTP_LLM_CHECK_WITH_INFO(config_.cp_kv_layout.cp_size > 0, "PAGE_INTERLEAVED cp_size must be positive");
+        RTP_LLM_CHECK_WITH_INFO(config_.cp_kv_layout.page_size > 0, "PAGE_INTERLEAVED page_size must be positive");
+        RTP_LLM_CHECK_WITH_INFO(config_.cp_kv_layout.interleave_size == config_.cp_kv_layout.page_size,
+                                "PAGE_INTERLEAVED interleave_size must equal page_size");
+        RTP_LLM_CHECK_WITH_INFO(config_.cp_kv_layout.max_global_length > 0,
+                                "PAGE_INTERLEAVED max_global_length must be positive");
+        const size_t global_tokens_per_local_block =
+            static_cast<size_t>(config_.cp_kv_layout.cp_size) * static_cast<size_t>(config_.cp_kv_layout.page_size);
+        const size_t max_local_blocks =
+            (static_cast<size_t>(config_.cp_kv_layout.max_global_length) + global_tokens_per_local_block - 1)
+            / global_tokens_per_local_block;
+        block_table_blocks_num = std::max(block_table_blocks_num, max_local_blocks);
+    }
+    const size_t multimodal_features_len = stream_groups.mmFeaturesLen();
+    const bool   has_multimodal_input    = config_.is_multimodal && stream_groups.has_multimodal_input();
     const bool   need_cal_position_id =
         (config_.mm_position_ids_style != PositionIdsStyle::DEFAULT) || config_.has_positional_encoding;
 
@@ -225,10 +241,11 @@ GptModelInputs NormalModelInputGatherer::allocateModelInputBuffers(const StreamG
         model_input.kv_cache_kernel_block_id =
             torch::zeros({(int64_t)config_.kv_cache_group_nums,
                           (int64_t)total_batch_size,
-                          (int64_t)(max_blocks_num * config_.kernel_blocks_per_kv_block)},
+                          (int64_t)(block_table_blocks_num * config_.kernel_blocks_per_kv_block)},
                          pinned_i32);
         model_input.kv_cache_block_id = torch::zeros(
-            {(int64_t)config_.kv_cache_group_nums, (int64_t)total_batch_size, (int64_t)max_blocks_num}, pinned_i32);
+            {(int64_t)config_.kv_cache_group_nums, (int64_t)total_batch_size, (int64_t)block_table_blocks_num},
+            pinned_i32);
         model_input.kv_cache_layer_to_group = torch::empty({(int64_t)config_.num_layers}, pinned_i32);
         model_input.kv_cache_group_types    = torch::empty({(int64_t)config_.kv_cache_group_nums}, pinned_i32);
         model_input.kv_cache_update_mapping = torch::empty({(int64_t)total_block_copy_num, 2}, pinned_i32);

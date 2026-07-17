@@ -98,12 +98,14 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
     }
 
     // Calculate cu_seqlens
-    int    batch_size               = py_attn_inputs.input_lengths.size(0);
-    size_t context_batch_size       = py_attn_inputs.prefix_lengths.size(0);
-    size_t decode_batch_size        = py_attn_inputs.sequence_lengths.size(0);
-    py_attn_inputs.dtype            = dataTypeToTorchType(description_.data_type);
-    py_attn_inputs.is_prefill       = !decode_batch_size;
-    py_attn_inputs.is_target_verify = inputs.is_target_verify;
+    int    batch_size                  = py_attn_inputs.input_lengths.size(0);
+    size_t context_batch_size          = py_attn_inputs.prefix_lengths.size(0);
+    size_t decode_batch_size           = py_attn_inputs.sequence_lengths.size(0);
+    py_attn_inputs.dtype               = dataTypeToTorchType(description_.data_type);
+    py_attn_inputs.is_prefill          = !decode_batch_size;
+    py_attn_inputs.is_target_verify    = inputs.is_target_verify;
+    py_attn_inputs.is_mtp_draft_extend = inputs.is_mtp_draft_extend;
+    py_attn_inputs.cp_kv_layout        = cp_kv_layout_config_;
     RTP_LLM_CHECK_WITH_INFO(
         context_batch_size + decode_batch_size == batch_size,
         "batch size check failed context_batch_size[%ld] decode_batch_size[%ld] total_batch_size[%ld]",
@@ -138,7 +140,7 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
 
         py_attn_inputs.context_total_kv_length = cu_kv_seqlens[context_batch_size].item<int>();
         py_attn_inputs.total_tokens            = cu_seqlens[batch_size].item<int>();
-        py_attn_inputs.cu_seqlens         = cu_seqlens;
+        py_attn_inputs.cu_seqlens              = cu_seqlens;
         py_attn_inputs.cu_seqlens_device       = tensorHoldHostAndToCuda(cu_seqlens);
         py_attn_inputs.cu_kv_seqlens_device    = tensorHoldHostAndToCuda(cu_kv_seqlens);
     } else {
@@ -154,7 +156,7 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
                           py_attn_inputs.sequence_lengths.size(0) + 1,
                           1,
                           torch::TensorOptions(torch::kInt32).device(torch::kCPU).pinned_memory(true));
-        py_attn_inputs.decode_cu_seqlens   = decode_cu_seqlens;
+        py_attn_inputs.decode_cu_seqlens        = decode_cu_seqlens;
         py_attn_inputs.decode_cu_seqlens_device = tensorHoldHostAndToCuda(decode_cu_seqlens);
     }
 
@@ -202,7 +204,7 @@ void PyWrappedModel::setupKVCacheForAttentionInputs(torch_ext::PyAttentionInputs
     // Legacy 2-D fields default to group 0.
     // NOTE: keep host/device 2-D fields consistent to avoid shape mismatch in CUDA graph replay path.
     py_attn_inputs.kv_cache_kernel_block_id_device = py_attn_inputs.kv_cache_kernel_block_id_device_by_group[0];
-    py_attn_inputs.kv_cache_kernel_block_id   = py_attn_inputs.kv_cache_kernel_block_id_by_group[0];
+    py_attn_inputs.kv_cache_kernel_block_id        = py_attn_inputs.kv_cache_kernel_block_id_by_group[0];
 }
 
 // Helper function to build BertEmbeddingInputs from GptModelInputs
@@ -248,15 +250,131 @@ GptModelOutputs PyWrappedModel::callForwardPostLayers(torch::Tensor         hidd
                                                       size_t                num_valid_tokens) {
     RTP_LLM_PROFILE_SCOPE("py_model.callForwardPostLayers");
     size_t num_input_tokens = num_valid_tokens != -1 ? num_valid_tokens : inputs.combo_tokens.size(0);
-    return forwardPostLayers(hidden_states,
-                             inputs.input_lengths.size(0) != inputs.sequence_lengths.size(0),
-                             inputs.need_all_logits,
-                             inputs.lm_output_indexes,
-                             false,
-                             num_input_tokens,
-                             inputs,
-                             torch::Tensor(),
-                             skip_final_layernorm);
+    auto   outputs          = forwardPostLayers(hidden_states,
+                                     inputs.input_lengths.size(0) != inputs.sequence_lengths.size(0),
+                                     inputs.need_all_logits,
+                                     inputs.lm_output_indexes,
+                                     false,
+                                     num_input_tokens,
+                                     inputs,
+                                     torch::Tensor(),
+                                     skip_final_layernorm);
+    maybeRecordMtpPostLayersTrace(inputs, outputs);
+    return outputs;
+}
+
+void PyWrappedModel::setMtpLayerTraceContext(const std::string& phase, int64_t cycle, int64_t step) {
+    if (!mtp_layer_trace_enabled_) {
+        return;
+    }
+    mtp_layer_trace_phase_ = phase;
+    mtp_layer_trace_cycle_ = cycle;
+    mtp_layer_trace_step_  = step;
+}
+
+void PyWrappedModel::resetMtpLayerTrace() {
+    if (!mtp_layer_trace_enabled_) {
+        return;
+    }
+    try {
+        py::gil_scoped_acquire gil;
+        if (!py::hasattr(py_model_, "reset_mtp_layer_trace")) {
+            RTP_LLM_LOG_WARNING("MTP layer trace requested but Python trace patch is not installed; disabling trace");
+            mtp_layer_trace_enabled_ = false;
+            return;
+        }
+        py_model_.attr("reset_mtp_layer_trace")();
+    } catch (const py::error_already_set& e) {
+        RTP_LLM_LOG_WARNING("Failed to reset MTP layer trace after graph capture; disabling trace: %s", e.what());
+        PyErr_Clear();
+        mtp_layer_trace_enabled_ = false;
+    } catch (const std::exception& e) {
+        RTP_LLM_LOG_WARNING("Failed to reset MTP layer trace after graph capture; disabling trace: %s", e.what());
+        mtp_layer_trace_enabled_ = false;
+    }
+}
+
+void PyWrappedModel::maybeRecordMtpPostLayersTrace(const GptModelInputs& inputs, const GptModelOutputs& outputs) {
+    if (!mtp_layer_trace_enabled_) {
+        return;
+    }
+    try {
+        py::gil_scoped_acquire gil;
+        if (!py::hasattr(py_model_, "record_mtp_post_layers_trace")
+            || !py::hasattr(py_model_, "flush_mtp_layer_trace")) {
+            RTP_LLM_LOG_WARNING("MTP layer trace methods are unavailable; disabling trace");
+            mtp_layer_trace_enabled_ = false;
+            return;
+        }
+        std::string phase = mtp_layer_trace_phase_;
+        if (phase.empty()) {
+            if (inputs.is_target_verify) {
+                phase = "target_verify";
+            } else if (inputs.is_mtp_draft_extend) {
+                phase = "draft_extend";
+            } else if (model_id_ == 1) {
+                phase = inputs.sequence_lengths.numel() == 0 ? "draft_prefill" : "draft_decode";
+            } else {
+                phase = inputs.sequence_lengths.numel() == 0 ? "target_prefill" : "target_decode";
+            }
+        }
+        py_model_.attr("record_mtp_post_layers_trace")(phase,
+                                                       mtp_layer_trace_cycle_,
+                                                       mtp_layer_trace_step_,
+                                                       inputs.combo_tokens,
+                                                       outputs.all_hidden_states,
+                                                       outputs.hidden_states,
+                                                       outputs.logits);
+        py_model_.attr("flush_mtp_layer_trace")();
+    } catch (const py::error_already_set& e) {
+        RTP_LLM_LOG_WARNING("MTP layer trace post-layer flush failed open; disabling trace: %s", e.what());
+        PyErr_Clear();
+        mtp_layer_trace_enabled_ = false;
+    } catch (const std::exception& e) {
+        RTP_LLM_LOG_WARNING("MTP layer trace post-layer flush failed open; disabling trace: %s", e.what());
+        mtp_layer_trace_enabled_ = false;
+    }
+}
+
+void PyWrappedModel::recordMtpDecisionTrace(
+    const std::string&                                               event,
+    int64_t                                                          cycle,
+    int64_t                                                          step,
+    const std::vector<std::pair<std::string, torch::Tensor>>&        tensors,
+    const std::vector<std::pair<std::string, std::vector<int64_t>>>& integer_lists) {
+    if (!mtp_layer_trace_enabled_) {
+        return;
+    }
+    try {
+        py::gil_scoped_acquire gil;
+        if (!py::hasattr(py_model_, "record_mtp_decision_trace")) {
+            RTP_LLM_LOG_WARNING("MTP decision trace method is unavailable; disabling trace");
+            mtp_layer_trace_enabled_ = false;
+            return;
+        }
+        py::dict py_tensors;
+        for (const auto& [name, tensor] : tensors) {
+            if (tensor.defined()) {
+                py_tensors[py::str(name)] = tensor;
+            }
+        }
+        py::dict py_integer_lists;
+        for (const auto& [name, values] : integer_lists) {
+            py::list py_values;
+            for (const auto value : values) {
+                py_values.append(value);
+            }
+            py_integer_lists[py::str(name)] = std::move(py_values);
+        }
+        py_model_.attr("record_mtp_decision_trace")(event, cycle, step, py_tensors, py_integer_lists);
+    } catch (const py::error_already_set& e) {
+        RTP_LLM_LOG_WARNING("MTP decision trace failed open; disabling trace: %s", e.what());
+        PyErr_Clear();
+        mtp_layer_trace_enabled_ = false;
+    } catch (const std::exception& e) {
+        RTP_LLM_LOG_WARNING("MTP decision trace failed open; disabling trace: %s", e.what());
+        mtp_layer_trace_enabled_ = false;
+    }
 }
 
 std::optional<PyCacheStoreInputs> PyWrappedModel::prepareWriteCacheParams(const GptModelInputs& inputs) {
@@ -466,34 +584,39 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         if (int(device_props_.enable_layer_micro_batch)) {
             return forwardMicroBatched(inputs);
         }
+        // CP rewrites token buffers and input lengths for the rank-local view.
+        // MTP reuses the caller-owned input for its draft pass, so keep those
+        // transformations private to this forward invocation.
+        GptModelInputs          prepared_inputs = inputs;
         PyContextParallelParams cp_params;
         if (device_props_.enable_prefill_cp) {
-            context_parallel_processor_->handleInputs(const_cast<GptModelInputs&>(inputs), cp_params);
+            prepared_inputs.input_lengths = inputs.input_lengths.clone().pin_memory();
+            context_parallel_processor_->handleInputs(prepared_inputs, cp_params);
         }
 
         torch::Tensor token_ids;
-        token_ids = tensorHoldHostAndToCuda(inputs.combo_tokens);
+        token_ids = tensorHoldHostAndToCuda(prepared_inputs.combo_tokens);
 
         torch::Tensor input_hiddens =
-            inputs.last_hidden_states.defined() ? inputs.last_hidden_states : torch::empty({0});
+            prepared_inputs.last_hidden_states.defined() ? prepared_inputs.last_hidden_states : torch::empty({0});
 
-        torch::Tensor combo_position_ids = inputs.combo_position_ids.defined() ?
-                                               tensorHoldHostAndToCuda(inputs.combo_position_ids) :
+        torch::Tensor combo_position_ids = prepared_inputs.combo_position_ids.defined() ?
+                                               tensorHoldHostAndToCuda(prepared_inputs.combo_position_ids) :
                                                torch::empty({0});
 
-        auto embedding_inputs      = buildPyEmbeddingInputs(inputs);
-        auto multimodal_inputs     = buildPyMultimodalInputs(inputs);
-        auto attention_inputs      = buildPyAttentionInputs(inputs);
-        auto bert_embedding_inputs = buildBertEmbeddingInputs(inputs);
+        auto embedding_inputs      = buildPyEmbeddingInputs(prepared_inputs);
+        auto multimodal_inputs     = buildPyMultimodalInputs(prepared_inputs);
+        auto attention_inputs      = buildPyAttentionInputs(prepared_inputs);
+        auto bert_embedding_inputs = buildBertEmbeddingInputs(prepared_inputs);
         if (device_props_.enable_prefill_cp) {
             attention_inputs.context_parallel_info = cp_params;
         }
 
-        if (!inputs.warmup && inputs.pd_separation) {
-            attention_inputs.cache_store_inputs = prepareWriteCacheParams(inputs);
+        if (!prepared_inputs.warmup && prepared_inputs.pd_separation) {
+            attention_inputs.cache_store_inputs = prepareWriteCacheParams(prepared_inputs);
             cache_store_async_writer_->init();
         }
-        setupKVCacheForAttentionInputs(attention_inputs, inputs);
+        setupKVCacheForAttentionInputs(attention_inputs, prepared_inputs);
 
         calculatePaddingOffset(attention_inputs);
         attention_inputs.padding_offset = tensorHoldHostAndToCuda(attention_inputs.padding_offset);
@@ -540,16 +663,17 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
             hidden_states         = py_model_outputs.hidden_states.clone();
         }
 
-        if (!inputs.warmup && inputs.pd_separation) {
+        if (!prepared_inputs.warmup && prepared_inputs.pd_separation) {
             cache_store_async_writer_->waitAllDone();
         }
 
         RTP_LLM_LOG_DEBUG("Python object instance forward method called successfully.");
         if (device_props_.enable_prefill_cp) {
-            size_t num_valid_tokens = context_parallel_processor_->handleOutputs(hidden_states, inputs, cp_params);
-            return callForwardPostLayers(hidden_states, inputs, true, num_valid_tokens);
+            size_t num_valid_tokens =
+                context_parallel_processor_->handleOutputs(hidden_states, prepared_inputs, cp_params);
+            return callForwardPostLayers(hidden_states, prepared_inputs, true, num_valid_tokens);
         }
-        return callForwardPostLayers(hidden_states, inputs, true);
+        return callForwardPostLayers(hidden_states, prepared_inputs, true);
 
     } catch (const py::error_already_set& e) {
         RTP_LLM_LOG_ERROR("Python error during forward call on Python instance: %s", e.what());

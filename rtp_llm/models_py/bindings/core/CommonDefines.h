@@ -4,8 +4,25 @@
 #include <string.h>
 #include <exception>
 #include <sstream>
+#include <cstdint>
 
 namespace rtp_llm {
+
+enum class CpKvLayoutKind : uint8_t {
+    REPLICATED                = 0,
+    LEGACY_DYNAMIC_CONTIGUOUS = 1,
+    PAGE_INTERLEAVED          = 2,
+};
+
+struct CpKvLayoutConfig {
+    CpKvLayoutKind kind              = CpKvLayoutKind::REPLICATED;
+    int            cp_size           = 1;
+    int            cp_rank           = 0;
+    int            page_size         = 0;
+    int            interleave_size   = 0;
+    uint32_t       layout_version    = 0;
+    int64_t        max_global_length = 0;
+};
 
 enum class OpErrorType {
     ERROR_NONE,

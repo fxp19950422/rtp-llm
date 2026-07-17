@@ -11,6 +11,28 @@
 
 namespace rtp_llm {
 
+static inline int cpShardLenForBlocks(int len, int cp_shard_size) {
+    return cp_shard_size > 1 ? (len + cp_shard_size - 1) / cp_shard_size : len;
+}
+
+static inline bool usesPageInterleavedCpStripes(const CacheConfig& config) {
+    return config.cp_shard_size > 1 && config.cp_kv_layout.kind == CpKvLayoutKind::PAGE_INTERLEAVED;
+}
+
+static CacheKeysType
+pageInterleavedStripeKeys(const CacheKeysType& cache_keys, int cp_shard_size, size_t stripe_count) {
+    CacheKeysType stripe_keys;
+    stripe_keys.reserve(stripe_count);
+    for (size_t stripe = 0; stripe < stripe_count; ++stripe) {
+        const size_t global_page = (stripe + 1) * static_cast<size_t>(cp_shard_size) - 1;
+        if (global_page >= cache_keys.size()) {
+            break;
+        }
+        stripe_keys.push_back(cache_keys[global_page]);
+    }
+    return stripe_keys;
+}
+
 int SingleTypeKVCacheAllocator::getNeedBlocks(const MallocInfo& malloc_info) const {
     if (!malloc_info.batch_kv_cache_resource || !malloc_info.complete_token_ids) {
         return 0;
@@ -18,9 +40,10 @@ int SingleTypeKVCacheAllocator::getNeedBlocks(const MallocInfo& malloc_info) con
     const bool reuse_enabled    = malloc_info.reuse_cache;
     const int  reuse_blocks_len = reuse_enabled ? malloc_info.batch_kv_cache_resource->curBlocksNum() : 0;
     const int  batch_size       = malloc_info.batch_kv_cache_resource->batchSize();
-    const int  seq_len          = malloc_info.complete_token_ids->seqLength();
-    const int  reserve_step     = malloc_info.complete_token_ids->getReserveStep();
-    const int  common_seq_len   = std::min(malloc_info.complete_token_ids->commonSeqLength(), seq_len);
+    const int  seq_len        = cpShardLenForBlocks(malloc_info.complete_token_ids->seqLength(), config_.cp_shard_size);
+    const int  reserve_step   = malloc_info.complete_token_ids->getReserveStep();
+    const int  common_seq_len = std::min(
+        cpShardLenForBlocks(malloc_info.complete_token_ids->commonSeqLength(), config_.cp_shard_size), seq_len);
 
     const auto need =
         full_kv_cache_group_->getNeedBlocks(common_seq_len, seq_len, reserve_step, reuse_blocks_len, reuse_enabled);
@@ -63,10 +86,11 @@ bool SingleTypeKVCacheAllocator::doInit() {
 }
 
 MallocResult SingleTypeKVCacheAllocator::initMallocForCommonLen(const MallocInfo& malloc_info) {
-    auto& kv_resource = malloc_info.batch_kv_cache_resource;
-    int   reuse_len   = 0;
-    int   common_seq_len =
+    auto&     kv_resource = malloc_info.batch_kv_cache_resource;
+    int       reuse_len   = 0;
+    const int global_common_seq_len =
         std::min(malloc_info.complete_token_ids->commonSeqLength(), malloc_info.complete_token_ids->totalSeqLength());
+    int common_seq_len = cpShardLenForBlocks(global_common_seq_len, config_.cp_shard_size);
 
     const auto& cache_keys         = kv_resource->cacheKeys(0);
     auto&       block_ids_0        = kv_resource->mutableBlockIds(0);
@@ -82,12 +106,24 @@ MallocResult SingleTypeKVCacheAllocator::initMallocForCommonLen(const MallocInfo
     // 2. if the last block is full and matched, the reuse length will be equal to the seq_len, which causes core dump
     // in computing ops.
     if (malloc_info.enable_device_cache) {
-        CacheKeysType match_keys(cache_keys.begin(), cache_keys.empty() ? cache_keys.end() : cache_keys.end() - 1);
-        auto          match_begin_time_us = currentTimeUs();
-        auto          match_result        = full_kv_cache_group_->match(match_keys);
-        match_cost_time_us                = currentTimeUs() - match_begin_time_us;
-        reuse_len                         = static_cast<int>(match_result.reuse_length);
-        reuse_blocks                      = static_cast<int>(match_result.reuse_blocks);
+        CacheKeysType match_keys;
+        if (usesPageInterleavedCpStripes(config_)) {
+            const size_t stripe_size =
+                static_cast<size_t>(config_.cp_shard_size) * static_cast<size_t>(config_.seq_size_per_block);
+            const size_t reusable_stripes =
+                global_common_seq_len > 0 ? static_cast<size_t>(global_common_seq_len - 1) / stripe_size : 0;
+            match_keys = pageInterleavedStripeKeys(cache_keys, config_.cp_shard_size, reusable_stripes);
+        } else {
+            match_keys =
+                CacheKeysType(cache_keys.begin(), cache_keys.empty() ? cache_keys.end() : cache_keys.end() - 1);
+        }
+        auto match_begin_time_us = currentTimeUs();
+        auto match_result        = full_kv_cache_group_->match(match_keys);
+        match_cost_time_us       = currentTimeUs() - match_begin_time_us;
+        reuse_len                = usesPageInterleavedCpStripes(config_) ?
+                                       static_cast<int>(match_result.reuse_length) * config_.cp_shard_size :
+                                       static_cast<int>(match_result.reuse_length);
+        reuse_blocks             = static_cast<int>(match_result.reuse_blocks);
         kv_resource->cacheResource(0).setDeviceReuseBlockNum(reuse_blocks);
         full_kv_cache_group_->reference(block_ids_0, match_result.block_indices);
     }
@@ -128,7 +164,7 @@ MallocResult SingleTypeKVCacheAllocator::incrMalloc(const MallocInfo& malloc_inf
     auto& kv_resource    = malloc_info.batch_kv_cache_resource;
     int   batch_size     = kv_resource->batchSize();
     int   current_blocks = kv_resource->curBlocksNum();
-    int   seq_len        = malloc_info.complete_token_ids->seqLength();
+    int   seq_len        = cpShardLenForBlocks(malloc_info.complete_token_ids->seqLength(), config_.cp_shard_size);
     int   reserve_step   = malloc_info.complete_token_ids->getReserveStep();
 
     auto need_blocks = full_kv_cache_group_->needBlocksNum(seq_len, current_blocks, reserve_step);
@@ -198,12 +234,24 @@ void SingleTypeKVCacheAllocator::insertIntoCache(const InsertInfo& insert_info) 
         const auto& cache_keys = kv_resource->cacheKeys(batch_id);
         const auto& blocks     = kv_resource->blocks(batch_id);
 
-        size_t block_num = std::min(size_t(cache_keys.size()), size_t(blocks.size()));
+        CacheKeysType put_cache_keys;
+        if (usesPageInterleavedCpStripes(config_)) {
+            const int    global_seq_len = std::min(insert_info.complete_token_ids->commonSeqLength(),
+                                                insert_info.complete_token_ids->totalSeqLength());
+            const size_t stripe_size =
+                static_cast<size_t>(config_.cp_shard_size) * static_cast<size_t>(config_.seq_size_per_block);
+            const size_t complete_stripes = global_seq_len > 0 ? static_cast<size_t>(global_seq_len) / stripe_size : 0;
+            put_cache_keys = pageInterleavedStripeKeys(cache_keys, config_.cp_shard_size, complete_stripes);
+        } else {
+            put_cache_keys = cache_keys;
+        }
+
+        size_t block_num = std::min(put_cache_keys.size(), blocks.size());
         if (block_num == 0) {
             continue;
         }
 
-        CacheKeysType    put_cache_keys(cache_keys.begin(), cache_keys.begin() + block_num);
+        put_cache_keys.resize(block_num);
         BlockIndicesType put_block_ids(blocks.begin(), blocks.begin() + block_num);
 
         full_kv_cache_group_->insertIntoCache(put_cache_keys, put_block_ids, insert_info.is_resident);
@@ -420,7 +468,7 @@ int SingleTypeKVCacheAllocator::seqSizePerBlock() const {
 int SingleTypeKVCacheAllocator::singleBatchNeedBlocks(const BatchKVCacheResourcePtr& batch_kv_cache_resource,
                                                       int                            seq_len,
                                                       int                            reserve_step) const {
-    return full_kv_cache_group_->needBlocksNum(seq_len, 0, reserve_step);
+    return full_kv_cache_group_->needBlocksNum(cpShardLenForBlocks(seq_len, config_.cp_shard_size), 0, reserve_step);
 }
 
 }  // namespace rtp_llm

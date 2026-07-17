@@ -8,6 +8,22 @@ void registerPyOpDefs(pybind11::module& m) {
         .value("FULL", rtp_llm::CacheGroupType::FULL)
         .export_values();
 
+    pybind11::enum_<rtp_llm::CpKvLayoutKind>(m, "CpKvLayoutKind")
+        .value("REPLICATED", rtp_llm::CpKvLayoutKind::REPLICATED)
+        .value("LEGACY_DYNAMIC_CONTIGUOUS", rtp_llm::CpKvLayoutKind::LEGACY_DYNAMIC_CONTIGUOUS)
+        .value("PAGE_INTERLEAVED", rtp_llm::CpKvLayoutKind::PAGE_INTERLEAVED)
+        .export_values();
+
+    pybind11::class_<rtp_llm::CpKvLayoutConfig>(m, "CpKvLayoutConfig")
+        .def(pybind11::init<>())
+        .def_readwrite("kind", &rtp_llm::CpKvLayoutConfig::kind)
+        .def_readwrite("cp_size", &rtp_llm::CpKvLayoutConfig::cp_size)
+        .def_readwrite("cp_rank", &rtp_llm::CpKvLayoutConfig::cp_rank)
+        .def_readwrite("page_size", &rtp_llm::CpKvLayoutConfig::page_size)
+        .def_readwrite("interleave_size", &rtp_llm::CpKvLayoutConfig::interleave_size)
+        .def_readwrite("layout_version", &rtp_llm::CpKvLayoutConfig::layout_version)
+        .def_readwrite("max_global_length", &rtp_llm::CpKvLayoutConfig::max_global_length);
+
     pybind11::class_<LayerKVCache>(m, "LayerKVCache")
         .def(pybind11::init<>())
         .def_readwrite("kv_cache_base", &LayerKVCache::kv_cache_base, "Key/value cache tensor (per-layer view)")
@@ -94,6 +110,8 @@ void registerPyOpDefs(pybind11::module& m) {
         .def_readwrite("is_prefill", &PyAttentionInputs::is_prefill)
         .def_readwrite("is_cuda_graph", &PyAttentionInputs::is_cuda_graph)
         .def_readwrite("is_target_verify", &PyAttentionInputs::is_target_verify)
+        .def_readwrite("is_mtp_draft_extend", &PyAttentionInputs::is_mtp_draft_extend)
+        .def_readwrite("cp_kv_layout", &PyAttentionInputs::cp_kv_layout)
         .def_readwrite("prefix_lengths", &PyAttentionInputs::prefix_lengths)
         .def_readwrite("sequence_lengths", &PyAttentionInputs::sequence_lengths)
         .def_readwrite("input_lengths", &PyAttentionInputs::input_lengths)

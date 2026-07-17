@@ -119,6 +119,10 @@ class PureCpRouterBase(FusedMoeDataRouter):
                 topk_ids_full, self.expert_start_id, self.expert_num_per_rank
             )
         )
+        # Remote experts are represented by -1 after localization. Some
+        # executors clamp that sentinel to expert 0, so its routing weight must
+        # be zero before the payload enters an executor.
+        topk_weights_full = topk_weights_full.masked_fill(adjusted_topk_ids < 0, 0)
 
         return ExpertForwardPayload(
             expert_x,
@@ -163,6 +167,32 @@ class PureCpRouterFp8PerBlock(PureCpRouterBase):
             )
         else:
             return trt_fp8_quantize_128(a1, False)
+
+
+class PureCpRouterNoQuant(PureCpRouterBase):
+    """Pure CP router for unquantized rank-local expert weights."""
+
+    @classmethod
+    def check_conditions(cls, checker: Any, config: MoEConfigAdapter) -> None:
+        super().check_conditions(checker, config)
+        checker.check(MoeConfigResolver().get_quant_method(config) is None)
+
+    def prepare(
+        self,
+        a1: torch.Tensor,
+        a1_scale: Optional[torch.Tensor],
+        a2_scale: Optional[torch.Tensor],
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> ExpertForwardPayload:
+        payload = super().prepare(a1, a1_scale, a2_scale, topk_weights, topk_ids)
+        payload.expert_ids_are_local = True
+        return payload
+
+    def _do_quant(
+        self, a1: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        return a1, None
 
 
 class PureCpRouterInt8PerChannel(PureCpRouterBase):

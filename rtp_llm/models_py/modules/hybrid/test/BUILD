@@ -68,6 +68,12 @@ py_test (
 )
 
 py_test (
+    name = "dense_mlp_chunking_test",
+    srcs = ["dense_mlp_chunking_test.py"],
+    deps = py_test_deps,
+)
+
+py_test (
    name = "flashinfer_jit_test",
    srcs = ["flashinfer_jit_test.py"],
    deps = [

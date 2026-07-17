@@ -13,6 +13,8 @@ namespace rtp_llm {
 
 class CacheConfigCreator {
 public:
+    static bool        supportsPageInterleavedCpKv(const ModelConfig&       model_config,
+                                                   const ParallelismConfig& parallelism_config);
     static CacheConfig createBasicConfig(const ModelConfig&       model_config,
                                          const ParallelismConfig& parallelism_config,
                                          bool                     is_mtp = false);

@@ -3,6 +3,15 @@
 
 namespace rtp_llm {
 
+namespace detail {
+
+torch::Tensor restoreContextParallelOutputs(const torch::Tensor& decode_hidden,
+                                            const torch::Tensor& gathered_prefill_hidden,
+                                            const torch::Tensor& restore_indices,
+                                            const torch::Tensor& padding_mask);
+
+}  // namespace detail
+
 /// @brief Zig-zag processing implementation for context parallel
 ///
 /// Processes tokens using a zig-zag shuffle pattern where each rank receives

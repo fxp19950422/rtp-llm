@@ -93,7 +93,10 @@ NormalExecutor::NormalExecutor(const EngineInitParams&                params,
          params.model_config_.attn_config.kernel_tokens_per_block,
          kv_cache_group_num,
          kv_cache_layer_to_group,
-         cache_manager});
+         cache_manager,
+         cache_manager ? (is_propose_ ? cache_manager->getMTPModuleCacheConfig(propose_model_index_).cp_kv_layout :
+                                        cache_manager->cacheConfig().cp_kv_layout) :
+                         CpKvLayoutConfig{}});
 
     if (params.ffn_disaggregate_config.enable_ffn_disaggregate) {
         RTP_LLM_LOG_INFO("using ffn as service");
@@ -180,7 +183,10 @@ absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams
         executor_collector.eplb_step_latency_us = autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
     }
 
-    if (tp_rank_ > 0 || warm_up_ || streams.size() == 0) {
+    // Fake streams only keep TP/EP collectives aligned on idle DP ranks. They
+    // must execute the model, but they do not represent a user request and can
+    // have no sampleable logits after CP padding/restoration.
+    if (detail::shouldSkipNormalSampling(tp_rank_, warm_up_, streams.size(), model_input.is_fake_stream)) {
         cudaSyncAndCheck();
         model_->releaseBuffers();
         return absl::OkStatus();

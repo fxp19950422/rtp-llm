@@ -28,6 +28,7 @@ from .no_quant import (
     CudaNoQuantCppStrategy,
     CudaNoQuantDpNormalStrategy,
     CudaNoQuantEpLowLatencyStrategy,
+    CudaNoQuantPureCPStrategy,
 )
 from .w4a8_int4_per_channel import (
     CudaW4a8Int4PerChannelEpLowLatencyStrategy,
@@ -40,6 +41,7 @@ __all__ = [
     "CudaNoQuantEpLowLatencyStrategy",
     "CudaNoQuantCppStrategy",
     "CudaNoQuantDpNormalStrategy",
+    "CudaNoQuantPureCPStrategy",
     # INT8 per-channel
     "CudaInt8PerChannelCppStrategy",
     "CudaInt8PerChannelPureCPStrategy",

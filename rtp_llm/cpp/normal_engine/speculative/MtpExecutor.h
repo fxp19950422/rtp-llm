@@ -100,7 +100,8 @@ protected:
     void draftModelDecode(GptModelInputs&             model_input,
                           const StreamGroups&         stream_groups,
                           std::vector<torch::Tensor>& draft_probs_list,
-                          torch::Tensor&              draft_token_ids_t);
+                          torch::Tensor&              draft_token_ids_t,
+                          int64_t                     trace_cycle);
 
     void prepareStreams(const std::list<GenerateStreamPtr>& streams,
                         std::list<GenerateStreamPtr>&       prefill_streams,
@@ -138,5 +139,7 @@ private:
     // group id tensors
     torch::Tensor target_kv_cache_layer_to_group;
     torch::Tensor draft_kv_cache_layer_to_group;
+
+    int64_t mtp_trace_cycle_{0};
 };
 };  // namespace rtp_llm

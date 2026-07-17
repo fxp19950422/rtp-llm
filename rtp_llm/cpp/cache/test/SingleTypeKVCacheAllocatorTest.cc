@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
+#include <cstdlib>
 #include <memory>
 #include <vector>
 #include <set>
 #include <optional>
+#include <string>
 #include <torch/torch.h>
 #include "rtp_llm/cpp/utils/Logger.h"
 #include "rtp_llm/cpp/cache/SingleTypeKVCacheAllocator.h"
@@ -13,9 +15,36 @@
 #include "rtp_llm/cpp/cache/test/CacheConfigTestUtils.h"
 #include "rtp_llm/cpp/cache/BatchKVCacheResource.h"
 #include "rtp_llm/cpp/engine_base/stream/CompleteTokenIds.h"
+#include "rtp_llm/models_py/bindings/OpDefs.h"
 
 namespace rtp_llm {
 namespace test {
+
+class ScopedEnvVar {
+public:
+    ScopedEnvVar(const char* name, const char* value): name_(name) {
+        if (const char* old_value = std::getenv(name)) {
+            old_value_ = old_value;
+        }
+        if (value == nullptr) {
+            unsetenv(name);
+        } else {
+            setenv(name, value, 1);
+        }
+    }
+
+    ~ScopedEnvVar() {
+        if (old_value_.has_value()) {
+            setenv(name_.c_str(), old_value_->c_str(), 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+private:
+    std::string                name_;
+    std::optional<std::string> old_value_;
+};
 
 CacheConfig createSingleTypeTestConfig(int layer_num = 4, int block_num = 10, int seq_size_per_block = 8) {
     return makeSimpleMhaCacheConfig(/*layer_num=*/layer_num,
@@ -800,6 +829,143 @@ TEST_F(SingleTypeKVCacheAllocatorTest, MaxSeqLen) {
     allocator_->init();
 
     EXPECT_EQ(allocator_->maxAvailableTokensNum(), (10 - 1) * 8);  // block_num * seq_size_per_block
+}
+
+TEST_F(SingleTypeKVCacheAllocatorTest, CpShardScalesCapacityAndPerRankBlockNeedForCp2AndCp4) {
+    for (const int cp_size : {2, 4}) {
+        auto config          = createSingleTypeTestConfig(/*layer_num=*/4, /*block_num=*/10, /*seq_size_per_block=*/8);
+        config.cp_shard_size = cp_size;
+        allocator_           = std::make_shared<SingleTypeKVCacheAllocator>(config);
+        ASSERT_TRUE(allocator_->init());
+
+        EXPECT_EQ(allocator_->maxAvailableTokensNum(), (10 - 1) * 8 * cp_size);
+
+        auto batch_resource = createBatchKVCacheResource(/*batch_size=*/1, config.layer_num);
+        EXPECT_EQ(allocator_->singleBatchNeedBlocks(batch_resource, /*global seq_len=*/65, /*reserve_step=*/0),
+                  (65 + cp_size * 8 - 1) / (cp_size * 8));
+        allocator_.reset();
+    }
+}
+
+TEST_F(SingleTypeKVCacheAllocatorTest, CpKvLayoutDefaultsToReplicated) {
+    CacheConfig config;
+
+    EXPECT_EQ(config.cp_kv_layout.kind, CpKvLayoutKind::REPLICATED);
+    EXPECT_EQ(config.cp_kv_layout.cp_size, 1);
+    EXPECT_EQ(config.cp_kv_layout.cp_rank, 0);
+    EXPECT_EQ(config.cp_kv_layout.page_size, 0);
+    EXPECT_EQ(config.cp_kv_layout.interleave_size, 0);
+    EXPECT_EQ(config.cp_kv_layout.layout_version, 0);
+    EXPECT_EQ(config.cp_kv_layout.max_global_length, 0);
+    EXPECT_EQ(config.cp_shard_size, 1);
+
+    torch_ext::PyAttentionInputs inputs;
+    EXPECT_EQ(inputs.cp_kv_layout.kind, CpKvLayoutKind::REPLICATED);
+}
+
+TEST_F(SingleTypeKVCacheAllocatorTest, CpKvLayoutSelectsPageInterleavedOnlyForSupportedGlmPpuMhaCpShard) {
+    ScopedEnvVar shard_env("RTP_LLM_CP_KV_SHARD_DECODE", "1");
+    ScopedEnvVar layout_env("RTP_LLM_CP_KV_LAYOUT", "page_interleaved");
+
+    auto model_config                         = makeTestModelConfig(/*num_layers=*/2);
+    model_config.model_type                   = "glm4_moe";
+    model_config.attn_config.tokens_per_block = 64;
+
+    ParallelismConfig parallelism_config;
+    parallelism_config.tp_size                  = 4;
+    parallelism_config.tp_rank                  = 3;
+    parallelism_config.prefill_cp_config.method = CPRotateMethod::ALL_GATHER;
+
+    RuntimeConfig runtime_config;
+    KVCacheConfig kv_cache_config;
+    kv_cache_config.seq_size_per_block = 64;
+    kv_cache_config.test_block_num     = 10;
+
+#if USE_PPU
+    auto config = CacheConfigCreator::createConfig(model_config, parallelism_config, runtime_config, kv_cache_config);
+    EXPECT_EQ(config.cp_shard_size, 4);
+    EXPECT_EQ(config.cp_kv_layout.kind, CpKvLayoutKind::PAGE_INTERLEAVED);
+    EXPECT_EQ(config.cp_kv_layout.cp_size, 4);
+    EXPECT_EQ(config.cp_kv_layout.cp_rank, 3);
+    EXPECT_EQ(config.cp_kv_layout.page_size, 64);
+    EXPECT_EQ(config.cp_kv_layout.interleave_size, 64);
+    EXPECT_EQ(config.cp_kv_layout.layout_version, 1);
+    EXPECT_EQ(config.cp_kv_layout.max_global_length, 128);
+#else
+    EXPECT_THROW(CacheConfigCreator::createConfig(model_config, parallelism_config, runtime_config, kv_cache_config),
+                 std::exception);
+#endif
+}
+
+TEST_F(SingleTypeKVCacheAllocatorTest, CpKvLayoutPropagatesToMtpScoreAndDraftConfigs) {
+    ScopedEnvVar shard_env("RTP_LLM_CP_KV_SHARD_DECODE", "1");
+    ScopedEnvVar layout_env("RTP_LLM_CP_KV_LAYOUT", "page_interleaved");
+
+    auto score_model_config                         = makeTestModelConfig(/*num_layers=*/2);
+    score_model_config.model_type                   = "glm4_moe";
+    score_model_config.attn_config.tokens_per_block = 64;
+
+    auto propose_model_config                         = makeTestModelConfig(/*num_layers=*/1);
+    propose_model_config.model_type                   = "glm4_moe-mtp";
+    propose_model_config.attn_config.tokens_per_block = 64;
+
+    ParallelismConfig parallelism_config;
+    parallelism_config.tp_size                  = 4;
+    parallelism_config.tp_rank                  = 3;
+    parallelism_config.prefill_cp_config.method = CPRotateMethod::ALL_GATHER;
+
+    RuntimeConfig runtime_config;
+    KVCacheConfig kv_cache_config;
+    kv_cache_config.seq_size_per_block = 64;
+    kv_cache_config.test_block_num     = 10;
+
+    SpeculativeExecutionConfig sp_config;
+    sp_config.type              = SP_TYPE_MTP;
+    sp_config.gen_num_per_cycle = 5;
+
+#if USE_PPU
+    const auto config = CacheConfigCreator::createSpConfig(score_model_config,
+                                                           propose_model_config,
+                                                           parallelism_config,
+                                                           runtime_config,
+                                                           kv_cache_config,
+                                                           sp_config,
+                                                           /*warm_up_result=*/std::nullopt,
+                                                           /*is_mtp=*/true,
+                                                           /*is_eagle=*/false);
+
+    EXPECT_EQ(config.cp_shard_size, 4);
+    EXPECT_EQ(config.cp_kv_layout.kind, CpKvLayoutKind::PAGE_INTERLEAVED);
+    EXPECT_EQ(config.cp_kv_layout.cp_size, 4);
+    EXPECT_EQ(config.cp_kv_layout.cp_rank, 3);
+    EXPECT_EQ(config.cp_kv_layout.page_size, 64);
+    EXPECT_EQ(config.cp_kv_layout.interleave_size, 64);
+    EXPECT_EQ(config.cp_kv_layout.layout_version, 1);
+    EXPECT_EQ(config.cp_kv_layout.max_global_length, 128);
+
+    ASSERT_EQ(config.mtp_sub_configs.size(), 1u);
+    ASSERT_NE(config.mtp_sub_configs[0], nullptr);
+    const auto& draft_config = *config.mtp_sub_configs[0];
+    EXPECT_EQ(draft_config.cp_shard_size, 4);
+    EXPECT_EQ(draft_config.cp_kv_layout.kind, CpKvLayoutKind::PAGE_INTERLEAVED);
+    EXPECT_EQ(draft_config.cp_kv_layout.cp_size, 4);
+    EXPECT_EQ(draft_config.cp_kv_layout.cp_rank, 3);
+    EXPECT_EQ(draft_config.cp_kv_layout.page_size, 64);
+    EXPECT_EQ(draft_config.cp_kv_layout.interleave_size, 64);
+    EXPECT_EQ(draft_config.cp_kv_layout.layout_version, 1);
+    EXPECT_EQ(draft_config.cp_kv_layout.max_global_length, 128);
+#else
+    EXPECT_THROW(CacheConfigCreator::createSpConfig(score_model_config,
+                                                    propose_model_config,
+                                                    parallelism_config,
+                                                    runtime_config,
+                                                    kv_cache_config,
+                                                    sp_config,
+                                                    /*warm_up_result=*/std::nullopt,
+                                                    /*is_mtp=*/true,
+                                                    /*is_eagle=*/false),
+                 std::exception);
+#endif
 }
 
 // Test boundary conditions

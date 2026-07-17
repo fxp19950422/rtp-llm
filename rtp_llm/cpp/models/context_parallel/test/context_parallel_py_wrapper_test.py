@@ -318,6 +318,87 @@ class TestGenerateQKVPaddingMask(unittest.TestCase):
         expect_padding_mask[38:] = 0
         self.assertTrue(torch.equal(expect_padding_mask, padding_mask))
 
+
+class TestRestoreContextParallelOutputs(unittest.TestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA-compatible device")
+    def test_decode_only_preserves_device_tokens_between_mtp_draft_steps(self):
+        combo_tokens = torch.tensor([11, 12], dtype=torch.int32, device="cuda")
+        hidden_states = torch.arange(8, dtype=torch.float32, device="cuda").reshape(
+            2, 4
+        )
+
+        prepared_tokens, prepared_hidden = (
+            cp_test.handle_context_parallel_decode_inputs(combo_tokens, hidden_states)
+        )
+
+        self.assertTrue(prepared_tokens.is_cuda)
+        self.assertEqual(prepared_tokens.data_ptr(), combo_tokens.data_ptr())
+        self.assertTrue(torch.equal(prepared_tokens, combo_tokens))
+        self.assertTrue(torch.equal(prepared_hidden, hidden_states))
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA-compatible device")
+    def test_target_verify_shuffles_and_pads_device_tokens(self):
+        combo_tokens = torch.tensor(
+            [10, 11, 12, 13, 14, 15], dtype=torch.int32, device="cuda"
+        )
+
+        rank0_tokens = cp_test.handle_context_parallel_target_verify_inputs(
+            combo_tokens, 0
+        )
+        rank1_tokens = cp_test.handle_context_parallel_target_verify_inputs(
+            combo_tokens, 1
+        )
+
+        self.assertTrue(torch.equal(rank0_tokens.cpu(), torch.tensor([10, 0])))
+        self.assertTrue(torch.equal(rank1_tokens.cpu(), torch.tensor([11, 0])))
+
+    def test_mtp_hidden_states_follow_token_shuffle_and_zero_padding(self):
+        global_hidden = torch.arange(22, dtype=torch.float32).reshape(11, 2)
+        selected = cp_test.select_context_parallel_hidden_states(
+            global_hidden,
+            1,
+            torch.tensor([1, 6, 4], dtype=torch.int32),
+            torch.tensor([4, 2], dtype=torch.int32),
+            torch.tensor([0, 1, 5, 6, 1, 2], dtype=torch.int32),
+        )
+
+        expected = torch.stack(
+            (
+                global_hidden[0],
+                global_hidden[1],
+                global_hidden[2],
+                global_hidden[6],
+                torch.zeros(2),
+                global_hidden[8],
+                global_hidden[9],
+            )
+        )
+        self.assertTrue(torch.equal(selected, expected))
+
+    def test_decode_only_preserves_hidden_rows(self):
+        decode_hidden = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        restored = cp_test.restore_context_parallel_outputs(
+            decode_hidden,
+            torch.empty((0, 2)),
+            torch.empty((0,), dtype=torch.int32),
+            torch.empty((0,), dtype=torch.bool),
+        )
+        self.assertTrue(torch.equal(restored, decode_hidden))
+
+    def test_mixed_decode_and_prefill_restores_only_valid_prefill_rows(self):
+        decode_hidden = torch.tensor([[10.0], [20.0]])
+        gathered_prefill_hidden = torch.tensor([[0.0], [1.0], [2.0], [3.0]])
+        restore_indices = torch.tensor([2, 0, 3, 1], dtype=torch.int32)
+        padding_mask = torch.tensor([True, True, False, True])
+        restored = cp_test.restore_context_parallel_outputs(
+            decode_hidden,
+            gathered_prefill_hidden,
+            restore_indices,
+            padding_mask,
+        )
+        expected = torch.tensor([[10.0], [20.0], [2.0], [0.0], [1.0]])
+        self.assertTrue(torch.equal(restored, expected))
+
     def test_no_padding(self):
         """Test when there is no padding"""
         prefill_cp_chunk_lengths = torch.tensor([8, 8, 8], dtype=torch.int32)

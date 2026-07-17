@@ -1,5 +1,6 @@
 """Unified dense MLP implementation supporting multiple activation types."""
 
+import os
 from typing import Dict, Optional, Type
 
 import torch
@@ -17,6 +18,7 @@ _ACTIVATION_FUNC_MAP: Dict[ActivationType, Type[nn.Module]] = {
 }
 
 _GATED_ACTIVATION_TYPE_LIST = [ActivationType.Swiglu]
+_PREFILL_CHUNK_SIZE = int(os.environ.get("DENSE_MLP_PREFILL_CHUNK_SIZE", "0") or "0")
 
 
 class DenseMLP(nn.Module):
@@ -93,14 +95,37 @@ class DenseMLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, skip_allreduce: bool = False) -> torch.Tensor:
+        if (
+            _PREFILL_CHUNK_SIZE > 0
+            and not torch.cuda.is_current_stream_capturing()
+            and x.shape[0] > _PREFILL_CHUNK_SIZE
+        ):
+            output = None
+            for start in range(0, x.shape[0], _PREFILL_CHUNK_SIZE):
+                end = min(start + _PREFILL_CHUNK_SIZE, x.shape[0])
+                chunk_output = self._forward_local(x[start:end])
+                if output is None:
+                    output = torch.empty(
+                        (*x.shape[:-1], chunk_output.shape[-1]),
+                        dtype=chunk_output.dtype,
+                        device=chunk_output.device,
+                    )
+                output[start:end].copy_(chunk_output)
+            assert output is not None
+        else:
+            output = self._forward_local(x)
+
+        ffn_tp_size = self.parallelism_config.get_ffn_tp_size()
+        if not skip_allreduce and ffn_tp_size > 1:
+            output = all_reduce(output, group=Group.TP)
+        return output
+
+    def _forward_local(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute the rank-local MLP result without a collective."""
         if not self.is_gated and self.activation_type == ActivationType.Gelu:
             activated = self.up_proj.forward_with_bias_gelu(x)
         else:
             up = self.up_proj(x)
             activated = self.act_fn(up)
 
-        ffn_tp_size = self.parallelism_config.get_ffn_tp_size()
-        output = self.down_proj(activated)
-        if not skip_allreduce and ffn_tp_size > 1:
-            output = all_reduce(output, group=Group.TP)
-        return output
+        return self.down_proj(activated)

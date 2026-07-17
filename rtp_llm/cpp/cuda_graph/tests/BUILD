@@ -25,6 +25,17 @@ cc_binary(
     visibility = ["//visibility:public"],
 )
 
+cc_test(
+    name = "cuda_graph_utils_test",
+    srcs = ["CudaGraphUtilsTest.cc"],
+    copts = copts(),
+    deps = [
+        "//rtp_llm/cpp/cuda_graph:cuda_graph_impl",
+        "@com_google_googletest//:gtest",
+        "@com_google_googletest//:gtest_main",
+    ] + torch_deps(),
+)
+
 py_library(
     name = "cuda_graph_test_utils",
     srcs = ["cuda_graph_test_utils.py"],

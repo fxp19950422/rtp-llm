@@ -328,3 +328,33 @@ TEST_F(ExecOpsTest, testWriteCacheStoreGid_2DOffset_NonZeroGroup) {
     EXPECT_EQ(cache_store->records[0].block_count, 3u)
         << "2-D path, layer 1 → group 1 (FULL): all 3 blocks should be stored";
 }
+
+TEST_F(ExecOpsTest, testWriteCacheStoreCpShardUsesRankLocalLengthsAndBlockTable) {
+    auto cache_store = std::make_shared<MockCacheStore>();
+    auto param       = makeHybridInputs(/*layer_id=*/1);
+
+    // CP8 page-interleaved transfer passes lengths owned by this rank, not the
+    // global request length. One reused page plus one new page must fit the two
+    // local block-table entries and transfer exactly those two logical blocks.
+    param.tokens_per_block     = 64;
+    param.input_lengths_host   = torch::tensor({64}, torch::kInt32);
+    param.prefix_lengths_host  = torch::tensor({64}, torch::kInt32);
+    param.host_kv_cache_offset = torch::ones({2, 1, 2}, torch::kInt32);
+    param.cache_keys           = {"local_stripe_0", "local_stripe_1"};
+
+    rtp_llm::KvCacheInfo kv;
+    kv.layer_num       = 2;
+    kv.kv_cache_buffer = torch::zeros({128}, torch::kByte);
+
+    ASSERT_NO_THROW(rtp_llm::runtimeWriteCacheStore(param, kv, /*mla_kvcache=*/false, cache_store));
+    ASSERT_EQ(cache_store->records.size(), 1u);
+    EXPECT_EQ(cache_store->records[0].block_count, 2u);
+
+    // Passing the corresponding global input length against the local table is
+    // invalid and must fail closed instead of reading beyond the table.
+    auto global_length_param               = param;
+    global_length_param.input_lengths_host = torch::tensor({512}, torch::kInt32);
+    EXPECT_THROW(rtp_llm::runtimeWriteCacheStore(
+                     global_length_param, kv, /*mla_kvcache=*/false, std::make_shared<MockCacheStore>()),
+                 std::exception);
+}

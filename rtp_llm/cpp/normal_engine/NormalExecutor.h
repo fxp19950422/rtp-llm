@@ -15,6 +15,14 @@
 
 namespace rtp_llm {
 
+namespace detail {
+
+inline bool shouldSkipNormalSampling(int tp_rank, bool warm_up, size_t stream_count, bool is_fake_stream) {
+    return tp_rank > 0 || warm_up || stream_count == 0 || is_fake_stream;
+}
+
+}  // namespace detail
+
 class KVCacheManager;
 struct GptModelInitParams;
 

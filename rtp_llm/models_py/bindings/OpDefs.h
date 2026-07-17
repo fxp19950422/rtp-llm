@@ -8,6 +8,7 @@
 #include "rtp_llm/cpp/model_utils/AttentionConfig.h"
 #include "rtp_llm/models_py/bindings/ParamsBase.h"
 #include "rtp_llm/cpp/utils/Logger.h"
+#include "rtp_llm/models_py/bindings/core/CommonDefines.h"
 
 // Forward declare for opaque pointers in PyCacheStoreInputs
 namespace rtp_llm {
@@ -160,11 +161,13 @@ struct PyContextParallelParams {
 // Naming convention: the host (pinned CPU) tensor uses the bare name; its device (CUDA)
 // counterpart carries a _device suffix.
 struct PyAttentionInputs {
-    bool          is_prefill{false};
-    bool          is_target_verify{false};
-    torch::Tensor prefix_lengths;
-    torch::Tensor sequence_lengths;
-    torch::Tensor input_lengths;
+    bool                      is_prefill{false};
+    bool                      is_target_verify{false};
+    bool                      is_mtp_draft_extend{false};
+    rtp_llm::CpKvLayoutConfig cp_kv_layout;
+    torch::Tensor             prefix_lengths;
+    torch::Tensor             sequence_lengths;
+    torch::Tensor             input_lengths;
     // Kernel-granularity block IDs for attention compute.
     // Shape: [group, batch, max_kernel_blocks] or [batch, max_kernel_blocks].
     torch::Tensor kv_cache_kernel_block_id;

@@ -114,6 +114,10 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
     def handle(self) -> Optional[Tuple[Any, ...]]:
         return self._handle
 
+    @property
+    def eager_prefill_chunk_size(self) -> int:
+        return self._num_max_dispatch_tokens_per_rank * self.config.tp_size
+
     def _prepare_pre_tp_slice(
         self,
         a1: torch.Tensor,
@@ -237,11 +241,19 @@ class DeepEpLowLatencyRouter(FusedMoeDataRouter):
             a1, topk_ids, topk_weights
         )
 
+        # Each CUDA Graph is captured for one batch shape.  Using the allocation
+        # ceiling here would inflate every decode expert tensor to the prefill size.
+        dispatch_token_capacity = (
+            tp_num_tokens
+            if torch.cuda.is_current_stream_capturing()
+            else self._num_max_dispatch_tokens_per_rank
+        )
+
         # Prepare dispatch basic arguments
         dispatch_args = {
             "x": tp_dispatch_input,
             "topk_idx": tp_topk_ids,
-            "num_max_dispatch_tokens_per_rank": self._num_max_dispatch_tokens_per_rank,
+            "num_max_dispatch_tokens_per_rank": dispatch_token_capacity,
             "num_experts": self._num_experts,
             "use_fp8": self._use_fp8_dispatch,
             "async_finish": self._async_finish,
