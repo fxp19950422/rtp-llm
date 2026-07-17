@@ -143,7 +143,7 @@ class FrontendServer(object):
             kmonitor.report(
                 AccMetrics.QPS_METRIC, 1, {"source": request.get("source", "unknown")}
             )
-            sequence = self._global_controller.increment() % 4096  # 12 bits
+            sequence = await self._global_controller.increment_async() % 4096  # 12 bits
             request[request_id_field_name] = generate_request_id(
                 self.py_env_configs.server_config.ip,
                 self.py_env_configs.server_config.server_port,
@@ -233,7 +233,7 @@ class FrontendServer(object):
             if isinstance(req, str):
                 req = json.loads(req)
             assert isinstance(req, dict)
-            sequence = self._global_controller.increment() % 4096  # 12 bits
+            sequence = await self._global_controller.increment_async() % 4096  # 12 bits
             req[request_id_field_name] = generate_request_id(
                 self.py_env_configs.server_config.ip,
                 self.py_env_configs.server_config.server_port,
@@ -273,7 +273,7 @@ class FrontendServer(object):
     async def chat_completion(
         self, request: ChatCompletionRequest, raw_request: Request
     ):
-        sequence = self._global_controller.increment() % 4096  # 12 bits
+        sequence = await self._global_controller.increment_async() % 4096  # 12 bits
         request_id = generate_request_id(
             self.py_env_configs.server_config.ip,
             self.py_env_configs.server_config.server_port,
@@ -313,7 +313,7 @@ class FrontendServer(object):
     async def batch_chat_completion(self, request, raw_request: Request):
         from rtp_llm.openai.api_datatype import BatchChatCompletionResponse
 
-        sequence = self._global_controller.increment() % 4096
+        sequence = await self._global_controller.increment_async() % 4096
         request_id = generate_request_id(
             self.py_env_configs.server_config.ip,
             self.py_env_configs.server_config.server_port,
@@ -340,7 +340,7 @@ class FrontendServer(object):
         # atomically enqueues all prompts via BatchGenerateCall. Per-item counting would over-
         # reject under the same concurrency_limit; the trade-off is that a large batch occupies
         # only one slot regardless of N.
-        sequence = self._global_controller.increment() % 4096
+        sequence = await self._global_controller.increment_async() % 4096
         request_id = generate_request_id(
             self.py_env_configs.server_config.ip,
             self.py_env_configs.server_config.server_port,

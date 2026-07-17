@@ -233,6 +233,8 @@ void FlashInferMlaAttnParams::fillParamsInternal(torch::Tensor t_prefix_lengths,
     auto kvlen_ptr                        = kvlen_h.data_ptr<int32_t>();
     auto positions_ptr                    = positions_h.data_ptr<int32_t>();
     auto batch_reuse_info_vec_ptr         = batch_reuse_info_vec_h.data_ptr<int32_t>();
+    auto slot_mapping_ptr =
+        slot_mapping_h_.defined() && slot_mapping_h_.numel() > 0 ? slot_mapping_h_.data_ptr<int64_t>() : nullptr;
 
     // Get input data pointers
     auto input_lengths = t_input_lengths.data_ptr<int32_t>();
@@ -273,6 +275,16 @@ void FlashInferMlaAttnParams::fillParamsInternal(torch::Tensor t_prefix_lengths,
             for (int j = 0; j < input_length; j++) {
                 batch_indice_ptr[offset] = i;
                 positions_ptr[offset]    = j + prefix_length;
+                if (slot_mapping_ptr) {
+                    const int block_index  = positions_ptr[offset] / seq_size_per_block;
+                    const int block_offset = positions_ptr[offset] % seq_size_per_block;
+                    RTP_LLM_CHECK_WITH_INFO(block_index >= 0 && block_index < max_batch_blocks,
+                                            "slot mapping block index out of range %d not in [0, %d)",
+                                            block_index,
+                                            max_batch_blocks);
+                    const int block_number   = kv_cache_block_id[i * max_batch_blocks + block_index];
+                    slot_mapping_ptr[offset] = static_cast<int64_t>(block_number) * seq_size_per_block + block_offset;
+                }
                 offset += 1;
             }
             seq_len   = input_length + prefix_length;
@@ -282,6 +294,10 @@ void FlashInferMlaAttnParams::fillParamsInternal(torch::Tensor t_prefix_lengths,
 
             int reuse_page_num = (prefix_length + seq_size_per_block - 1) / seq_size_per_block;
             if (kv_cache_block_id) {
+                RTP_LLM_CHECK_WITH_INFO(reuse_page_num <= max_batch_blocks,
+                                        "reuse pages exceed block table width %d > %d",
+                                        reuse_page_num,
+                                        max_batch_blocks);
                 RTP_LLM_CHECK_WITH_INFO(reuse_page_idx + reuse_page_num <= max_reuse_page_num_,
                                         "reuse_page_num exceed reserved %d > %d",
                                         reuse_page_idx + reuse_page_num,
@@ -317,7 +333,17 @@ void FlashInferMlaAttnParams::fillParamsInternal(torch::Tensor t_prefix_lengths,
                                     max_input_token_num_);
             batch_indice_ptr[i] = i;
             positions_ptr[i]    = sequence_lengths[i];
-            seq_len             = sequence_lengths[i] + 1;
+            if (slot_mapping_ptr) {
+                const int block_index  = positions_ptr[i] / seq_size_per_block;
+                const int block_offset = positions_ptr[i] % seq_size_per_block;
+                RTP_LLM_CHECK_WITH_INFO(block_index >= 0 && block_index < max_batch_blocks,
+                                        "slot mapping block index out of range %d not in [0, %d)",
+                                        block_index,
+                                        max_batch_blocks);
+                const int block_number = kv_cache_block_id[i * max_batch_blocks + block_index];
+                slot_mapping_ptr[i]    = static_cast<int64_t>(block_number) * seq_size_per_block + block_offset;
+            }
+            seq_len = sequence_lengths[i] + 1;
             accu_q_len += 1;
             accu_kv_len += 1;
         }
@@ -331,6 +357,10 @@ void FlashInferMlaAttnParams::fillParamsInternal(torch::Tensor t_prefix_lengths,
                                 total_page_idx + current_page_num,
                                 max_page_num_);
         if (kv_cache_block_id) {
+            RTP_LLM_CHECK_WITH_INFO(current_page_num <= max_batch_blocks,
+                                    "sequence pages exceed block table width %d > %d",
+                                    current_page_num,
+                                    max_batch_blocks);
             for (int j = 0; j < current_page_num; j++) {
                 auto page_idx                     = kv_cache_block_id[i * max_batch_blocks + j];
                 page_indice_ptr[total_page_idx++] = page_idx;
@@ -439,7 +469,14 @@ void FlashInferMlaAttnParams::fillParams(torch::Tensor t_prefix_lengths,
     // Ensure tensors are allocated with sufficient size
     ensureTensorSize(batch_size, input_token_num, page_num, reuse_page_num, batch_reuse_info_size, forbid_realloc);
 
-    // Fill params directly into HOST tensors
+    const bool has_slot_mapping =
+        t_kv_cache_block_id_host.defined() && t_kv_cache_block_id_host.numel() > 0 && input_token_num > 0;
+    slot_mapping_h_ =
+        has_slot_mapping ? buf_h_i64_.slice(0, 0, input_token_num).reshape({input_token_num}) : torch::Tensor();
+
+    // Fill every host-side field in one pass, including slot_mapping. This keeps
+    // the metadata H2D at its original point and avoids rereading pinned metadata
+    // while refreshBuffer's asynchronous copy is in flight.
     fillParamsInternal(t_prefix_lengths,
                        t_sequence_lengths,
                        t_input_lengths,
@@ -465,24 +502,7 @@ void FlashInferMlaAttnParams::fillParams(torch::Tensor t_prefix_lengths,
     positions                    = positions_d;
     batch_reuse_info_vec         = batch_size > 0 ? batch_reuse_info_vec_d : torch::Tensor();
 
-    // Calculate slot_mapping
-    if (t_kv_cache_block_id_host.defined() && t_kv_cache_block_id_host.numel() > 0 && input_token_num > 0) {
-        const int64_t max_blocks       = t_kv_cache_block_id_host.size(1);
-        auto          block_table_ptr  = t_kv_cache_block_id_host.data_ptr<int32_t>();
-        auto          batch_indice_ptr = batch_indice_h.data_ptr<int32_t>();
-        auto          positions_ptr    = positions_h.data_ptr<int32_t>();
-
-        slot_mapping_h_       = buf_h_i64_.slice(0, 0, input_token_num).reshape({input_token_num});
-        auto slot_mapping_ptr = slot_mapping_h_.data_ptr<int64_t>();
-
-        for (int64_t i = 0; i < input_token_num; ++i) {
-            const int32_t batch_id     = batch_indice_ptr[i];
-            const int32_t position     = positions_ptr[i];
-            const int32_t block_index  = position / seq_size_per_block;
-            const int32_t block_offset = position % seq_size_per_block;
-            const int32_t block_number = block_table_ptr[batch_id * max_blocks + block_index];
-            slot_mapping_ptr[i]        = static_cast<int64_t>(block_number) * seq_size_per_block + block_offset;
-        }
+    if (has_slot_mapping) {
 
         cudaStream_t stream      = GET_CURRENT_STREAM();
         size_t       total_bytes = static_cast<size_t>(input_token_num) * sizeof(int64_t);

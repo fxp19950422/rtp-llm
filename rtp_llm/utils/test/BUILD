@@ -34,6 +34,16 @@ py_test(
     ],
 )
 
+py_test(
+    name = "concurrency_controller_test",
+    srcs = [
+        "concurrency_controller_test.py",
+    ],
+    deps = [
+        "//rtp_llm:utils",
+    ],
+)
+
 
 py_test(
     name = "util_test",
