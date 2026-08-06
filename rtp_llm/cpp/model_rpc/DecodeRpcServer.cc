@@ -52,7 +52,15 @@ grpc::Status DecodeRpcServer::init(const EngineInitParams&                      
     }
     decode_admission_.setLimit(
         static_cast<size_t>(std::max<int64_t>(maga_init_params.runtime_config.max_generate_batch_size, 1)));
-    RTP_LLM_LOG_INFO("Decode RPC admission limit is [%zu]", decode_admission_.limit());
+    const auto cache_manager    = engine_->resourceContext().cache_manager;
+    const auto available_blocks = cache_manager->availableBlocksNum();
+    const auto reserve_blocks   = cache_manager->reserveBlocksNum();
+    const auto lifecycle_blocks = available_blocks > reserve_blocks ? available_blocks - reserve_blocks : 0;
+    decode_admission_.setBlockLimit(lifecycle_blocks);
+    RTP_LLM_LOG_INFO("Decode RPC admission limits: slots=[%zu], lifecycle_kv_blocks=[%zu], reserve_blocks=[%zu]",
+                     decode_admission_.limit(),
+                     decode_admission_.blockLimit(),
+                     reserve_blocks);
     return grpc::Status::OK;
 }
 
@@ -1212,8 +1220,16 @@ grpc::Status DecodeRpcServer::RemoteGenerate(grpc::ServerContext* server_context
     try {
         EXECUTE_STAGE_FUNC(prepareGenerateContext, decode_context);
 
-        const size_t admission_slots      = std::max<size_t>(decode_context.getStream()->maxBatchSize(), 1);
-        int64_t      admission_timeout_ms = -1;
+        const auto&  generate_stream = decode_context.getStream();
+        const size_t admission_slots = std::max<size_t>(generate_stream->maxBatchSize(), 1);
+        const size_t max_token_num   = generate_stream->maxTokenNum();
+        const size_t current_seq_len = static_cast<size_t>(std::max(generate_stream->seqLength(), 0));
+        // The final generated token is returned but never forwarded, so it does not need a KV entry.
+        const int remaining_kv_tokens =
+            max_token_num > current_seq_len ? static_cast<int>(max_token_num - current_seq_len - 1) : 0;
+        const size_t admission_blocks =
+            static_cast<size_t>(std::max(generate_stream->estimatePeakNeedBlocks(remaining_kv_tokens), 0));
+        int64_t admission_timeout_ms = -1;
         if (decode_context.request_timeout_ms > 0) {
             admission_timeout_ms = decode_context.request_timeout_ms - decode_context.executeTimeMs();
             if (admission_timeout_ms <= 0) {
@@ -1225,7 +1241,10 @@ grpc::Status DecodeRpcServer::RemoteGenerate(grpc::ServerContext* server_context
 
         const auto admission_begin_us = currentTimeUs();
         const auto admission_result   = decode_admission_.acquire(
-            admission_slots, [server_context]() { return server_context->IsCancelled(); }, admission_timeout_ms);
+            admission_slots,
+            admission_blocks,
+            [server_context]() { return server_context->IsCancelled(); },
+            admission_timeout_ms);
         const auto admission_wait_us = currentTimeUs() - admission_begin_us;
         if (admission_result != DecodeAdmissionController::AcquireResult::ACQUIRED) {
             switch (admission_result) {
@@ -1238,20 +1257,22 @@ grpc::Status DecodeRpcServer::RemoteGenerate(grpc::ServerContext* server_context
                                                                "request timed out while waiting for decode admission");
                     break;
                 case DecodeAdmissionController::AcquireResult::OVERSIZED:
-                    decode_context.error_status = grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
-                                                               "request batch exceeds the decode admission limit");
+                    decode_context.error_status =
+                        grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED,
+                                     "request exceeds the decode slot or lifecycle KV admission limit");
                     break;
                 case DecodeAdmissionController::AcquireResult::ACQUIRED:
                     break;
             }
             return decode_context.error_status;
         }
-        admission_guard.emplace(decode_admission_, admission_slots);
+        admission_guard.emplace(decode_admission_, admission_slots, admission_blocks);
         if (admission_wait_us > 1000) {
-            RTP_LLM_LOG_INFO("request [%s] waited [%ld] us for [%zu] decode admission slot(s)",
+            RTP_LLM_LOG_INFO("request [%s] waited [%ld] us for decode admission: slots=[%zu], kv_blocks=[%zu]",
                              decode_context.request_key.c_str(),
                              admission_wait_us,
-                             admission_slots);
+                             admission_slots,
+                             admission_blocks);
         }
 
         EXECUTE_WITH_RETRY(

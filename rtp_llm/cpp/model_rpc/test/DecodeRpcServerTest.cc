@@ -43,6 +43,51 @@ TEST(DecodeAdmissionControllerTest, RejectsCancelledAndOversizedRequests) {
     EXPECT_EQ(controller.activeSlots(), 0);
 }
 
+TEST(DecodeAdmissionControllerTest, EnforcesLifecycleKVBlockBudget) {
+    DecodeAdmissionController controller(/*limit=*/8, /*block_limit=*/100);
+    ASSERT_EQ(controller.acquire(/*slots=*/4, /*blocks=*/80, [] { return false; }, /*timeout_ms=*/100),
+              DecodeAdmissionController::AcquireResult::ACQUIRED);
+    {
+        DecodeAdmissionGuard guard(controller, /*slots=*/4, /*blocks=*/80);
+        EXPECT_EQ(controller.activeSlots(), 4);
+        EXPECT_EQ(controller.activeBlocks(), 80);
+        EXPECT_EQ(controller.acquire(/*slots=*/1, /*blocks=*/21, [] { return false; }, /*timeout_ms=*/20),
+                  DecodeAdmissionController::AcquireResult::TIMED_OUT);
+        EXPECT_EQ(controller.acquire(/*slots=*/1, /*blocks=*/101, [] { return false; }, /*timeout_ms=*/20),
+                  DecodeAdmissionController::AcquireResult::OVERSIZED);
+    }
+
+    EXPECT_EQ(controller.activeSlots(), 0);
+    EXPECT_EQ(controller.activeBlocks(), 0);
+    EXPECT_EQ(controller.acquire(/*slots=*/8, /*blocks=*/100, [] { return false; }, /*timeout_ms=*/100),
+              DecodeAdmissionController::AcquireResult::ACQUIRED);
+    DecodeAdmissionGuard guard(controller, /*slots=*/8, /*blocks=*/100);
+}
+
+TEST(DecodeAdmissionControllerTest, BlockedKVWaiterAcquiresAfterRelease) {
+    DecodeAdmissionController controller(/*limit=*/8, /*block_limit=*/100);
+    ASSERT_EQ(controller.acquire(/*slots=*/1, /*blocks=*/100, [] { return false; }, /*timeout_ms=*/100),
+              DecodeAdmissionController::AcquireResult::ACQUIRED);
+
+    auto        result = DecodeAdmissionController::AcquireResult::TIMED_OUT;
+    std::thread queued;
+    {
+        DecodeAdmissionGuard initial_guard(controller, /*slots=*/1, /*blocks=*/100);
+        queued = std::thread([&] {
+            result = controller.acquire(/*slots=*/1, /*blocks=*/20, [] { return false; }, /*timeout_ms=*/1000);
+            if (result == DecodeAdmissionController::AcquireResult::ACQUIRED) {
+                DecodeAdmissionGuard queued_guard(controller, /*slots=*/1, /*blocks=*/20);
+            }
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        EXPECT_EQ(controller.activeBlocks(), 100);
+    }
+    queued.join();
+
+    EXPECT_EQ(result, DecodeAdmissionController::AcquireResult::ACQUIRED);
+    EXPECT_EQ(controller.activeBlocks(), 0);
+}
+
 TEST(DecodeAdmissionControllerTest, BlockedWaiterAcquiresAfterRelease) {
     DecodeAdmissionController controller(/*limit=*/2);
     ASSERT_EQ(controller.acquire(/*slots=*/2, [] { return false; }, /*timeout_ms=*/100),

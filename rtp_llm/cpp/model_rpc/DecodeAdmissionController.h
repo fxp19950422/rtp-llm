@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <mutex>
 
 namespace rtp_llm {
@@ -19,7 +20,8 @@ public:
         OVERSIZED,
     };
 
-    explicit DecodeAdmissionController(size_t limit = 1): limit_(std::max<size_t>(limit, 1)) {}
+    explicit DecodeAdmissionController(size_t limit = 1, size_t block_limit = std::numeric_limits<size_t>::max()):
+        limit_(std::max<size_t>(limit, 1)), block_limit_(block_limit) {}
 
     void setLimit(size_t limit) {
         {
@@ -29,10 +31,18 @@ public:
         condition_.notify_all();
     }
 
-    AcquireResult acquire(size_t slots, const std::function<bool()>& cancelled, int64_t timeout_ms) {
+    void setBlockLimit(size_t block_limit) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            block_limit_ = block_limit;
+        }
+        condition_.notify_all();
+    }
+
+    AcquireResult acquire(size_t slots, size_t blocks, const std::function<bool()>& cancelled, int64_t timeout_ms) {
         slots = std::max<size_t>(slots, 1);
         std::unique_lock<std::mutex> lock(mutex_);
-        if (slots > limit_) {
+        if (slots > limit_ || blocks > block_limit_) {
             return AcquireResult::OVERSIZED;
         }
 
@@ -46,8 +56,11 @@ public:
             if (has_deadline && std::chrono::steady_clock::now() >= deadline) {
                 return AcquireResult::TIMED_OUT;
             }
-            if (active_slots_ + slots <= limit_) {
+            const bool slots_available  = slots <= limit_ - std::min(active_slots_, limit_);
+            const bool blocks_available = blocks <= block_limit_ - std::min(active_blocks_, block_limit_);
+            if (slots_available && blocks_available) {
                 active_slots_ += slots;
+                active_blocks_ += blocks;
                 return AcquireResult::ACQUIRED;
             }
 
@@ -57,6 +70,10 @@ public:
                 condition_.wait_for(lock, kCancelPollInterval);
             }
         }
+    }
+
+    AcquireResult acquire(size_t slots, const std::function<bool()>& cancelled, int64_t timeout_ms) {
+        return acquire(slots, /*blocks=*/0, cancelled, timeout_ms);
     }
 
     size_t activeSlots() const {
@@ -69,13 +86,24 @@ public:
         return limit_;
     }
 
+    size_t activeBlocks() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return active_blocks_;
+    }
+
+    size_t blockLimit() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return block_limit_;
+    }
+
 private:
     friend class DecodeAdmissionGuard;
 
-    void release(size_t slots) {
+    void release(size_t slots, size_t blocks) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             active_slots_ -= std::min(active_slots_, std::max<size_t>(slots, 1));
+            active_blocks_ -= std::min(active_blocks_, blocks);
         }
         condition_.notify_all();
     }
@@ -85,27 +113,30 @@ private:
 
     mutable std::mutex      mutex_;
     std::condition_variable condition_;
-    size_t                  limit_        = 1;
-    size_t                  active_slots_ = 0;
+    size_t                  limit_         = 1;
+    size_t                  active_slots_  = 0;
+    size_t                  block_limit_   = std::numeric_limits<size_t>::max();
+    size_t                  active_blocks_ = 0;
 };
 
 class DecodeAdmissionGuard {
 public:
-    DecodeAdmissionGuard(DecodeAdmissionController& controller, size_t slots):
-        controller_(&controller), slots_(std::max<size_t>(slots, 1)) {}
+    DecodeAdmissionGuard(DecodeAdmissionController& controller, size_t slots, size_t blocks = 0):
+        controller_(&controller), slots_(std::max<size_t>(slots, 1)), blocks_(blocks) {}
 
     ~DecodeAdmissionGuard() {
         if (controller_ != nullptr) {
-            controller_->release(slots_);
+            controller_->release(slots_, blocks_);
         }
     }
 
-    DecodeAdmissionGuard(const DecodeAdmissionGuard&)            = delete;
+    DecodeAdmissionGuard(const DecodeAdmissionGuard&) = delete;
     DecodeAdmissionGuard& operator=(const DecodeAdmissionGuard&) = delete;
 
 private:
     DecodeAdmissionController* controller_;
     size_t                     slots_;
+    size_t                     blocks_;
 };
 
 }  // namespace rtp_llm
