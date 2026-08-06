@@ -109,6 +109,31 @@ class StartupWarmupTest(unittest.TestCase):
         self.assertEqual(client.paths, ["/v1/chat/completions", "/v1/chat/completions"])
         self.assertEqual(client.max_active, 2)
 
+    def test_backend_readiness_uses_root_health_bypass_until_backend_is_ready(self):
+        class HealthClient:
+            def __init__(self):
+                self.paths = []
+                self.statuses = [503, 200]
+
+            def get_status(self, path):
+                self.paths.append(path)
+                return self.statuses.pop(0)
+
+        client = HealthClient()
+        warmup = ServingPathWarmup(client, "default", [], [])
+        with mock.patch.object(STARTUP_WARMUP.time, "sleep", return_value=None):
+            warmup.wait_until_backend_is_ready(10)
+        self.assertEqual(client.paths, ["/", "/"])
+
+    def test_backend_readiness_timeout_does_not_publish_a_false_ready(self):
+        class UnreadyClient:
+            def get_status(self, path):
+                return 503
+
+        warmup = ServingPathWarmup(UnreadyClient(), "default", [], [])
+        with self.assertRaises(WarmupError):
+            warmup.wait_until_backend_is_ready(0)
+
     def test_gate_publish_is_atomic_and_jit_snapshot_tracks_files(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)

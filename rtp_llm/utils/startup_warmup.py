@@ -394,12 +394,13 @@ def main(env: Optional[Mapping[str, str]] = None) -> int:
         regular_cases = parse_cases(
             config.get(
                 "RTP_LLM_STARTUP_WARMUP_CASES",
-                "64x1,128x1,256x1,1024x1,2048x1,256x4,256x8,2048x4,2048x8",
+                "64x1,128x1,256x1,1024x1,2048x1,4096x1,256x4,256x8,2048x4,2048x8,4096x8",
             )
         )
         prefix_cases = parse_cases(
             config.get(
-                "RTP_LLM_STARTUP_WARMUP_PREFIX_CASES", "1024x1,256x8,2048x1,2048x8"
+                "RTP_LLM_STARTUP_WARMUP_PREFIX_CASES",
+                "1024x1,256x8,2048x1,2048x8,4096x1,4096x8",
             )
         )
         concurrency_limit = int(config.get("CONCURRENCY_LIMIT", "8"))
