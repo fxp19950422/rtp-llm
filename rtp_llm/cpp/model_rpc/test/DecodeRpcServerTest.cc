@@ -1,10 +1,93 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
+#include <thread>
+
+#include "rtp_llm/cpp/model_rpc/DecodeAdmissionController.h"
 #include "rtp_llm/cpp/model_rpc/DecodeRpcServer.h"
 #include "rtp_llm/cpp/cache/MHAKVCacheSpec.h"
 #include "rtp_llm/cpp/testing/TestLogCapture.h"
 
 namespace rtp_llm {
+
+TEST(DecodeAdmissionControllerTest, QueuesBeforeResourceAllocationAndReleasesSlots) {
+    DecodeAdmissionController controller(/*limit=*/2);
+    ASSERT_EQ(controller.acquire(/*slots=*/2, [] { return false; }, /*timeout_ms=*/100),
+              DecodeAdmissionController::AcquireResult::ACQUIRED);
+    {
+        DecodeAdmissionGuard guard(controller, /*slots=*/2);
+        EXPECT_EQ(controller.activeSlots(), 2);
+
+        DecodeAdmissionController::AcquireResult queued_result;
+        std::thread                              queued(
+            [&] { queued_result = controller.acquire(/*slots=*/1, [] { return false; }, /*timeout_ms=*/20); });
+        queued.join();
+        EXPECT_EQ(queued_result, DecodeAdmissionController::AcquireResult::TIMED_OUT);
+        EXPECT_EQ(controller.activeSlots(), 2);
+    }
+
+    EXPECT_EQ(controller.activeSlots(), 0);
+    EXPECT_EQ(controller.acquire(/*slots=*/1, [] { return false; }, /*timeout_ms=*/100),
+              DecodeAdmissionController::AcquireResult::ACQUIRED);
+    DecodeAdmissionGuard guard(controller, /*slots=*/1);
+    EXPECT_EQ(controller.activeSlots(), 1);
+}
+
+TEST(DecodeAdmissionControllerTest, RejectsCancelledAndOversizedRequests) {
+    DecodeAdmissionController controller(/*limit=*/8);
+    EXPECT_EQ(controller.acquire(/*slots=*/1, [] { return true; }, /*timeout_ms=*/100),
+              DecodeAdmissionController::AcquireResult::CANCELLED);
+    EXPECT_EQ(controller.acquire(/*slots=*/9, [] { return false; }, /*timeout_ms=*/100),
+              DecodeAdmissionController::AcquireResult::OVERSIZED);
+    EXPECT_EQ(controller.activeSlots(), 0);
+}
+
+TEST(DecodeAdmissionControllerTest, BlockedWaiterAcquiresAfterRelease) {
+    DecodeAdmissionController controller(/*limit=*/2);
+    ASSERT_EQ(controller.acquire(/*slots=*/2, [] { return false; }, /*timeout_ms=*/100),
+              DecodeAdmissionController::AcquireResult::ACQUIRED);
+
+    std::atomic<bool> finished{false};
+    auto              result = DecodeAdmissionController::AcquireResult::TIMED_OUT;
+    std::thread       queued;
+    {
+        DecodeAdmissionGuard initial_guard(controller, /*slots=*/2);
+        queued = std::thread([&] {
+            result = controller.acquire(/*slots=*/1, [] { return false; }, /*timeout_ms=*/1000);
+            if (result == DecodeAdmissionController::AcquireResult::ACQUIRED) {
+                DecodeAdmissionGuard queued_guard(controller, /*slots=*/1);
+                finished.store(true, std::memory_order_release);
+            }
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        EXPECT_FALSE(finished.load(std::memory_order_acquire));
+    }
+    queued.join();
+
+    EXPECT_EQ(result, DecodeAdmissionController::AcquireResult::ACQUIRED);
+    EXPECT_TRUE(finished.load(std::memory_order_acquire));
+    EXPECT_EQ(controller.activeSlots(), 0);
+}
+
+TEST(DecodeAdmissionControllerTest, BlockedWaiterObservesCancellation) {
+    DecodeAdmissionController controller(/*limit=*/1);
+    ASSERT_EQ(controller.acquire(/*slots=*/1, [] { return false; }, /*timeout_ms=*/100),
+              DecodeAdmissionController::AcquireResult::ACQUIRED);
+    DecodeAdmissionGuard initial_guard(controller, /*slots=*/1);
+
+    std::atomic<bool> cancelled{false};
+    auto              result = DecodeAdmissionController::AcquireResult::ACQUIRED;
+    std::thread       queued([&] {
+        result = controller.acquire(
+            /*slots=*/1, [&] { return cancelled.load(std::memory_order_acquire); }, /*timeout_ms=*/1000);
+    });
+    cancelled.store(true, std::memory_order_release);
+    queued.join();
+
+    EXPECT_EQ(result, DecodeAdmissionController::AcquireResult::CANCELLED);
+    EXPECT_EQ(controller.activeSlots(), 1);
+}
 
 namespace {
 

@@ -121,6 +121,26 @@ absl::Status GenerateStream::initKVBlock() {
     return ret;
 }
 
+absl::Status GenerateStream::prepareForRemoteCacheLoad() {
+    RTP_LLM_PROFILE_FUNCTION();
+    std::lock_guard<std::mutex> lock(*mutex_);
+    if (hasEventWithoutLock(StreamEvents::LoadInitiated)) {
+        return absl::OkStatus();
+    }
+
+    auto ret = stream_cache_resource_->initKVBlock();
+    if (!ret.ok()) {
+        RTP_LLM_LOG_WARNING("GenerateStream::prepareForRemoteCacheLoad: initKVBlock failed, stream_id: %lld",
+                            streamId());
+        return ret;
+    }
+
+    // Resource preparation must not grant scheduler admission. DecodeRpcServer
+    // allocates blocks before enqueue, while CanRun remains scheduler-owned.
+    reportEventWithoutLock(StreamEvents::LoadInitiated);
+    return absl::OkStatus();
+}
+
 void GenerateStream::fakeInitKVBlock(size_t reserved_blocks) {
     std::lock_guard<std::mutex> lock(*mutex_);
     stream_cache_resource_->fakeInitKVBlock(reserved_blocks);
