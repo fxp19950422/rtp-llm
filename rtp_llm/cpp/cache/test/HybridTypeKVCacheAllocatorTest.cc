@@ -1730,6 +1730,39 @@ TEST_F(HybridTypeKVCacheAllocatorTest, FreshReusePeakCoversThreeBoundaryDecodeAt
     EXPECT_EQ(allocator->freeBlocksNum(), 1);
 }
 
+TEST_F(HybridTypeKVCacheAllocatorTest, OnlineLongRequestEstimateIncludesPromptAndFullDecodeLifecycle) {
+    auto config    = makeTinyHybridConfig();
+    auto allocator = std::make_shared<HybridTypeKVCacheAllocator>(config, AllocationType::DEVICE);
+    ASSERT_TRUE(allocator->init());
+
+    auto          resource             = makeBatchResource(/*batch_size=*/1, config, CacheKeysType{});
+    constexpr int kObservedInputTokens = 2204;
+    constexpr int kObservedMaxOutput   = 65535;
+    // Decode returns the last generated token without storing a KV entry for it.
+    constexpr int kRemainingKVTokens = kObservedMaxOutput - 1;
+
+    const int prompt_blocks    = allocator->estimateBatchPeakNeedBlocks(resource,
+                                                                     kObservedInputTokens,
+                                                                     kObservedInputTokens,
+                                                                     /*remaining_tokens=*/0,
+                                                                     /*reserve_step=*/0,
+                                                                     /*enable_reuse_cache=*/false,
+                                                                     /*target_batch_size=*/1);
+    const int lifecycle_blocks = allocator->estimateBatchPeakNeedBlocks(resource,
+                                                                        kObservedInputTokens,
+                                                                        kObservedInputTokens,
+                                                                        kRemainingKVTokens,
+                                                                        /*reserve_step=*/0,
+                                                                        /*enable_reuse_cache=*/false,
+                                                                        /*target_batch_size=*/1);
+
+    // With four tokens per test block, the FULL group owns ceil(67738 / 4)=16935 blocks. The LINEAR group
+    // transiently owns three physical tail blocks. A prompt-only estimate would be just 552 blocks.
+    EXPECT_EQ(prompt_blocks, 552);
+    EXPECT_EQ(lifecycle_blocks, 16938);
+    EXPECT_GT(lifecycle_blocks, prompt_blocks);
+}
+
 }  // namespace test
 }  // namespace rtp_llm
 

@@ -64,6 +64,25 @@ TEST(DecodeAdmissionControllerTest, EnforcesLifecycleKVBlockBudget) {
     DecodeAdmissionGuard guard(controller, /*slots=*/8, /*blocks=*/100);
 }
 
+TEST(DecodeAdmissionControllerTest, ConcurrentOnlineLongRequestsCannotOvercommitLifecycleKV) {
+    constexpr size_t          kPerRequestLifecycleBlocks = 16938;
+    constexpr size_t          kSevenRequestBlocks        = 7 * kPerRequestLifecycleBlocks;
+    DecodeAdmissionController controller(
+        /*limit=*/8, /*block_limit=*/8 * kPerRequestLifecycleBlocks - 1);
+
+    ASSERT_EQ(controller.acquire(
+                  /*slots=*/7, kSevenRequestBlocks, [] { return false; }, /*timeout_ms=*/100),
+              DecodeAdmissionController::AcquireResult::ACQUIRED);
+    DecodeAdmissionGuard seven_requests(controller, /*slots=*/7, kSevenRequestBlocks);
+
+    // One slot remains, but admitting the eighth observed 2204 -> 65535 lifecycle would exceed the KV budget.
+    EXPECT_EQ(controller.acquire(
+                  /*slots=*/1, kPerRequestLifecycleBlocks, [] { return false; }, /*timeout_ms=*/20),
+              DecodeAdmissionController::AcquireResult::TIMED_OUT);
+    EXPECT_EQ(controller.activeSlots(), 7);
+    EXPECT_EQ(controller.activeBlocks(), kSevenRequestBlocks);
+}
+
 TEST(DecodeAdmissionControllerTest, BlockedKVWaiterAcquiresAfterRelease) {
     DecodeAdmissionController controller(/*limit=*/8, /*block_limit=*/100);
     ASSERT_EQ(controller.acquire(/*slots=*/1, /*blocks=*/100, [] { return false; }, /*timeout_ms=*/100),
