@@ -1,6 +1,8 @@
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <memory>
+#include <thread>
 #include <ATen/Generator.h>
 #if defined(USING_CUDA) || defined(USING_ROCM)
 #include <ATen/cuda/CUDAGeneratorImpl.h>
@@ -123,21 +125,41 @@ absl::Status GenerateStream::initKVBlock() {
 
 absl::Status GenerateStream::prepareForRemoteCacheLoad() {
     RTP_LLM_PROFILE_FUNCTION();
-    std::lock_guard<std::mutex> lock(*mutex_);
-    if (hasEventWithoutLock(StreamEvents::LoadInitiated)) {
-        return absl::OkStatus();
+    bool cache_load_started = false;
+    {
+        std::lock_guard<std::mutex> lock(*mutex_);
+        if (hasEventWithoutLock(StreamEvents::LoadInitiated)) {
+            return hasErrorWithoutLock() ? absl::InternalError(statusInfoWithoutLock().ToString()) : absl::OkStatus();
+        }
+
+        auto ret = stream_cache_resource_->initKVBlock();
+        if (!ret.ok()) {
+            RTP_LLM_LOG_WARNING("GenerateStream::prepareForRemoteCacheLoad: initKVBlock failed, stream_id: %lld",
+                                streamId());
+            return ret;
+        }
+
+        // Preserve remote/memory-cache matching without granting scheduler
+        // admission. DecodeRpcServer already owns an admission slot here.
+        cache_load_started = stream_cache_resource_->asyncLoadCache();
+        reportEventWithoutLock(StreamEvents::LoadInitiated);
     }
 
-    auto ret = stream_cache_resource_->initKVBlock();
-    if (!ret.ok()) {
-        RTP_LLM_LOG_WARNING("GenerateStream::prepareForRemoteCacheLoad: initKVBlock failed, stream_id: %lld",
-                            streamId());
-        return ret;
+    while (cache_load_started) {
+        bool cache_load_done = false;
+        {
+            std::lock_guard<std::mutex> lock(*mutex_);
+            cache_load_done = stream_cache_resource_->loadCacheDone();
+        }
+        if (cache_load_done) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    // Resource preparation must not grant scheduler admission. DecodeRpcServer
-    // allocates blocks before enqueue, while CanRun remains scheduler-owned.
-    reportEventWithoutLock(StreamEvents::LoadInitiated);
+    if (hasError()) {
+        return absl::InternalError(statusInfo().ToString());
+    }
     return absl::OkStatus();
 }
 
