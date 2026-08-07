@@ -15,7 +15,17 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 
 
 class WarmupError(RuntimeError):
-    pass
+    """A warmup failure. ``status`` carries the HTTP code when one was seen.
+
+    The code is what tells a transient startup condition (5xx while a peer is
+    still coming up) apart from a permanent one (4xx, i.e. this warmup is asking
+    for something the server will never accept), and the two must not be
+    retried the same way.
+    """
+
+    def __init__(self, message: str, status: Optional[int] = None):
+        super().__init__(message)
+        self.status = status
 
 
 @dataclass(frozen=True)
@@ -58,6 +68,12 @@ def parse_cases(value: str) -> List[WarmupCase]:
     return cases
 
 
+# The readiness probe only has to reach Decode once, so it uses the smallest
+# prompt the tokenizer search can land on and a batch of one.
+PROBE_TARGET_TOKENS = 64
+PROBE_RETRY_INTERVAL_S = 3.0
+
+
 class HttpJsonClient:
     def __init__(self, base_url: str, timeout_s: float):
         self.base_url = base_url.rstrip("/")
@@ -85,13 +101,15 @@ class HttpJsonClient:
                 status = response.status
                 body = response.read()
         except urllib.error.HTTPError as error:
-            raise WarmupError(f"{path} returned HTTP {error.code}") from error
+            raise WarmupError(
+                f"{path} returned HTTP {error.code}", status=error.code
+            ) from error
         except (OSError, urllib.error.URLError) as error:
             raise WarmupError(
                 f"{path} request failed: {type(error).__name__}"
             ) from error
         if status != 200:
-            raise WarmupError(f"{path} returned HTTP {status}")
+            raise WarmupError(f"{path} returned HTTP {status}", status=status)
         try:
             result = json.loads(body)
         except json.JSONDecodeError as error:
@@ -194,6 +212,41 @@ class ServingPathWarmup:
                 return
             time.sleep(1)
         raise WarmupError("backend did not become ready before the warmup deadline")
+
+    def wait_until_serving_path_is_ready(self, deadline_s: float) -> None:
+        """Retry one minimal request until the whole serving path answers.
+
+        The backend health check above only covers this role. Under PD
+        separation the Prefill role reports healthy as soon as its own ranks are
+        up, but a request cannot complete until the Decode peer accepts the KV
+        handoff, and the two roles start concurrently -- measured on a 16-card
+        host, Decode became ready 131s after Prefill. Sending the case matrix in
+        that window returns HTTP 500, and because a failed warmup terminates the
+        worker, the role that was merely early gets killed and PD never
+        converges.
+
+        So the first request is part of waiting, not part of measuring: retry it
+        until the deadline. 4xx is not retried -- that means the request itself
+        is unacceptable, which more time cannot fix.
+        """
+        deadline = time.monotonic() + deadline_s
+        probe, _ = self.prompts.closest_content(PROBE_TARGET_TOKENS, 0, 0)
+        last_error: Optional[BaseException] = None
+        while True:
+            try:
+                self._infer([probe], reuse_cache=False)
+                return
+            except WarmupError as error:
+                status = getattr(error, "status", None)
+                if status is not None and 400 <= status < 500:
+                    raise
+                last_error = error
+            if time.monotonic() >= deadline:
+                raise WarmupError(
+                    "serving path did not become ready before the warmup "
+                    f"deadline: {last_error}"
+                )
+            time.sleep(PROBE_RETRY_INTERVAL_S)
 
     def run_round(self, round_index: int) -> Dict[str, CaseResult]:
         results: Dict[str, CaseResult] = {}
@@ -429,8 +482,16 @@ def main(env: Optional[Mapping[str, str]] = None) -> int:
 
         client = HttpJsonClient(f"http://127.0.0.1:{port}", request_timeout_s)
         warmup = ServingPathWarmup(client, model, regular_cases, prefix_cases)
+        # One budget for both waits, so a slow peer cannot double the ceiling.
+        startup_deadline = time.monotonic() + startup_timeout_s
         print("STARTUP_WARMUP phase=WAITING", flush=True)
-        warmup.wait_until_backend_is_ready(startup_timeout_s)
+        warmup.wait_until_backend_is_ready(
+            max(0.0, startup_deadline - time.monotonic())
+        )
+        print("STARTUP_WARMUP phase=WAITING_SERVING_PATH", flush=True)
+        warmup.wait_until_serving_path_is_ready(
+            max(0.0, startup_deadline - time.monotonic())
+        )
 
         cache_dirs = jit_cache_directories(config)
         publish_phase(phase_file, "WARMUP")

@@ -134,6 +134,70 @@ class StartupWarmupTest(unittest.TestCase):
         with self.assertRaises(WarmupError):
             warmup.wait_until_backend_is_ready(0)
 
+    def test_serving_path_wait_retries_until_the_pd_peer_answers(self):
+        # The Prefill role is healthy long before Decode accepts the KV handoff,
+        # so the first requests get 500. Retrying is the whole point: failing
+        # here terminates a role that was merely early.
+        class LatePeerClient:
+            def __init__(self):
+                self.chat_calls = 0
+
+            def post_json(self, path, payload):
+                if path != "/v1/chat/completions":
+                    content = payload["messages"][0]["content"]
+                    return {"token_ids": list(range(len(content.split()) + 5))}
+                self.chat_calls += 1
+                if self.chat_calls < 3:
+                    raise WarmupError(
+                        "/v1/chat/completions returned HTTP 500", status=500
+                    )
+                return {
+                    "choices": [{}],
+                    "aux_info": {"first_token_cost_time": 12.0, "input_len": 64},
+                }
+
+        client = LatePeerClient()
+        warmup = ServingPathWarmup(client, "default", [WarmupCase(64, 1)], [])
+        with mock.patch.object(STARTUP_WARMUP.time, "sleep", return_value=None):
+            warmup.wait_until_serving_path_is_ready(30)
+        self.assertEqual(client.chat_calls, 3)
+
+    def test_serving_path_wait_does_not_retry_a_client_error(self):
+        # 4xx means the request itself is unacceptable; more time cannot fix it,
+        # and retrying would burn the whole startup budget before reporting it.
+        class RejectingClient:
+            def __init__(self):
+                self.chat_calls = 0
+
+            def post_json(self, path, payload):
+                if path != "/v1/chat/completions":
+                    content = payload["messages"][0]["content"]
+                    return {"token_ids": list(range(len(content.split()) + 5))}
+                self.chat_calls += 1
+                raise WarmupError("/v1/chat/completions returned HTTP 400", status=400)
+
+        client = RejectingClient()
+        warmup = ServingPathWarmup(client, "default", [WarmupCase(64, 1)], [])
+        with mock.patch.object(STARTUP_WARMUP.time, "sleep", return_value=None):
+            with self.assertRaises(WarmupError):
+                warmup.wait_until_serving_path_is_ready(30)
+        self.assertEqual(client.chat_calls, 1)
+
+    def test_serving_path_wait_reports_the_last_error_on_timeout(self):
+        class NeverReadyClient:
+            def post_json(self, path, payload):
+                if path != "/v1/chat/completions":
+                    content = payload["messages"][0]["content"]
+                    return {"token_ids": list(range(len(content.split()) + 5))}
+                raise WarmupError("/v1/chat/completions returned HTTP 503", status=503)
+
+        warmup = ServingPathWarmup(
+            NeverReadyClient(), "default", [WarmupCase(64, 1)], []
+        )
+        with mock.patch.object(STARTUP_WARMUP.time, "sleep", return_value=None):
+            with self.assertRaisesRegex(WarmupError, "HTTP 503"):
+                warmup.wait_until_serving_path_is_ready(0)
+
     def test_gate_publish_is_atomic_and_jit_snapshot_tracks_files(self):
         with tempfile.TemporaryDirectory() as temporary_dir:
             root = Path(temporary_dir)
