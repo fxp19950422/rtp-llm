@@ -37,6 +37,7 @@ compile_event_count = STARTUP_WARMUP.compile_event_count
 validate_second_round = STARTUP_WARMUP.validate_second_round
 ServingPathWarmup = STARTUP_WARMUP.ServingPathWarmup
 WarmupCase = STARTUP_WARMUP.WarmupCase
+_cases_within_limit = STARTUP_WARMUP._cases_within_limit
 
 
 class FakeTokenizerClient:
@@ -197,6 +198,20 @@ class StartupWarmupTest(unittest.TestCase):
         with mock.patch.object(STARTUP_WARMUP.time, "sleep", return_value=None):
             with self.assertRaisesRegex(WarmupError, "HTTP 503"):
                 warmup.wait_until_serving_path_is_ready(0)
+
+    def test_cases_above_concurrency_limit_are_skipped_not_fatal(self):
+        # The case matrix is a shared default; CONCURRENCY_LIMIT is per
+        # deployment. A narrow role must warm what it can, not die at boot.
+        cases = parse_cases("64x1,256x4,256x8")
+        kept, dropped = _cases_within_limit(cases, 4)
+        self.assertEqual([case.label for case in kept], ["64x1", "256x4"])
+        self.assertEqual(dropped, ["256x8"])
+
+    def test_cases_within_limit_keeps_everything_when_limit_is_unset(self):
+        cases = parse_cases("64x1,256x8")
+        kept, dropped = _cases_within_limit(cases, 0)
+        self.assertEqual([case.label for case in kept], ["64x1", "256x8"])
+        self.assertEqual(dropped, [])
 
     def test_gate_publish_is_atomic_and_jit_snapshot_tracks_files(self):
         with tempfile.TemporaryDirectory() as temporary_dir:

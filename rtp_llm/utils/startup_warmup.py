@@ -74,6 +74,22 @@ PROBE_TARGET_TOKENS = 64
 PROBE_RETRY_INTERVAL_S = 3.0
 
 
+def _cases_within_limit(
+    cases: Sequence[WarmupCase], concurrency_limit: int
+) -> Tuple[List[WarmupCase], List[str]]:
+    """Split cases into the ones this role can admit and the ones it cannot.
+
+    A batch above CONCURRENCY_LIMIT is never admitted, so warming it is not
+    possible on this deployment -- but that is a property of the shared default
+    matrix, not an error in the deployment.
+    """
+    if concurrency_limit <= 0:
+        return list(cases), []
+    kept = [case for case in cases if case.batch_size <= concurrency_limit]
+    dropped = [case.label for case in cases if case.batch_size > concurrency_limit]
+    return kept, dropped
+
+
 class HttpJsonClient:
     def __init__(self, base_url: str, timeout_s: float):
         self.base_url = base_url.rstrip("/")
@@ -457,10 +473,27 @@ def main(env: Optional[Mapping[str, str]] = None) -> int:
             )
         )
         concurrency_limit = int(config.get("CONCURRENCY_LIMIT", "8"))
-        largest_batch = max(case.batch_size for case in regular_cases + prefix_cases)
-        if largest_batch > concurrency_limit:
+        # Drop the cases a role can never admit instead of refusing to start. The
+        # matrix is a default shared by every topology, while CONCURRENCY_LIMIT is
+        # per deployment, so a narrow role would otherwise be killed at boot for
+        # owning a case list it never asked for. Warming fewer shapes costs one
+        # slow first request; failing here costs the role.
+        regular_cases, dropped_regular = _cases_within_limit(
+            regular_cases, concurrency_limit
+        )
+        prefix_cases, dropped_prefix = _cases_within_limit(
+            prefix_cases, concurrency_limit
+        )
+        if dropped_regular or dropped_prefix:
+            print(
+                "STARTUP_WARMUP phase=WARMUP skipped_cases="
+                f"{','.join(dropped_regular + dropped_prefix)} "
+                f"reason=batch_above_CONCURRENCY_LIMIT_{concurrency_limit}",
+                flush=True,
+            )
+        if not regular_cases:
             raise WarmupError(
-                f"warmup batch {largest_batch} exceeds CONCURRENCY_LIMIT={concurrency_limit}"
+                f"no warmup case fits CONCURRENCY_LIMIT={concurrency_limit}"
             )
 
         port = int(config.get("START_PORT", "12233"))
