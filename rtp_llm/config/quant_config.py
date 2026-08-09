@@ -424,6 +424,19 @@ class CompressedTensorsQuantConfig(QuantizationConfig):
     def get_supported_act_dtypes(self) -> List[torch.dtype]:
         return [torch.float16, torch.bfloat16]
 
+    # QuantizationConfig declares both of these abstract, and this class is
+    # instantiated directly by _from_config for a plain "compressed-tensors"
+    # checkpoint, so leaving them unimplemented made the class impossible to
+    # construct: the frontend role hit
+    # "Can't instantiate abstract class CompressedTensorsQuantConfig" while
+    # loading the GLM-4.7 checkpoint and crash-looped. Compute mirrors the
+    # activation dtypes above; the KV list matches the sibling FP8 configs.
+    def get_supported_compute_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_kv_cache_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16, torch.float8_e4m3fn]
+
     @classmethod
     def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
         return CompressedTensorsQuantConfig()
