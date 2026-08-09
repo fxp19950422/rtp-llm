@@ -375,15 +375,27 @@ def jit_cache_directories(env: Mapping[str, str]) -> List[Path]:
 
 
 def snapshot_jit_artifacts(directories: Iterable[Path]) -> Set[str]:
+    """Fingerprint the JIT caches by path and size, deliberately not by mtime.
+
+    A cache *hit* still touches the file, so including st_mtime_ns counted files
+    that were only re-read as brand new artifacts. On ea119 the GLM-4.7 prefill
+    role failed the second-round gate with 28, then 7, then 49 "changed"
+    artifacts -- oscillating rather than converging -- while its stdout for the
+    same round contained 16 "Using cached JIT runtime" lines and zero compile
+    invocations. Nothing was rebuilt; only mtimes moved.
+
+    Path plus size still catches what the gate is for: a genuinely new kernel
+    lands under a new content-hashed directory, and a recompiled one almost never
+    reproduces the exact same byte count.
+    """
     artifacts: Set[str] = set()
     for directory in directories:
         if not directory.is_dir():
             continue
         for path in directory.rglob("*"):
             if path.is_file():
-                stat = path.stat()
                 artifacts.add(
-                    f"{directory}:{path.relative_to(directory)}:{stat.st_size}:{stat.st_mtime_ns}"
+                    f"{directory}:{path.relative_to(directory)}:{path.stat().st_size}"
                 )
     return artifacts
 
