@@ -1,3 +1,4 @@
+import ast
 import importlib.util
 import json
 import os
@@ -109,6 +110,81 @@ class StartupWarmupTest(unittest.TestCase):
         self.assertEqual(result.input_lengths, (64, 64))
         self.assertEqual(client.paths, ["/v1/chat/completions", "/v1/chat/completions"])
         self.assertEqual(client.max_active, 2)
+
+    def test_canary_round_replays_an_earlier_rounds_prompts(self):
+        # The convergence gate compares the artifacts a round writes against the
+        # round before it, which is only meaningful when both rounds send the same
+        # prompts: the prompt body picks the MoE routing distribution, and a new
+        # distribution legitimately compiles a new Triton specialisation. So round
+        # 3 must reproduce round 2's request bodies exactly, while round 2 must
+        # still differ from round 1 to keep warming a second set of shapes.
+        class RecordingClient:
+            def __init__(self):
+                self.bodies = []
+
+            def post_json(self, path, payload):
+                if path == "/tokenize":
+                    content = payload["messages"][0]["content"]
+                    return {"token_ids": list(range(len(content.split()) + 5))}
+                self.bodies.append(payload["messages"][0]["content"])
+                return {
+                    "choices": [{}],
+                    "aux_info": {"first_token_cost_time": 10.0, "input_len": 64},
+                }
+
+        client = RecordingClient()
+        warmup = ServingPathWarmup(client, "default", [WarmupCase(64, 1)], [])
+
+        warmup.run_round(1)
+        first_bodies = list(client.bodies)
+        client.bodies.clear()
+
+        warmup.run_round(2)
+        second_bodies = list(client.bodies)
+        client.bodies.clear()
+
+        warmup.run_round(3, family_round=2)
+        third_bodies = list(client.bodies)
+
+        self.assertNotEqual(first_bodies, second_bodies)
+        self.assertEqual(second_bodies, third_bodies)
+
+    def test_main_warms_two_families_and_canaries_the_second(self):
+        # Guards the wiring, not just run_round's capability: rounds 1 and 2 must
+        # draw separate families so two sets of shapes get warmed, and the canary
+        # must replay round 2 so the artifact diff is comparable. Collapsing round
+        # 2 onto round 1 would silently halve the warmed coverage.
+        source = MODULE_PATH.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        main_fn = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "main"
+        )
+        calls = []
+        for node in ast.walk(main_fn):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "run_round"
+            ):
+                positional = [
+                    arg.value for arg in node.args if isinstance(arg, ast.Constant)
+                ]
+                keywords = {
+                    kw.arg: kw.value.value
+                    for kw in node.keywords
+                    if isinstance(kw.value, ast.Constant)
+                }
+                calls.append((positional[0] if positional else None, keywords))
+
+        rounds = [index for index, _ in calls]
+        self.assertEqual(rounds, [1, 2, 3])
+        # Rounds 1 and 2 warm distinct families: neither pins family_round.
+        self.assertIsNone(calls[0][1].get("family_round"))
+        self.assertIsNone(calls[1][1].get("family_round"))
+        # The canary replays round 2.
+        self.assertEqual(calls[2][1].get("family_round"), 2)
 
     def test_backend_readiness_uses_root_health_bypass_until_backend_is_ready(self):
         class HealthClient:

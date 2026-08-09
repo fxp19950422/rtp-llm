@@ -264,9 +264,20 @@ class ServingPathWarmup:
                 )
             time.sleep(PROBE_RETRY_INTERVAL_S)
 
-    def run_round(self, round_index: int) -> Dict[str, CaseResult]:
+    def run_round(
+        self, round_index: int, family_round: Optional[int] = None
+    ) -> Dict[str, CaseResult]:
+        """Run the case matrix once.
+
+        family_round overrides which prompt family the round draws from, so a
+        later round can replay an earlier round's exact prompts. That matters
+        because the prompt body decides the MoE routing distribution, and the
+        routing distribution decides which Triton specialisations get compiled:
+        two rounds with different prompts cannot be compared for JIT
+        convergence, only two rounds with identical prompts can.
+        """
         results: Dict[str, CaseResult] = {}
-        family_base = round_index * 1000
+        family_base = (round_index if family_round is None else family_round) * 1000
         for case_index, case in enumerate(self.regular_cases):
             contents = [
                 self.prompts.closest_content(
@@ -540,24 +551,44 @@ def main(env: Optional[Mapping[str, str]] = None) -> int:
 
         cache_dirs = jit_cache_directories(config)
         publish_phase(phase_file, "WARMUP")
+        # Two warmup rounds over two different prompt families, then a canary that
+        # replays the second family verbatim. Only the canary is a convergence
+        # check. Comparing two rounds that used *different* prompts never was:
+        # the prompt body sets the MoE routing distribution, a new distribution
+        # needs a new Triton specialisation, and the gate counted that fresh
+        # specialisation as a cache that had failed to converge. Measured on the
+        # PPU P8D8 image, rounds 1 and 2 wrote 14 new _silu_mul_quant_kernel
+        # artifacts every attempt while replaying one family wrote 0, and ea119
+        # burned a dozen prefill restarts on it. Two families still get warmed,
+        # so the coverage this used to buy is kept.
         print("STARTUP_WARMUP phase=WARMUP round=1", flush=True)
         first = warmup.run_round(1)
         _log_round("WARMUP", 1, first)
         after_first = snapshot_jit_artifacts(cache_dirs)
-        compile_events_after_first = compile_event_count(event_file)
+
+        print("STARTUP_WARMUP phase=WARMUP round=2", flush=True)
+        second = warmup.run_round(2)
+        _log_round("WARMUP", 2, second)
+        after_second = snapshot_jit_artifacts(cache_dirs)
+        compile_events_after_second = compile_event_count(event_file)
+        print(
+            "STARTUP_WARMUP phase=WARMUP warmed_artifacts="
+            f"round1={len(after_first)} round2_new={len(after_second - after_first)}",
+            flush=True,
+        )
 
         publish_phase(phase_file, "CANARY")
-        print("STARTUP_WARMUP phase=CANARY round=2", flush=True)
-        second = warmup.run_round(2)
-        _log_round("CANARY", 2, second)
-        after_second = snapshot_jit_artifacts(cache_dirs)
-        changed_jit_artifacts = after_second - after_first
+        print("STARTUP_WARMUP phase=CANARY round=3 replays=2", flush=True)
+        third = warmup.run_round(3, family_round=2)
+        _log_round("CANARY", 3, third)
+        after_third = snapshot_jit_artifacts(cache_dirs)
+        changed_jit_artifacts = after_third - after_second
         second_round_compile_events = max(
-            0, compile_event_count(event_file) - compile_events_after_first
+            0, compile_event_count(event_file) - compile_events_after_second
         )
         if fail_on_new_jit and changed_jit_artifacts:
             raise WarmupError(
-                "second round produced "
+                "canary round replayed round 2 and still produced "
                 f"{len(changed_jit_artifacts)} changed local JIT artifact(s) and "
                 f"{second_round_compile_events} Triton compile event(s)"
             )
@@ -576,7 +607,7 @@ def main(env: Optional[Mapping[str, str]] = None) -> int:
                 f"events={second_round_compile_events} new_artifacts=0",
                 flush=True,
             )
-        validate_second_round(first, second, max_ratio, slack_ms, max_ttft_ms)
+        validate_second_round(second, third, max_ratio, slack_ms, max_ttft_ms)
 
         gate_file = Path(gate_value)
         publish_phase(phase_file, "SERVING")
@@ -586,6 +617,8 @@ def main(env: Optional[Mapping[str, str]] = None) -> int:
                 "completed_at": int(time.time()),
                 "regular_cases": [case.label for case in regular_cases],
                 "prefix_cases": [case.label for case in prefix_cases],
+                "warmup_rounds": 2,
+                "canary_replays_round": 2,
                 "second_round_compile_events": second_round_compile_events,
                 "second_round_changed_jit_artifacts": len(changed_jit_artifacts),
             },
