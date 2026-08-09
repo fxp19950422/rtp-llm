@@ -198,6 +198,27 @@ class QuantizationConfig(ABC):
                 )
             elif (
                 weights_config["type"] == "int"
+                and bits == 8
+                and weights_config["strategy"] == "channel"
+            ):
+                # compressed-tensors "int-quantized": per-channel symmetric INT8
+                # weights with dynamic per-token INT8 activations (GLM-4.7 W8A8).
+                # Without this branch quant_method stayed "compressed-tensors",
+                # which only the abstract base class answers to, and the frontend
+                # role died on either "Can't instantiate abstract class
+                # CompressedTensorsQuantConfig" or, once that was constructible,
+                # "unknown quant_method: compressed-tensors" from setQuantAlgo.
+                quant_method = Int8PerChannelCompressedQuantConfig.get_method()
+                return Int8PerChannelCompressedQuantConfig.from_config(
+                    {
+                        "bits": bits,
+                        "method": quant_method,
+                        "group_size": group_size,
+                        "is_quanted": True,
+                    }
+                )
+            elif (
+                weights_config["type"] == "int"
                 and bits == 4
                 and weights_config["strategy"] == "group"
             ):
@@ -485,6 +506,41 @@ class Fp8PerChannelCompressedQuantConfig(CompressedTensorsQuantConfig):
     @classmethod
     def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
         return Fp8PerChannelCompressedQuantConfig(**config)
+
+
+class Int8PerChannelCompressedQuantConfig(CompressedTensorsQuantConfig):
+    """compressed-tensors "int-quantized": per-channel symmetric INT8 weights.
+
+    The activations are dynamic per-token INT8, which is the same runtime path as
+    smooth_quant, so get_algo reports smooth_quant -- that is the C++ enum
+    QuantInfo accepts for dynamic per-token INT8 (there is no separate
+    int8-compressed-tensors enum, unlike the FP8 sibling). This mirrors what the
+    internal glm47_int8_w8a8 preset already does for the same checkpoint.
+    """
+
+    def __init__(self, bits: int = 8, is_quanted: bool = False, **kwargs: Any):
+        super().__init__(bits=bits, is_quanted=is_quanted)
+
+    @classmethod
+    def get_method(cls) -> str:
+        return "INT8_PER_CHANNEL_COMPRESSED"
+
+    @classmethod
+    def get_algo(cls) -> str:
+        return "smooth_quant"
+
+    def get_supported_act_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_compute_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_kv_cache_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16, torch.float8_e4m3fn]
+
+    @classmethod
+    def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+        return Int8PerChannelCompressedQuantConfig(**config)
 
 
 class QuarkQuantConfig(QuantizationConfig):
