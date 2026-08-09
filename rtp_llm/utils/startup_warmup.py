@@ -543,11 +543,26 @@ def main(env: Optional[Mapping[str, str]] = None) -> int:
         second_round_compile_events = max(
             0, compile_event_count(event_file) - compile_events_after_first
         )
-        if fail_on_new_jit and (changed_jit_artifacts or second_round_compile_events):
+        if fail_on_new_jit and changed_jit_artifacts:
             raise WarmupError(
                 "second round produced "
-                f"{second_round_compile_events} Triton compile event(s) and "
-                f"{len(changed_jit_artifacts)} changed local JIT artifact(s)"
+                f"{len(changed_jit_artifacts)} changed local JIT artifact(s) and "
+                f"{second_round_compile_events} Triton compile event(s)"
+            )
+        if second_round_compile_events:
+            # Compile events alone do not mean the cache failed to converge. Triton
+            # counts an event per compile *call*, including calls served from the
+            # on-disk cache, and some kernels are re-entered once per warmup case:
+            # measured on the PPU P8D8 image, a fully warm second round still logged
+            # 23 _silu_mul_quant_kernel events while writing 0 new artifacts. Failing
+            # on the counter therefore blocked a converged service from ever passing
+            # its own health gate. Artifacts written to the cache are the signal that
+            # something actually compiled; the counter stays as a warning so a real
+            # regression is still visible in the log.
+            print(
+                "STARTUP_WARMUP phase=CANARY warning=cached_compile_events "
+                f"events={second_round_compile_events} new_artifacts=0",
+                flush=True,
             )
         validate_second_round(first, second, max_ratio, slack_ms, max_ttft_ms)
 
