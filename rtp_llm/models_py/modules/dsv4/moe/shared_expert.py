@@ -104,8 +104,6 @@ class W13SharedExpert(nn.Module):
         swiglu_limit: float = 0.0,
     ) -> None:
         super().__init__()
-        from rtp_llm.models_py.modules.dsv4.utils import _v4_fp8_linear
-
         w13_w = expert_weights["w13_w"]
         w13_s = expert_weights["w13_s"]
         if w13_w.dim() != 2:
@@ -115,8 +113,25 @@ class W13SharedExpert(nn.Module):
                 "shared w13 weight shape mismatch: "
                 f"got {tuple(w13_w.shape)}, expected {(2 * inter_dim, dim)}"
             )
-        self.w13 = _v4_fp8_linear(w13_w, w13_s)
-        self.w2 = _v4_fp8_linear(expert_weights["w2_w"], expert_weights["w2_s"])
+        self._is_int8 = w13_w.dtype == torch.int8
+        if self._is_int8:
+            # PPU W8A8-INT8: per-channel int8 shared expert (dequant->bf16),
+            # mirroring the routed Expert(storage="int8") path.  The fp8
+            # merged-w13 FusedSharedExpertFastPath is skipped for int8 (see
+            # ``can_run`` / ``prepare``), so forward runs the generic path.
+            from rtp_llm.models_py.modules.dsv4.qlinear import QuantizedLinear
+
+            self.w13 = QuantizedLinear(dim, 2 * inter_dim, storage="int8")
+            self.w13.bind_int8_weight(w13_w, w13_s)
+            self.w2 = QuantizedLinear(inter_dim, dim, storage="int8")
+            self.w2.bind_int8_weight(
+                expert_weights["w2_w"], expert_weights["w2_s"]
+            )
+        else:
+            from rtp_llm.models_py.modules.dsv4.utils import _v4_fp8_linear
+
+            self.w13 = _v4_fp8_linear(w13_w, w13_s)
+            self.w2 = _v4_fp8_linear(expert_weights["w2_w"], expert_weights["w2_s"])
         self.swiglu_limit = swiglu_limit
 
     def _apply_layer(self, layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -187,6 +202,10 @@ class FusedSharedExpertFastPath:
 
     @staticmethod
     def can_run(shared_experts: nn.Module, x: torch.Tensor) -> bool:
+        if getattr(shared_experts, "_is_int8", False):
+            # W8A8-INT8 shared expert: the fp8 merged-w13 fast path does not
+            # apply; fall back to the generic dequant->bf16 forward.
+            return False
         if not (x.is_cuda and x.dtype == torch.bfloat16 and x.dim() == 2):
             return False
         return all(hasattr(shared_experts, name) for name in ("w13", "w2"))
@@ -233,6 +252,9 @@ class FusedSharedExpertFastPath:
 
     def prepare(self, shared_experts: nn.Module) -> None:
         """Validate the loader-prepared merged w13; no runtime concatenation."""
+        if getattr(shared_experts, "_is_int8", False):
+            # W8A8-INT8 shared expert has no fp8 merged-w13 to validate.
+            return
         if not hasattr(shared_experts, "w13"):
             raise RuntimeError("DSV4 shared expert requires loader-prepared w13")
         w13_w, w13_s = self._linear_parts(shared_experts.w13)
@@ -510,7 +532,7 @@ def _run_shared_expert(
         except Exception:
             if strict_fused_moe_enabled():
                 raise
-    if strict_fused_moe_enabled():
+    if strict_fused_moe_enabled() and not getattr(shared_experts, "_is_int8", False):
         raise RuntimeError(
             "DSV4_MOE_STRICT_FUSED=1 forbids generic Expert.forward shared path"
         )
