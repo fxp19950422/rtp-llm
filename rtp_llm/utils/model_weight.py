@@ -7,6 +7,25 @@ import torch
 
 from rtp_llm.utils.util import check_with_info
 
+# Single-byte float8 dtypes. torch.concat has no float8 kernels, so tensors of
+# these dtypes are concatenated through a zero-copy uint8 view and viewed back.
+# Resolved with getattr because the set grows across torch releases -- notably
+# float8_e8m0fnu only exists from torch 2.7 onwards.
+FP8_BYTE_DTYPES = tuple(
+    dtype
+    for dtype in (
+        getattr(torch, name, None)
+        for name in (
+            "float8_e4m3fn",
+            "float8_e4m3fnuz",
+            "float8_e5m2",
+            "float8_e5m2fnuz",
+            "float8_e8m0fnu",
+        )
+    )
+    if dtype is not None
+)
+
 
 def get_pad_size(size: int, align_size: int) -> int:
     """Calculate padding size to align to align_size."""
@@ -40,13 +59,7 @@ def concat_0(ts: List[torch.Tensor]) -> torch.Tensor:
     if len(ts) == 1:
         return ts[0]
     # torch.concat() dose not support fp8 in current rocm torch version
-    if ts[0].dtype in [
-        torch.float8_e4m3fn,
-        torch.float8_e4m3fnuz,
-        torch.float8_e5m2,
-        torch.float8_e5m2fnuz,
-        torch.float8_e8m0fnu,
-    ]:
+    if ts[0].dtype in FP8_BYTE_DTYPES:
         dtype = ts[0].dtype
         out_u8 = torch.concat([x.view(torch.uint8) for x in ts], dim=0).contiguous()
         return out_u8.view(dtype)
@@ -58,13 +71,7 @@ def concat_1(ts: List[torch.Tensor]) -> torch.Tensor:
     if len(ts) == 1:
         return ts[0]
     # torch.concat() does not support fp8 in current rocm torch version
-    if ts[0].dtype in [
-        torch.float8_e4m3fn,
-        torch.float8_e4m3fnuz,
-        torch.float8_e5m2,
-        torch.float8_e5m2fnuz,
-        torch.float8_e8m0fnu,
-    ]:
+    if ts[0].dtype in FP8_BYTE_DTYPES:
         dtype = ts[0].dtype
         out_u8 = torch.concat([x.view(torch.uint8) for x in ts], dim=1).contiguous()
         return out_u8.view(dtype)
@@ -408,13 +415,7 @@ def stack_0(ts: List[torch.Tensor]) -> torch.Tensor:
     if len(ts) == 1:
         return ts[0].unsqueeze(0)
     # torch.stack() does not support fp8 in current rocm torch version
-    if ts[0].dtype in [
-        torch.float8_e4m3fn,
-        torch.float8_e4m3fnuz,
-        torch.float8_e5m2,
-        torch.float8_e5m2fnuz,
-        torch.float8_e8m0fnu,
-    ]:
+    if ts[0].dtype in FP8_BYTE_DTYPES:
         dtype = ts[0].dtype
         out_u8 = torch.concat(
             [x.view(torch.uint8).unsqueeze(0) for x in ts], dim=0
@@ -948,13 +949,7 @@ def pad_w13(ts: List[torch.Tensor], align_size: int, dim: int):
     """
     w1 = pad([ts[0]], align_size, dim)
     w3 = pad([ts[1]], align_size, dim)
-    if w1.dtype in [
-        torch.float8_e4m3fn,
-        torch.float8_e4m3fnuz,
-        torch.float8_e5m2,
-        torch.float8_e5m2fnuz,
-        torch.float8_e8m0fnu,
-    ]:
+    if w1.dtype in FP8_BYTE_DTYPES:
         dtype = w1.dtype
         out_u8 = torch.concat(
             [w1.view(torch.uint8), w3.view(torch.uint8)], dim=dim

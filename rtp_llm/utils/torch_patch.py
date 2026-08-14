@@ -66,14 +66,23 @@ if _torch_mm != _TORCH_TESTED_MAJOR_MINOR:
         *_TORCH_TESTED_MAJOR_MINOR,
     )
 
-_UE8M0_DTYPE = torch.float8_e8m0fnu
-_orig_broadcast = _dist.broadcast
+# float8_e8m0fnu only exists from torch 2.7 onwards. On older torch no tensor
+# can carry that dtype, so there is nothing for the shim to intercept and
+# installing it would only add a call on every broadcast.
+_UE8M0_DTYPE = getattr(torch, "float8_e8m0fnu", None)
 
+if _UE8M0_DTYPE is None:
+    logging.info(
+        "torch %s has no float8_e8m0fnu; skipping the UE8M0 dist.broadcast "
+        "compat shim (nothing can produce tensors of that dtype).",
+        torch.__version__,
+    )
+else:
+    _orig_broadcast = _dist.broadcast
 
-def _ue8m0_broadcast(tensor, *args, **kwargs):
-    if tensor.dtype is _UE8M0_DTYPE:
-        return _orig_broadcast(tensor.view(torch.uint8), *args, **kwargs)
-    return _orig_broadcast(tensor, *args, **kwargs)
+    def _ue8m0_broadcast(tensor, *args, **kwargs):
+        if tensor.dtype is _UE8M0_DTYPE:
+            return _orig_broadcast(tensor.view(torch.uint8), *args, **kwargs)
+        return _orig_broadcast(tensor, *args, **kwargs)
 
-
-_dist.broadcast = _ue8m0_broadcast
+    _dist.broadcast = _ue8m0_broadcast
