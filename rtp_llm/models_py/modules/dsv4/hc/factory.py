@@ -10,10 +10,22 @@ from rtp_llm.models_py.modules.dsv4.hc.base import HCHeadBase, HCMode, HCUnitBas
 from rtp_llm.models_py.modules.dsv4.hc.utils import maybe_squeeze_hc_1d
 
 
+def _tilelang_available() -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec("tilelang") is not None
+
+
 def _mode_from_env() -> HCMode:
-    raw = os.environ.get("DSV4_HC_IMPL", HCMode.TILELANG.value).lower()
+    raw = os.environ.get("DSV4_HC_IMPL")
+    if raw is None:
+        # Default: TileLang when the package is importable, else the PyTorch
+        # reference fallback. Backends without tilelang (e.g. PPU) then work
+        # out of the box instead of raising inside the TileLang kernel; an
+        # explicit DSV4_HC_IMPL still overrides this auto-detection.
+        return HCMode.TILELANG if _tilelang_available() else HCMode.FALLBACK
     try:
-        return HCMode(raw)
+        return HCMode(raw.lower())
     except ValueError as exc:
         allowed = ", ".join(m.value for m in HCMode)
         raise ValueError(f"invalid DSV4_HC_IMPL={raw!r}; expected one of: {allowed}") from exc
