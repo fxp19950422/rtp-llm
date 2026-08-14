@@ -8,6 +8,22 @@ from typing import Any, Dict, List, Optional
 import torch
 
 
+def _select_compressed_config_group(config_groups: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the single quant scheme group from a compressed-tensors config.
+
+    compressed-tensors names its scheme group arbitrarily: llm-compressor emits
+    ``group_0``, but other exporters name it after the scheme (e.g. ``W8A8``).
+    The previous code hard-coded ``config_groups["group_0"]`` and raised KeyError
+    on any other name. Prefer an explicit ``group_0`` for back-compat, otherwise
+    fall back to the sole group (deterministic first key when several exist).
+    """
+    if "group_0" in config_groups:
+        return config_groups["group_0"]
+    if not config_groups:
+        raise ValueError("compressed-tensors config has no config_groups")
+    return config_groups[sorted(config_groups)[0]]
+
+
 class QuantizationType(str, Enum):
     """
     Enum storing quantization type options
@@ -158,9 +174,9 @@ class QuantizationConfig(ABC):
                 group_size = weight_block[0]
                 quant_method = Fp8BlockWiseQuantConfig.get_method()
         if quant_method == "compressed-tensors":
-            config_groups = quant_config["config_groups"]
-            weights_config = config_groups["group_0"]["weights"]
-            activation_config = config_groups["group_0"]["input_activations"]
+            group = _select_compressed_config_group(quant_config["config_groups"])
+            weights_config = group["weights"]
+            activation_config = group["input_activations"]
             bits = weights_config["num_bits"]
             if (
                 weights_config["type"] == "float"
@@ -197,9 +213,9 @@ class QuantizationConfig(ABC):
                 quant_method = Fp8PerChannelQuarkQuantConfig.get_method()
 
         if quant_method == "modelopt":
-            config_groups = quant_config["config_groups"]
-            weights_config = config_groups["group_0"]["weights"]
-            activation_config = config_groups["group_0"]["input_activations"]
+            group = _select_compressed_config_group(quant_config["config_groups"])
+            weights_config = group["weights"]
+            activation_config = group["input_activations"]
             bits = weights_config["num_bits"]
             activation_bits = activation_config["num_bits"]
             group_size = weights_config["group_size"]
