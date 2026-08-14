@@ -125,6 +125,11 @@ class LocalLoopStrategy(RoutedExpertsStrategy):
             "w3_s": layer_weights.pop(W.v4_routed_w3_s),
         }
 
+        self._is_int8 = stacked_routed["w1_w"].dtype == torch.int8
+        if self._is_int8:
+            self._setup_weights_int8(stacked_routed)
+            return
+
         # PATCH: keep references to stacked tensors for fast top-K dispatch.
         # These share storage with the per-expert slices held by Expert objects
         # below — zero memory overhead. Stored as plain attributes (not nn.Parameter
@@ -189,6 +194,48 @@ class LocalLoopStrategy(RoutedExpertsStrategy):
         # safe under cuda-graph capture (no fresh allocation per replay).
         self._local_y_buf: Optional[torch.Tensor] = None
 
+    def _setup_weights_int8(self, stacked_routed: Dict) -> None:
+        """Per-channel INT8 (W8A8) routed experts for FP4-less backends (PPU).
+
+        Builds ``Expert(storage="int8")`` per local expert from the EP-sliced
+        int8 stacks (int8 ``[E, out, in]`` weight + fp32 ``[E, out, 1]`` scale).
+        No DeepGEMM FP4 scale prep and no ``_W*_s_gemm`` buffers: the INT8 path
+        dequants per-expert to bf16, so the fp8_fp4 topk fast path is skipped in
+        ``_forward_into_buf`` and forward runs the generic per-expert loop.
+        """
+        cfg = self.cfg
+        self._W1_w = stacked_routed["w1_w"]
+        self._W1_s = stacked_routed["w1_s"]
+        self._W2_w = stacked_routed["w2_w"]
+        self._W2_s = stacked_routed["w2_s"]
+        self._W3_w = stacked_routed["w3_w"]
+        self._W3_s = stacked_routed["w3_s"]
+
+        def _expert_at(global_idx: int) -> Optional[Expert]:
+            if not (cfg.local_expert_start <= global_idx < cfg.local_expert_end):
+                return None
+            local_idx = global_idx - cfg.local_expert_start
+            ew = {
+                "w1_w": stacked_routed["w1_w"][local_idx],
+                "w1_s": stacked_routed["w1_s"][local_idx],
+                "w2_w": stacked_routed["w2_w"][local_idx],
+                "w2_s": stacked_routed["w2_s"][local_idx],
+                "w3_w": stacked_routed["w3_w"][local_idx],
+                "w3_s": stacked_routed["w3_s"][local_idx],
+            }
+            return Expert(
+                cfg.dim,
+                cfg.moe_inter_dim,
+                swiglu_limit=cfg.swiglu_limit,
+                storage="int8",
+                expert_weights=ew,
+            )
+
+        self.experts = nn.ModuleList(
+            [_expert_at(i) for i in range(cfg.n_routed_experts)]
+        )
+        self._local_y_buf = None
+
     def forward(
         self,
         x: torch.Tensor,
@@ -236,7 +283,8 @@ class LocalLoopStrategy(RoutedExpertsStrategy):
             # Conditioned on ep_size==1 (so all experts are local — no per-rank
             # filter needed) and T (=N) small enough that N×K < E.
             topk_max_n = _topk_dispatch_max_n()
-            if (_bs1_fast_enabled()
+            if (not getattr(self, "_is_int8", False)
+                and _bs1_fast_enabled()
                 and self.cfg.ep_size == 1
                 and topk_max_n > 0
                 and T <= topk_max_n):
