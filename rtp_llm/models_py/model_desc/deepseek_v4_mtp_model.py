@@ -32,7 +32,6 @@ from rtp_llm.models_py.modules.dsv4.chunk_env import (
     DEFAULT_DSV4_CHUNK_TOKENS,
     dsv4_chunk_tokens_from_env,
 )
-from rtp_llm.models_py.modules.dsv4.utils import _v4_fp8_linear
 from rtp_llm.utils.model_weight import W
 
 
@@ -122,8 +121,22 @@ class DeepSeekV4MtpModel(DeepSeekV4Model):
         eps = float(self._v4_args.norm_eps)
         self.enorm = RMSNorm(gw[W.v4_mtp_enorm], eps)
         self.hnorm = RMSNorm(gw[W.v4_mtp_hnorm], eps)
-        self.e_proj = _v4_fp8_linear(gw[W.v4_mtp_e_proj_w], gw[W.v4_mtp_e_proj_s])
-        self.h_proj = _v4_fp8_linear(gw[W.v4_mtp_h_proj_w], gw[W.v4_mtp_h_proj_s])
+        e_w, e_s = gw[W.v4_mtp_e_proj_w], gw[W.v4_mtp_e_proj_s]
+        h_w, h_s = gw[W.v4_mtp_h_proj_w], gw[W.v4_mtp_h_proj_s]
+        if e_w.dtype == torch.int8:
+            # PPU W8A8-INT8: mtp e/h projections are per-channel int8; route
+            # through the int8 dequant->bf16 linear (imported lazily to avoid
+            # dsv4.utils' fp8-only deep_gemm.utils.layout top-level import,
+            # which is unavailable on PPU).
+            from rtp_llm.models_py.modules.dsv4.fp8.attention import _v4_int8_linear
+
+            self.e_proj = _v4_int8_linear(e_w, e_s)
+            self.h_proj = _v4_int8_linear(h_w, h_s)
+        else:
+            from rtp_llm.models_py.modules.dsv4.utils import _v4_fp8_linear
+
+            self.e_proj = _v4_fp8_linear(e_w, e_s)
+            self.h_proj = _v4_fp8_linear(h_w, h_s)
 
     # ------------------------------------------------------------------
     # Hidden-state preparation overrides — splice the e/h fusion stage in
