@@ -338,10 +338,18 @@ class IndexerFP8(PoolBackedModule):
         from rtp_llm.models_py.modules.dsv4.fp8.attention import _v4_fp8_linear
         from rtp_llm.utils.model_weight import W
 
-        self.wq_b = _v4_fp8_linear(
-            layer_weights[W.v4_indexer_wq_b_w],
-            layer_weights[W.v4_indexer_wq_b_s],
-        )
+        _iq_wq_b_w = layer_weights[W.v4_indexer_wq_b_w]
+        _iq_wq_b_s = layer_weights[W.v4_indexer_wq_b_s]
+        if _iq_wq_b_w.dtype == torch.int8:
+            # PPU W8A8-INT8 checkpoint: indexer wq_b is per-channel int8 +
+            # fp32 scale; route through the int8 dequant->bf16 linear (the fp8
+            # DeepGEMM linear cannot consume int8).  The indexer forward calls
+            # wq_b generically, so this drops in.
+            from rtp_llm.models_py.modules.dsv4.fp8.attention import _v4_int8_linear
+
+            self.wq_b = _v4_int8_linear(_iq_wq_b_w, _iq_wq_b_s)
+        else:
+            self.wq_b = _v4_fp8_linear(_iq_wq_b_w, _iq_wq_b_s)
         # weights_proj is plain BF16. Pre-fold the runtime ``softmax_scale *
         # n_heads^-0.5`` into the weight at load time so prefill / decode can
         # do a single ``F.linear`` (cuBLAS GEMM) without a trailing elementwise
