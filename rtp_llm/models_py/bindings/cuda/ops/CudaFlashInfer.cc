@@ -293,7 +293,16 @@ void FlashInferAttnParams::genPlan(int     batch_size,
                                               true,
                                               stream);
         } else if (mla_ops_type == MlaOpsType::FLASH_MLA) {
+#ifdef RTP_LLM_NO_FLASHMLA_CXX
+            // Backends that build flashmla header-only (e.g. PPU, which runs MLA
+            // through the flash_mla pip wheel) do not link the C++ get_mla_metadata
+            // kernel. FLASH_MLA must not be selected there; fail loudly instead of
+            // emitting an unresolved symbol at import time.
+            RTP_LLM_FAIL("MlaOpsType::FLASH_MLA is not available: flashmla C++ "
+                         "kernels are not built on this backend");
+#else
             flash_mla_plan = get_mla_metadata(kvlen_d, local_head_num * q_length, 1);
+#endif
         } else {
             RTP_LLM_FAIL("unexpected mla ops type: %d", int(mla_ops_type));
         }
