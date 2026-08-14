@@ -55,6 +55,32 @@ def decode_output_proj(
     """
     rd = attn.rope_head_dim
 
+    if getattr(attn, "_wo_a_is_int8", False):
+        # W8A8-INT8 (PPU, no FP8): bf16 inverse-RoPE + grouped bf16 matmul
+        # against the dequantized int8 ``wo_a`` weight.  Mirrors the eager
+        # fallback numerics; the FP8 fused-inv-rope-quant + ``fp8_einsum``
+        # fast path is unavailable on backends without FP8 DeepGEMM.
+        if freqs_cis.dim() == 2 and int(freqs_cis.shape[0]) == bsz:
+            apply_rotary_emb_batched(o[..., -rd:], freqs_cis, inverse=True)
+        else:
+            apply_rotary_emb(
+                o[..., -rd:],
+                freqs_cis.reshape(-1, freqs_cis.shape[-1]).contiguous(),
+                inverse=True,
+            )
+        o = o.reshape(bsz, q_len, attn.n_groups, -1)
+        wo_a = (attn._wo_a_int8_w.to(torch.float32) * attn._wo_a_int8_s).to(o.dtype)
+        o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+        out = attn._lin(attn.wo_b, o.flatten(2))
+        if attn.tp_size > 1:
+            from rtp_llm.models_py.distributed.collective_torch import (
+                Group,
+                all_reduce,
+            )
+
+            all_reduce(out, Group.TP)
+        return out
+
     if o.is_cuda and o.numel() > 0:
         o_fp8, o_scale = fused_inv_rope_fp8_quant(
             o,

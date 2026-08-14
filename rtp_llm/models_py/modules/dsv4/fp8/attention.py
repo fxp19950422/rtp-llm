@@ -5611,6 +5611,9 @@ class AttentionFP8(nn.Module):
         (``fused_inv_rope_fp8_quant``) emits the exact ``(fp8 [M,G,K],
         scale [M,G,K/512])`` layout ``deep_gemm.fp8_einsum`` consumes.
         """
+        if getattr(self, "_wo_a_is_int8", False):
+            self._int8_output_proj_into(o, freqs_cis, out=out)
+            return
         o_3d = o.view(-1, self.n_heads, self.head_dim)
         seqlen = o_3d.shape[0]
         with record_function_range("dsv4.fp8.attn.out.fused_inv_rope_quant"):
@@ -5626,4 +5629,53 @@ class AttentionFP8(nn.Module):
             o_proj = self._wo_a_einsum_from_fp8(o_fp8, o_scale, 1, seqlen)
         with record_function_range("dsv4.fp8.attn.out.wo_b"):
             wo_b_in = o_proj.flatten(2).reshape(seqlen, -1)
+            self.wo_b(wo_b_in, out=out)
+
+    def _int8_output_proj_into(
+        self,
+        o: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        *,
+        out: torch.Tensor,
+    ) -> None:
+        """W8A8-INT8 (PPU, no FP8) output projection: inverse-RoPE in bf16
+        (no activation quant), a grouped bf16 matmul against the dequantized
+        int8 ``wo_a`` weight, then ``wo_b``.  Mirrors the FP8
+        ``_prefill_output_proj_into`` numerics with bf16 math throughout --
+        the FP8 fused-inv-rope-quant + ``fp8_einsum`` path is unavailable on
+        backends without FP8 DeepGEMM.
+        """
+        o_3d = o.view(-1, self.n_heads, self.head_dim)
+        seqlen = o_3d.shape[0]
+        nope_dim = self.head_dim - self.rope_head_dim
+        rd = self.rope_head_dim
+        # --- inverse RoPE on the last ``rope_head_dim`` cols of each head ---
+        # Interleaved (real, imag) layout, multiply by conj(freqs_cis); same
+        # convention as ``apply_rotary_emb(inverse=True)`` and the fused FP8
+        # kernel.  ``freqs_cis`` may be per-token ``[M, rd/2]`` or per-request
+        # ``[B, rd/2]`` -- map token t to freq row ``t // (M // F)``.
+        with record_function_range("dsv4.int8.attn.out.inv_rope"):
+            o_rot = o_3d.to(torch.float32)
+            rope = o_rot[..., nope_dim:].contiguous()
+            rope_c = torch.view_as_complex(
+                rope.view(seqlen, self.n_heads, rd // 2, 2)
+            )
+            n_freq_rows = freqs_cis.shape[0]
+            q_len_per_b = max(seqlen // n_freq_rows, 1)
+            freq_row = torch.arange(seqlen, device=o.device) // q_len_per_b
+            fc = freqs_cis.conj().index_select(0, freq_row)  # [M, rd/2]
+            rope_c = rope_c * fc.unsqueeze(1)  # broadcast over heads
+            o_rot = o_rot.clone()
+            o_rot[..., nope_dim:] = torch.view_as_real(rope_c).flatten(-2)
+        # --- grouped wo_a matmul (dequant int8 -> bf16) --------------------
+        with record_function_range("dsv4.int8.attn.out.wo_a_grouped"):
+            heads_per_group = self.n_heads // self.n_groups
+            K = heads_per_group * self.head_dim
+            o_grouped = o_rot.reshape(seqlen, self.n_groups, K).to(torch.bfloat16)
+            wo_a = (self._wo_a_int8_w.to(torch.float32) * self._wo_a_int8_s).to(
+                torch.bfloat16
+            )  # [G, R, K]
+            o_proj = torch.einsum("mgk,grk->mgr", o_grouped, wo_a)  # [M, G, R]
+        with record_function_range("dsv4.int8.attn.out.wo_b"):
+            wo_b_in = o_proj.flatten(1).reshape(seqlen, -1)
             self.wo_b(wo_b_in, out=out)
