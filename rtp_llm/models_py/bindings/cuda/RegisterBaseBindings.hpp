@@ -23,7 +23,14 @@
 
 #include "rtp_llm/models_py/bindings/cuda/kernels/mla_quant_kernel.h"
 #include "rtp_llm/models_py/bindings/cuda/kernels/dsv4_persistent_topk.h"
+// topk_v3 is built on SM90+ thread block clusters and has no pre-SM90 path.
+// Backends without cluster support drop the kernel target (cluster_topk_deps()
+// in arch_select.bzl) and define RTP_LLM_NO_CLUSTER_TOPK, so the op is simply
+// not registered there; callers already probe for it with
+// hasattr(rtp_llm_ops, "topk_v3").
+#ifndef RTP_LLM_NO_CLUSTER_TOPK
 #include "rtp_llm/models_py/bindings/cuda/kernels/topk_v3.h"
+#endif
 #include "rtp_llm/models_py/bindings/cuda/kernels/dsv4_top_k_per_row_prefill.h"
 
 using namespace rtp_llm;
@@ -266,6 +273,7 @@ void registerBasicCudaOps(py::module& rtp_ops_m) {
                   py::arg("k"),
                   py::arg("max_seq_len"));
 
+#ifndef RTP_LLM_NO_CLUSTER_TOPK
     rtp_ops_m.def("topk_v3",
                   &topk_v3,
                   "DeepSeek V4 decode indexer exact SGLang radix-select TopK",
@@ -275,6 +283,7 @@ void registerBasicCudaOps(py::module& rtp_ops_m) {
                   py::arg("workspace"),
                   py::arg("k"),
                   py::arg("max_seq_len"));
+#endif
 
     // Vendored from vLLM (csrc/sampler.cu::top_k_per_row_prefill).
     // Per-row TopK over [row_starts[r], row_ends[r]); returned indices
