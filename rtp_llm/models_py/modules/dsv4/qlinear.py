@@ -84,12 +84,28 @@ def _fp8_dequant_to_fp32(weight_fp8: torch.Tensor, scale_ue8m0: torch.Tensor) ->
     return w_f * scale_full
 
 
+def _int8_dequant_to_fp32(
+    weight_int8: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    """Dequantize per-channel INT8 [out, in] + FP32 scale -> fp32 [out, in].
+
+    W8A8 int-quantized weights carry one symmetric scale per output channel,
+    stored as ``[out, 1]`` (the compressed-tensors ``.scale`` tensor). The
+    dequant is a plain per-row multiply that broadcasts the scale across the
+    input dimension.
+    """
+    w_f = weight_int8.to(torch.float32)
+    scale_f = scale.to(torch.float32).reshape(weight_int8.shape[0], 1)
+    return w_f * scale_f
+
+
 class QuantizedLinear(nn.Module):
     """Linear layer holding native-dtype weight + scale; dequants in forward.
 
-    Three modes selected at construction via `storage`:
+    Four modes selected at construction via `storage`:
       - "fp4":  weight int8 [out, in//2], scale UE8M0 [out, in//32]
       - "fp8":  weight float8_e4m3fn [out, in], scale UE8M0 [out//128, in//128]
+      - "int8": weight int8 [out, in], scale fp32 per-channel [out, 1] (W8A8)
       - "bf16": plain bf16 weight [out, in], no scale
 
     Checkpoint loading populates `.weight` and `.scale` directly without
@@ -103,7 +119,7 @@ class QuantizedLinear(nn.Module):
         self.out_features = out_features
         self.storage = storage
         assert bias is False, "V4 linears have no bias"
-        if storage not in {"fp4", "fp8", "bf16"}:
+        if storage not in {"fp4", "fp8", "bf16", "int8"}:
             raise ValueError(f"unknown storage {storage!r}")
         # weight / scale are bound externally by V4Transformer factory mode
         # directly from the framework's ``ModelWeights`` tensors — no
@@ -143,6 +159,8 @@ class QuantizedLinear(nn.Module):
             return _fp4_unpack_to_fp32(self.weight, self.scale).to(out_dtype)
         if self.storage == "fp8":
             return _fp8_dequant_to_fp32(self.weight, self.scale).to(out_dtype)
+        if self.storage == "int8":
+            return _int8_dequant_to_fp32(self.weight, self.scale).to(out_dtype)
         return self.weight
 
     def _fp4_forward_deepgemm(self, x: torch.Tensor) -> torch.Tensor:
@@ -193,6 +211,14 @@ class QuantizedLinear(nn.Module):
             return F.linear(x, self.weight)
         if self.storage == "fp4":
             return self._fp4_forward_deepgemm(x)
-        # FP8: dequant to x's dtype on the fly.
+        # FP8 / INT8: dequant weight to x's dtype on the fly.
+        #
+        # For INT8 W8A8 this is the correctness path (weights exactly
+        # dequantized to bf16; activations stay bf16). It matches the FP8 path's
+        # current staging. The performant + numerically-W8A8 path -- per-token
+        # int8 activation quant + deep_gemm gemm_int8_int8_bf16_nt against the
+        # per-channel int8 weight -- is a follow-on that first needs the int8
+        # GEMM surfaced through deepgemm_wrapper (the wheel exports it; the
+        # wrapper currently only wraps fp8/fp4).
         w = self.dequant_weight(out_dtype=x.dtype)
         return F.linear(x, w)
