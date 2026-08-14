@@ -53,7 +53,6 @@ from rtp_llm.models_py.modules.dsv4.fp8.decode.decode_attn_metadata import (
 )
 from rtp_llm.models_py.modules.dsv4.fp8.decode.output_proj import decode_output_proj
 from rtp_llm.models_py.modules.dsv4.fp8.decode.write_swa import decode_write_swa_fp8
-from rtp_llm.models_py.modules.dsv4.utils import _v4_fp8_linear
 from rtp_llm.models_py.modules.factory.attention.common import (
     create_write_cache_store_impl,
 )
@@ -210,9 +209,19 @@ class DeepSeekV4DSparkModel(DSparkProposerMixin, DeepSeekV4Model):
         self.main_norm = RMSNorm(
             gw[W.v4_dspark_main_norm], float(self._v4_args.norm_eps)
         )
-        self.main_proj = _v4_fp8_linear(
-            gw[W.v4_dspark_main_proj_w], gw[W.v4_dspark_main_proj_s]
-        )
+        _mp_w = gw[W.v4_dspark_main_proj_w]
+        _mp_s = gw[W.v4_dspark_main_proj_s]
+        if _mp_w.dtype == torch.int8:
+            # PPU W8A8-INT8: dspark main_proj is per-channel int8; route through
+            # the int8 dequant->bf16 linear (lazy import avoids dsv4.utils'
+            # fp8-only deep_gemm.utils.layout top-level import, absent on PPU).
+            from rtp_llm.models_py.modules.dsv4.fp8.attention import _v4_int8_linear
+
+            self.main_proj = _v4_int8_linear(_mp_w, _mp_s)
+        else:
+            from rtp_llm.models_py.modules.dsv4.utils import _v4_fp8_linear
+
+            self.main_proj = _v4_fp8_linear(_mp_w, _mp_s)
         self.markov_head = DSparkMarkovHead(
             gw[W.v4_dspark_markov_w1],
             gw[W.v4_dspark_markov_w2],
