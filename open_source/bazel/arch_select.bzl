@@ -149,6 +149,11 @@ def deep_ep_py_deps():
         actual = "//rtp_llm:empty_target",
     )
 
+# topk_v3 needs thread block clusters (cooperative_groups::this_cluster()),
+# which are SM90+ only. Every arch the open-source build targets has them.
+def cluster_topk_deps():
+    return ["//rtp_llm/models_py/bindings/cuda/kernels:topk_v3"]
+
 def kernel_so_deps():
     return select({
         "@//:using_cuda": [":libfa_so", ":libflashinfer_single_prefill_so", ":libflashinfer_single_decode_so", ":libflashinfer_batch_paged_prefill_so", ":libflashinfer_batch_paged_decode_so", ":libflashinfer_batch_ragged_prefill_so", ":libflashinfer_sm90_so", ":libflashinfer_single_prefill_256_so", ":libflashinfer_single_decode_256_so", ":libflashinfer_batch_paged_prefill_256_so", ":libflashinfer_batch_paged_decode_256_so", ":libflashinfer_batch_ragged_prefill_256_so"],

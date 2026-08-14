@@ -1,5 +1,5 @@
 load("//:def.bzl", "copts", "cuda_copts")
-load("//bazel:arch_select.bzl", "torch_deps", "fa_deps")
+load("//bazel:arch_select.bzl", "torch_deps", "fa_deps", "cluster_topk_deps")
 
 package(default_visibility=["//rtp_llm:__subpackages__"])
 
@@ -228,7 +228,6 @@ cc_library(
         "//rtp_llm/models_py/bindings/cuda/kernels:fast_topk",
         "//rtp_llm/models_py/bindings/cuda/kernels:persistent_topk",
         "//rtp_llm/models_py/bindings/cuda/kernels:dsv4_persistent_topk",
-        "//rtp_llm/models_py/bindings/cuda/kernels:topk_v3",
         "//rtp_llm/models_py/bindings/cuda/kernels:dsv4_top_k_per_row_prefill",
         "//rtp_llm/models_py/bindings/cuda/kernels:mha_paged_attn_plan",
         "//rtp_llm/models_py/bindings/cuda/kernels:mla_quant_kernel",
@@ -237,7 +236,7 @@ cc_library(
         "//rtp_llm/cpp/config:model_config",
         "//rtp_llm/models_py/bindings/cuda/kernels:user_buffers",
         "//rtp_llm/cpp/utils:profiling_scope",
-    ] + select({
+    ] + cluster_topk_deps() + select({
         "@//:using_cuda12_9": [
             "//rtp_llm/models_py/bindings/cuda/kernels:scaled_fp4_quant",
         ],
