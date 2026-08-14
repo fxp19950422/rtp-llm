@@ -67,6 +67,7 @@ class Expert(nn.Module):
         super().__init__()
         # storage="fp8" → CudaFp8DeepGEMMLinear (2D input only).
         # storage="fp4" → QuantizedLinear with bound weight/scale (accepts N-D).
+        # storage="int8" → QuantizedLinear per-channel INT8 (W8A8), accepts N-D.
         self._uses_fp8_linear = storage == "fp8"
 
         assert expert_weights is not None, "Expert requires expert_weights (descriptor path)"
@@ -77,6 +78,16 @@ class Expert(nn.Module):
             self.w1 = _v4_fp8_linear(expert_weights["w1_w"], expert_weights["w1_s"])
             self.w2 = _v4_fp8_linear(expert_weights["w2_w"], expert_weights["w2_s"])
             self.w3 = _v4_fp8_linear(expert_weights["w3_w"], expert_weights["w3_s"])
+        elif storage == "int8":
+            # Per-channel INT8 (W8A8): bind int8 weight + FP32 per-channel scale
+            # directly; forward dequants on the fly (deep_gemm grouped int8 GEMM
+            # is the tracked perf follow-on).
+            self.w1 = QuantizedLinear(dim, inter_dim, storage=storage)  # gate
+            self.w2 = QuantizedLinear(inter_dim, dim, storage=storage)  # down
+            self.w3 = QuantizedLinear(dim, inter_dim, storage=storage)  # up
+            self.w1.bind_int8_weight(expert_weights["w1_w"], expert_weights["w1_s"])
+            self.w2.bind_int8_weight(expert_weights["w2_w"], expert_weights["w2_s"])
+            self.w3.bind_int8_weight(expert_weights["w3_w"], expert_weights["w3_s"])
         else:
             # Legacy storage="fp4" — bind weight + scale directly from
             # the framework tensors; forward still dequants on the fly

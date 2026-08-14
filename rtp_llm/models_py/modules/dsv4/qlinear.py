@@ -149,6 +149,18 @@ class QuantizedLinear(nn.Module):
                 f"expected packed FP4 scale int32, got {self.scale_gemm.dtype}"
             )
 
+    def bind_int8_weight(self, weight: torch.Tensor, scale: torch.Tensor) -> None:
+        """Bind a per-channel INT8 weight + FP32 scale (W8A8).
+
+        Unlike the FP4 path there is no prepacked GEMM scale: the per-channel
+        FP32 scale [out, 1] is consumed directly by the dequant forward.
+        """
+        if weight.dtype != torch.int8:
+            raise TypeError(f"expected int8 weight, got {weight.dtype}")
+        self.weight = weight
+        self.scale = scale
+        self.scale_gemm = None
+
     def dequant_weight(self, out_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
         """Return dequantized [out, in] weight in `out_dtype`.
 
