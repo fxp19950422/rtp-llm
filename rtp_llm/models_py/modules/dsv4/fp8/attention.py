@@ -339,6 +339,33 @@ _V4_FP8_BLOCK_CFG = Fp8BlockWiseQuantConfig()
 # ``_V4_FP8_BLOCK_CFG`` pattern above).
 _V4_INT8_PC_CFG = Int8PerChannelCompressedQuantConfig()
 
+# Some flash_mla builds (e.g. PPU SDK) ship an older ``flash_mla_sparse_fwd``
+# signature ``(q, kv, indices, sm_scale, d_v=512)`` without the kernel-side
+# ``attn_sink`` / ``topk_length`` kwargs the newer (GPU) build accepts. When the
+# kwargs are unsupported we mask invalid indices to -1 (the kernel ignores
+# -1 / >= s_kv) and apply the attention-sink correction post-hoc from the
+# returned lse -- identical numerics to the CP raw-q-merge path
+# (``_raw_q_merge_apply_sink``). Detected once, lazily.
+_FLASH_MLA_ATTN_SINK_SUPPORTED: Optional[bool] = None
+
+
+def _flash_mla_supports_attn_sink() -> bool:
+    global _FLASH_MLA_ATTN_SINK_SUPPORTED
+    if _FLASH_MLA_ATTN_SINK_SUPPORTED is None:
+        supported = True
+        try:
+            import inspect as _inspect
+
+            from flash_mla import flash_mla_sparse_fwd as _fms
+
+            params = _inspect.signature(_fms).parameters
+            if params:
+                supported = "attn_sink" in params
+        except (ImportError, ValueError, TypeError):
+            supported = True
+        _FLASH_MLA_ATTN_SINK_SUPPORTED = supported
+    return _FLASH_MLA_ATTN_SINK_SUPPORTED
+
 _DSV4_FP8_KV_ENTRY_BYTES = 584
 
 # Call sites whose first byte-sliced (CP-RR) SWA cache write has been logged.
@@ -5378,17 +5405,43 @@ class AttentionFP8(nn.Module):
                 f"({s_q}, {self.dim}), got {tuple(out.shape)}"
             )
 
+        _has_sink_kw = _flash_mla_supports_attn_sink()
         for start in range(0, s_q, chunk_rows):
             end = min(start + chunk_rows, s_q)
             with record_function_range(profile_name):
-                o_part, _, _ = flash_mla_sparse_fwd(
-                    q=q[start:end],
-                    kv=kv,
-                    indices=indices[start:end],
-                    sm_scale=self.softmax_scale,
-                    attn_sink=self.attn_sink,
-                    topk_length=topk_length[start:end],
-                )
+                if _has_sink_kw:
+                    o_part, _, _ = flash_mla_sparse_fwd(
+                        q=q[start:end],
+                        kv=kv,
+                        indices=indices[start:end],
+                        sm_scale=self.softmax_scale,
+                        attn_sink=self.attn_sink,
+                        topk_length=topk_length[start:end],
+                    )
+                else:
+                    # PPU flash_mla: no attn_sink / topk_length kwargs. Mask
+                    # invalid indices (>= per-row topk_length) to -1 -- the
+                    # kernel ignores -1 / >= s_kv -- then apply the attn_sink
+                    # correction post-hoc from the returned lse (identical
+                    # formula to the CP raw-q-merge path).
+                    idx_c = indices[start:end]
+                    tl_c = topk_length[start:end]
+                    _bshape = [1] * (idx_c.dim() - 1)
+                    col = torch.arange(
+                        idx_c.shape[-1], device=idx_c.device
+                    ).view(*_bshape, idx_c.shape[-1])
+                    idx_c = torch.where(
+                        col < tl_c.view(-1, *_bshape),
+                        idx_c,
+                        torch.full_like(idx_c, -1),
+                    )
+                    o_part, _, lse_part = flash_mla_sparse_fwd(
+                        q=q[start:end],
+                        kv=kv,
+                        indices=idx_c,
+                        sm_scale=self.softmax_scale,
+                    )
+                    o_part = self._raw_q_merge_apply_sink(o_part, lse_part)
             with record_function_range("dsv4.fp8.attn.prefill.output_proj"):
                 self._prefill_output_proj_into(
                     o_part,
