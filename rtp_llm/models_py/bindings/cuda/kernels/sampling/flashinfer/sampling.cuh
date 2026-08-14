@@ -37,8 +37,17 @@
 #include "utils.cuh"
 #include "vec_dtypes.cuh"
 
+// cuda::maximum / cuda::minimum only exist in CCCL 2.8+, i.e. CUDA 12.9 and
+// later; on older toolkits cub::Max / cub::Min are the equivalents. Guard on
+// CUDA_VERSION the same way upstream flashinfer does (PR #2086) so this header
+// also compiles against CUDA 12.6 toolchains.
+#if CUDA_VERSION >= 12090
 using MaxReduceOp = cuda::maximum<>;
 using MinReduceOp = cuda::minimum<>;
+#else
+using MaxReduceOp = cub::Max;
+using MinReduceOp = cub::Min;
+#endif
 
 namespace flashinfer {
 
