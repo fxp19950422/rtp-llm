@@ -1052,7 +1052,8 @@ PYBIND11_MODULE(libth_transformer_config, m) {
         .value("FP8Quant", QuantMethod::FP8Quant)
         .value("FP8PTPC", QuantMethod::FP8PTPC)
         .value("W4A8INT4PTPC", QuantMethod::W4A8INT4PTPC)
-        .value("ModelOptFP4", QuantMethod::ModelOptFP4);
+        .value("ModelOptFP4", QuantMethod::ModelOptFP4)
+        .value("INT8PTPC", QuantMethod::INT8PTPC);
 
     // Register QuantAlgo
     py::class_<QuantAlgo>(m, "QuantAlgo")

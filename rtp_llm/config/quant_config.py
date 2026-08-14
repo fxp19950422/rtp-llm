@@ -201,6 +201,26 @@ class QuantizationConfig(ABC):
                         "weight_scale_suffix": ".weight_scale",
                     }
                 )
+            elif (
+                weights_config["type"] == "int"
+                and bits == 8
+                and weights_config["strategy"] == "channel"
+            ):
+                # W8A8 int-quantized: per-channel INT8 weights (scale under the
+                # `.scale` suffix, not `.weight_scale`) + per-token dynamic INT8
+                # activations (no static act scale). Used by DeepSeek-V4-Flash-
+                # W8A8-INT8.
+                quant_method = Int8PerChannelCompressedQuantConfig.get_method()
+                return Int8PerChannelCompressedQuantConfig.from_config(
+                    {
+                        "bits": bits,
+                        "method": quant_method,
+                        "group_size": group_size,
+                        "is_quanted": True,
+                        "dynamic": activation_config.get("dynamic", True),
+                        "weight_scale_suffix": ".scale",
+                    }
+                )
 
         if quant_method == "quark":
             quark_weights_config = quant_config["global_quant_config"]["weight"]
@@ -459,6 +479,55 @@ class Fp8PerChannelCompressedQuantConfig(CompressedTensorsQuantConfig):
     @classmethod
     def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
         return Fp8PerChannelCompressedQuantConfig(**config)
+
+
+class Int8PerChannelCompressedQuantConfig(CompressedTensorsQuantConfig):
+    """compressed-tensors W8A8 INT8: per-channel INT8 weights + per-token acts.
+
+    DeepSeek-V4-Flash-W8A8-INT8 checkpoint layout:
+      - weights: int8, symmetric, per output channel; scale is stored under the
+        ``.scale`` suffix (not the FP8 convention ``.weight_scale``).
+      - input_activations: int8, dynamic, symmetric, per token -- computed at
+        runtime, so there is no static activation scale tensor.
+    """
+
+    def __init__(self, bits: int = 8, is_quanted: bool = False, **kwargs: Any):
+        super().__init__(bits=bits, is_quanted=is_quanted)
+        self._dynamic = kwargs.get("dynamic", True)
+        self._weight_s_suffix = kwargs.get("weight_scale_suffix", ".scale")
+        self._act_s_suffix = kwargs.get("act_scale_suffix", None)
+
+    @classmethod
+    def get_method(cls) -> str:
+        return "INT8_PER_CHANNEL_COMPRESSED"
+
+    @classmethod
+    def get_algo(cls) -> str:
+        return "int8-perchannel-compressed-tensors"
+
+    def is_dynamic(self) -> bool:
+        return self._dynamic
+
+    @property
+    def weight_scale_suffix(self) -> Optional[str]:
+        return self._weight_s_suffix
+
+    @property
+    def act_scale_suffix(self) -> Optional[str]:
+        return self._act_s_suffix
+
+    def get_supported_act_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_compute_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16]
+
+    def get_supported_kv_cache_dtypes(self) -> List[torch.dtype]:
+        return [torch.float16, torch.bfloat16, torch.int8]
+
+    @classmethod
+    def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
+        return Int8PerChannelCompressedQuantConfig(**config)
 
 
 class QuarkQuantConfig(QuantizationConfig):

@@ -42,6 +42,9 @@ void QuantAlgo::setQuantAlgo(const std::string& quant_method, int64_t bits, int6
     } else if (quant_method == "fp8-perchannel-quark") {
         quant_method_ = FP8PTPC;
         weight_bits_  = 8;
+    } else if (quant_method == "int8-perchannel-compressed-tensors") {
+        quant_method_ = INT8PTPC;
+        weight_bits_  = 8;
     } else if (quant_method == "w4a8_int4_per_channel") {
         quant_method_ = W4A8INT4PTPC;
         weight_bits_  = 4;
