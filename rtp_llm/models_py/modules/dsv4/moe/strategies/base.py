@@ -320,6 +320,24 @@ def select_strategy(
             )
         if mega_cls.can_handle(cfg):
             return mega_cls
+        # Backends without the DeepGEMM ``fp8_fp4_mega_moe`` kernel (e.g. PPU)
+        # cannot run MegaMoE at all; fall back to DeepEP (per-rank dispatch +
+        # the int8-capable LocalLoop local compute) when it can handle the cfg.
+        # Backends that DO ship the kernel keep the strict Mega-only EP policy
+        # (fallback intentionally disabled there).
+        _mega_kernel_available = False
+        try:
+            import deep_gemm as _dg
+
+            _mega_kernel_available = hasattr(_dg, "fp8_fp4_mega_moe")
+        except Exception:
+            _mega_kernel_available = False
+        if not _mega_kernel_available:
+            deepep_cls = next(
+                (c for c in _STRATEGY_PRIORITY if c.name == "deepep"), None
+            )
+            if deepep_cls is not None and deepep_cls.can_handle(cfg):
+                return deepep_cls
         from rtp_llm.models_py.modules.dsv4.moe.mega_buf import (
             _mega_moe_disabled_or_unavailable_reason,
         )
