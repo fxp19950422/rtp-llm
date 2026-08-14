@@ -369,6 +369,52 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
             )
         return out
 
+    def _build_routed_experts_int8(self, layer_id: int) -> List[WeightModule]:
+        """INT8 routed experts: per-expert int8 ``.weight`` + FP32 per-channel
+        ``.scale``, stacked across experts. Structurally identical to the FP4
+        variant except the scale is FP32 (compressed-tensors W8A8) rather than
+        the UE8M0 ``float8_e8m0fnu`` used by the FP4 scheme.
+        """
+        moe_cfg = MoeConfig(
+            expert_num=self.expert_num_,
+            align_size=self._moe_align_size,
+        )
+        out: List[WeightModule] = []
+        for sub_w_name, sub_s_name, sub in [
+            (W.v4_routed_w1_w, W.v4_routed_w1_s, "w1"),
+            (W.v4_routed_w2_w, W.v4_routed_w2_s, "w2"),
+            (W.v4_routed_w3_w, W.v4_routed_w3_s, "w3"),
+        ]:
+            out.append(
+                MoeAtomicWeight(
+                    sub_w_name,
+                    [
+                        CkptWeightInfo(
+                            self._key(f"ffn.experts.{{expert_id}}.{sub}.weight"),
+                            identity,
+                        )
+                    ],
+                    stack_,
+                    config=moe_cfg,
+                    data_type=torch.int8,
+                )
+            )
+            out.append(
+                MoeAtomicWeight(
+                    sub_s_name,
+                    [
+                        CkptWeightInfo(
+                            self._key(f"ffn.experts.{{expert_id}}.{sub}.scale"),
+                            identity,
+                        )
+                    ],
+                    stack_,
+                    config=moe_cfg,
+                    data_type=torch.float32,
+                )
+            )
+        return out
+
     # ------------------------------------------------------------------
     # Top-level entry points
     # ------------------------------------------------------------------
@@ -417,8 +463,15 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
         # 8. Shared expert (FP8)
         weights += self._build_shared_expert(layer_id)
 
-        # 9. Routed experts (FP4 — per-expert via MoeAtomicWeight)
-        weights += self._build_routed_experts_fp4(layer_id)
+        # 9. Routed experts. INT8 (compressed-tensors W8A8) declares int8
+        # .weight + FP32 per-channel .scale; the FP4 variant declares int8-packed
+        # FP4 .weight + UE8M0 .scale. They are otherwise identical stacked
+        # MoeAtomicWeight pairs, but the scale dtypes differ and torch.float8_e8m0fnu
+        # is unavailable pre-2.7, so pick the right builder by quant method.
+        if self._quant_algo.isInt8PTPC():
+            weights += self._build_routed_experts_int8(layer_id)
+        else:
+            weights += self._build_routed_experts_fp4(layer_id)
 
         return weights
 
