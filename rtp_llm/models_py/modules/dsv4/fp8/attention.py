@@ -29,11 +29,28 @@ import deep_gemm  # noqa: E402
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from deep_gemm.utils.layout import (  # noqa: E402
-    get_mn_major_tma_aligned_packed_ue8m0_tensor,
-)
 
-from rtp_llm.config.quant_config import Fp8BlockWiseQuantConfig
+try:
+    from deep_gemm.utils.layout import (  # noqa: E402
+        get_mn_major_tma_aligned_packed_ue8m0_tensor,
+    )
+except (ImportError, ModuleNotFoundError):
+    # PPU (deep_gemm ppu2.1.0) ships no FP8 einsum / TMA-packed UE8M0 layout
+    # helper.  This symbol is only used by the FP8 attention path
+    # (``_prepare_wo_a_stacked`` / ``_repack_v4_fp8_scale_to_int32``); the PPU
+    # W8A8-INT8 path never touches it.  Provide a stub that errors only when
+    # actually invoked, so the module still imports on FP8-less backends.
+    def get_mn_major_tma_aligned_packed_ue8m0_tensor(*args, **kwargs):
+        raise RuntimeError(
+            "get_mn_major_tma_aligned_packed_ue8m0_tensor is unavailable in "
+            "this deep_gemm build (no FP8 support); the FP8 attention path is "
+            "not usable on this backend -- use the INT8 (W8A8) path instead."
+        )
+
+from rtp_llm.config.quant_config import (
+    Fp8BlockWiseQuantConfig,
+    Int8PerChannelCompressedQuantConfig,
+)
 from rtp_llm.models_py.modules.dsv4._fused_inv_rope_fp8_quant_triton import (
     fused_inv_rope_fp8_quant,
 )
@@ -316,6 +333,12 @@ def _build_suffix_cp_sliced_slot_mapping(
 
 _V4_FP8_BLOCK_CFG = Fp8BlockWiseQuantConfig()
 
+# PPU (ZW810E, no FP8) W8A8-INT8: per-channel INT8 weight + fp32 per-out-channel
+# scale linears run a dequant->bf16 matmul via ``CudaInt8PerChannelLinear``.
+# Shared module-level config instance for the factory dispatch (mirrors the
+# ``_V4_FP8_BLOCK_CFG`` pattern above).
+_V4_INT8_PC_CFG = Int8PerChannelCompressedQuantConfig()
+
 _DSV4_FP8_KV_ENTRY_BYTES = 584
 
 # Call sites whose first byte-sliced (CP-RR) SWA cache write has been logged.
@@ -425,6 +448,23 @@ def _v4_fp8_linear(w: torch.Tensor, s: torch.Tensor):
         "_w",
         "_s",
         quant_config=_V4_FP8_BLOCK_CFG,
+    )
+
+
+def _v4_int8_linear(w: torch.Tensor, s: torch.Tensor):
+    """Build a per-channel INT8 (W8A8) linear from a V4 int8 weight + fp32
+    per-output-channel scale.  Runs a dequant->bf16 matmul (activations stay
+    bf16), mirroring the W8A8 dequant path used by the MoE experts and the
+    factory ``CudaInt8PerChannelLinear``.  PPU ZW810E has no FP8, so the fp8
+    DeepGEMM ``fp8_gemm_nt`` path (``_v4_fp8_linear``) does not apply here."""
+    assert w.dtype == torch.int8, f"expected int8 weight, got {w.dtype}"
+    assert s is not None, "expected non-null int8 scale"
+    local = {"_w": w, "_s": s}
+    return LinearFactory.create_linear_from_weights(
+        local,
+        "_w",
+        "_s",
+        quant_config=_V4_INT8_PC_CFG,
     )
 
 
@@ -955,6 +995,20 @@ class AttentionFP8(nn.Module):
                 (slice by ``slice.start // 512``)."""
             w = layer_weights[w_tag]
             s = layer_weights[s_tag]
+            if w.dtype == torch.int8:
+                # PPU W8A8-INT8: per-output-channel scale ``[out, 1]``.  A
+                # row_slice (TP split along N) selects output channels
+                # directly (no //128 block indexing); a col_slice (input
+                # dim) leaves the per-out-channel scale untouched.
+                if row_slice is not None:
+                    w = w[row_slice]
+                    s = s[row_slice]
+                if col_slice is not None:
+                    w = w[:, col_slice]
+                if row_slice is not None or col_slice is not None:
+                    w = w.contiguous()
+                    s = s.contiguous()
+                return _v4_int8_linear(w, s)
             scale_is_packed_int32 = s.dtype == torch.int32
             if row_slice is not None:
                 w = w[row_slice]
@@ -997,23 +1051,46 @@ class AttentionFP8(nn.Module):
         assert (n_heads * head_dim) % o_groups == 0
         wo_a_w = layer_weights[W.v4_attn_wo_a_w]
         wo_a_s = layer_weights[W.v4_attn_wo_a_s]
-        if tp_size > 1:
-            wo_a_w = wo_a_w[wo_a_row_slice].contiguous()
-            if wo_a_s.dtype == torch.int32:
-                # framework path: scale is already (N, K//128//4) int32
-                wo_a_s = wo_a_s[wo_a_row_slice].contiguous()
-            else:
-                wo_a_s = wo_a_s[
-                    wo_a_row_slice.start // 128 : wo_a_row_slice.stop // 128
-                ].contiguous()
-        self.wo_a_w = wo_a_w
-        self.wo_a_s = wo_a_s
         K_local = n_heads_local * head_dim // n_groups_local
-        _stk_w, _stk_s = _prepare_wo_a_stacked(
-            wo_a_w, wo_a_s, n_groups_local, o_lora_rank, K_local
-        )
-        self.register_buffer("_wo_a_stk_w", _stk_w, persistent=False)
-        self.register_buffer("_wo_a_stk_s", _stk_s, persistent=False)
+        self._wo_a_is_int8 = wo_a_w.dtype == torch.int8
+        if self._wo_a_is_int8:
+            # PPU W8A8-INT8: wo_a is int8 ``[G*R, K]`` + fp32 per-out-channel
+            # scale ``[G*R, 1]``.  A TP row_slice selects output channels
+            # directly.  Store grouped ``[G, R, K]`` int8 + ``[G, R, 1]`` scale;
+            # the bf16 output projection dequants per-forward (no fp8_einsum
+            # stacked buffers -- PPU has no FP8).
+            if tp_size > 1:
+                wo_a_w = wo_a_w[wo_a_row_slice].contiguous()
+                wo_a_s = wo_a_s[wo_a_row_slice].contiguous()
+            self.register_buffer(
+                "_wo_a_int8_w",
+                wo_a_w.view(n_groups_local, o_lora_rank, K_local).contiguous(),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_wo_a_int8_s",
+                wo_a_s.reshape(n_groups_local, o_lora_rank, 1)
+                .to(torch.float32)
+                .contiguous(),
+                persistent=False,
+            )
+        else:
+            if tp_size > 1:
+                wo_a_w = wo_a_w[wo_a_row_slice].contiguous()
+                if wo_a_s.dtype == torch.int32:
+                    # framework path: scale is already (N, K//128//4) int32
+                    wo_a_s = wo_a_s[wo_a_row_slice].contiguous()
+                else:
+                    wo_a_s = wo_a_s[
+                        wo_a_row_slice.start // 128 : wo_a_row_slice.stop // 128
+                    ].contiguous()
+            self.wo_a_w = wo_a_w
+            self.wo_a_s = wo_a_s
+            _stk_w, _stk_s = _prepare_wo_a_stacked(
+                wo_a_w, wo_a_s, n_groups_local, o_lora_rank, K_local
+            )
+            self.register_buffer("_wo_a_stk_w", _stk_w, persistent=False)
+            self.register_buffer("_wo_a_stk_s", _stk_s, persistent=False)
 
         # wo_b row-split along K (cols), all_reduce after forward
         self.wo_b = _fp8_w_s(
