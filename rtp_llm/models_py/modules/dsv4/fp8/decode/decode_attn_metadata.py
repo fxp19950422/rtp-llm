@@ -285,6 +285,18 @@ def get_or_build_sched_meta(
     inside the graph so it re-runs (with fresh ``topk_length`` values) on every
     replay. See ``opt_flash_mla/design/01_cuda_graph_sched_meta_freeze.md``.
     """
+    # PPU flash_mla wheel: the sparse decode op (``_forward_flash_mla_ppu``)
+    # rebuilds per-pool sched_meta locally with the PPU ``get_mla_metadata``
+    # signature (positional ``num_heads_per_head_k`` + a real ``cache_seqlens``
+    # tensor) and ignores the value returned here. The GPU-shaped planner call
+    # below would raise on PPU, so return None and let the op self-build.
+    from rtp_llm.models_py.modules.dsv4.fp8.decode.fp8_sparse_attn_decode_op import (
+        _flash_mla_with_kvcache_supports_attn_sink,
+    )
+
+    if not _flash_mla_with_kvcache_supports_attn_sink():
+        return None
+
     from flash_mla import get_mla_metadata  # type: ignore[import-not-found]
 
     capturing = False

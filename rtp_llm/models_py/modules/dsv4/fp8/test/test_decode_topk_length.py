@@ -341,17 +341,23 @@ class DecodeTopkLengthPlumbingTest(unittest.TestCase):
 
         fake.flash_mla_with_kvcache = fake_kv
         old = sys.modules.get("flash_mla")
+        module = importlib.import_module(
+            "rtp_llm.models_py.modules.dsv4.fp8.decode.fp8_sparse_attn_decode_op"
+        )
+        old_attn_sink_flag = module._FLASH_MLA_KVCACHE_ATTN_SINK
         sys.modules["flash_mla"] = fake
+        # These plumbing tests assert GPU-path kwargs (topk_length forwarded to
+        # the kernel); force GPU detection so they stay host-independent (the PPU
+        # wheel applies topk_length as an index mask instead of a kwarg).
+        module._FLASH_MLA_KVCACHE_ATTN_SINK = True
         try:
-            module = importlib.import_module(
-                "rtp_llm.models_py.modules.dsv4.fp8.decode.fp8_sparse_attn_decode_op"
-            )
             module._FLASH_MLA_AVAILABLE = True
             op = module.SparseAttnV4DecodeFp8Op(
                 n_heads=2, head_dim=HEAD_DIM, softmax_scale=HEAD_DIM**-0.5
             )
             fn(op, calls)
         finally:
+            module._FLASH_MLA_KVCACHE_ATTN_SINK = old_attn_sink_flag
             if old is None:
                 sys.modules.pop("flash_mla", None)
             else:
