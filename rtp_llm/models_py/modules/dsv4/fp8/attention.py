@@ -3913,14 +3913,38 @@ class AttentionFP8(nn.Module):
         )
         combined_indices, combined_lens = self._compact_indices([local_topk, local_swa])
 
-        local_o, _, local_lse = flash_mla_sparse_fwd(
-            q=q_full,
-            kv=workspace.view(B * local_M, 1, D),
-            indices=combined_indices.unsqueeze(1),
-            sm_scale=self.softmax_scale,
-            attn_sink=None,
-            topk_length=combined_lens,
-        )
+        if _flash_mla_supports_attn_sink():
+            local_o, _, local_lse = flash_mla_sparse_fwd(
+                q=q_full,
+                kv=workspace.view(B * local_M, 1, D),
+                indices=combined_indices.unsqueeze(1),
+                sm_scale=self.softmax_scale,
+                attn_sink=None,
+                topk_length=combined_lens,
+            )
+        else:
+            # PPU flash_mla: no attn_sink / topk_length kwargs. Mask indices
+            # at/after the per-row length to -1 (kernel ignores -1 / >= s_kv),
+            # then convert the 2-based (log2) lse to natural base so the
+            # downstream merge_lse_output (base-e logsumexp) and the post-hoc
+            # _raw_q_merge_apply_sink (base-e sigmoid) stay consistent. The sink
+            # is applied post-hoc below, so attn_sink is not passed to the
+            # kernel on either path here.
+            _col = torch.arange(
+                combined_indices.shape[-1], device=combined_indices.device
+            ).view(1, combined_indices.shape[-1])
+            _masked_idx = torch.where(
+                _col < combined_lens.view(-1, 1),
+                combined_indices,
+                torch.full_like(combined_indices, -1),
+            )
+            local_o, _, local_lse = flash_mla_sparse_fwd(
+                q=q_full,
+                kv=workspace.view(B * local_M, 1, D),
+                indices=_masked_idx.unsqueeze(1),
+                sm_scale=self.softmax_scale,
+            )
+            local_lse = local_lse * math.log(2.0)
         with record_function_range(
             f"dsv4.cp.all_gather.L{self.layer_id:02d}.workspace_attn.o.launch"
         ):
