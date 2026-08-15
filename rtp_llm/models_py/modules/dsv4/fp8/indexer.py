@@ -50,7 +50,11 @@ from rtp_llm.models_py.modules.dsv4.fp8._indexer_score import (
     has_fp8_paged_mqa_logits,
 )
 from rtp_llm.models_py.modules.dsv4.fp8._kv_cache_utils import PoolBackedModule
-from rtp_llm.models_py.modules.dsv4.fp8._ppu_indexer_score import ppu_indexer_score
+from rtp_llm.models_py.modules.dsv4.fp8._ppu_indexer_score import (
+    _apply_rope_torch,
+    ppu_indexer_score,
+    ppu_indexer_score_prefill,
+)
 from rtp_llm.models_py.modules.dsv4.fp8.compressor import _is_ppu_device
 from rtp_llm.models_py.modules.dsv4.fp8.compressor import (
     CompressorFP8,
@@ -1122,17 +1126,25 @@ class IndexerFP8(PoolBackedModule):
 
             q_for_quant = q if q.dim() == 4 else q.unsqueeze(0)
             w_for_quant = weights if weights.dim() == 3 else weights.unsqueeze(0)
-            with record_function_range("dsv4.fp8.indexer.prefill.quant_q_rope"):
-                q_fp8, w_fold = indexer_q_rope_fp8_quant_fold(
-                    _as_bf16_contig(q_for_quant),
-                    _as_bf16_contig(w_for_quant),
+            _ppu_prefill = _is_ppu_device(x.device)
+            if _ppu_prefill:
+                q_roped_ppu = _apply_rope_torch(
+                    _as_bf16_contig(q_for_quant).view(-1, self.n_heads, INDEXER_HEAD_DIM),
                     attention_inputs.freqs_cis_slice,
                     self.rope_head_dim,
-                )
-
-            assert (
-                has_fp8_mqa_logits()
-            ), "deep_gemm.fp8_mqa_logits required for IndexerFP8 prefill"
+                ).view(-1, self.n_heads, INDEXER_HEAD_DIM)
+                w_flat_ppu = _as_bf16_contig(w_for_quant).view(-1, self.n_heads).float()
+            else:
+                with record_function_range("dsv4.fp8.indexer.prefill.quant_q_rope"):
+                    q_fp8, w_fold = indexer_q_rope_fp8_quant_fold(
+                        _as_bf16_contig(q_for_quant),
+                        _as_bf16_contig(w_for_quant),
+                        attention_inputs.freqs_cis_slice,
+                        self.rope_head_dim,
+                    )
+                assert (
+                    has_fp8_mqa_logits()
+                ), "deep_gemm.fp8_mqa_logits required for IndexerFP8 prefill"
             assert self._kv_pool_view.dim() == 3, (
                 "IndexerFP8 expects 3D ``_kv_pool_view`` "
                 "[num_blocks, eb, 132]; got dim="
@@ -1172,8 +1184,12 @@ class IndexerFP8(PoolBackedModule):
             # view uint8 [T, 4] → fp32 [T, 1] → squeeze [T].
             k_scale_flat = k_scale_buf.view(torch.float32).squeeze(-1)
 
-            q_score = q_fp8.view(M, self.n_heads, INDEXER_HEAD_DIM)
-            w_score = w_fold.view(M, self.n_heads)
+            if _ppu_prefill:
+                q_score = q_roped_ppu
+                w_score = w_flat_ppu
+            else:
+                q_score = q_fp8.view(M, self.n_heads, INDEXER_HEAD_DIM)
+                w_score = w_fold.view(M, self.n_heads)
             score_chunk_rows = _fp8_prefill_score_chunk_rows()
             chunked_score = score_chunk_rows > 0 and M > score_chunk_rows
             if not chunked_score:
@@ -1187,15 +1203,25 @@ class IndexerFP8(PoolBackedModule):
             for row_start in range(0, M, score_chunk_rows):
                 row_end = min(M, row_start + score_chunk_rows)
                 with record_function_range("dsv4.fp8.indexer.prefill.score"):
-                    logits = fp8_mqa_indexer_score(
-                        q_score[row_start:row_end],
-                        w_score[row_start:row_end],
-                        k_quant_flat,
-                        k_scale_flat,
-                        attention_inputs.ks[row_start:row_end],
-                        attention_inputs.ke[row_start:row_end],
-                        clean_logits=False,
-                    )  # [chunk_rows, T] fp32
+                    if _ppu_prefill:
+                        logits = ppu_indexer_score_prefill(
+                            q_score[row_start:row_end],
+                            w_score[row_start:row_end],
+                            k_quant_flat,
+                            k_scale_flat,
+                            attention_inputs.ks[row_start:row_end],
+                            attention_inputs.ke[row_start:row_end],
+                        )
+                    else:
+                        logits = fp8_mqa_indexer_score(
+                            q_score[row_start:row_end],
+                            w_score[row_start:row_end],
+                            k_quant_flat,
+                            k_scale_flat,
+                            attention_inputs.ks[row_start:row_end],
+                            attention_inputs.ke[row_start:row_end],
+                            clean_logits=False,
+                        )  # [chunk_rows, T] fp32
 
                 with record_function_range("dsv4.fp8.indexer.prefill.topk"):
                     _run_prefill_topk(
@@ -1336,17 +1362,25 @@ class IndexerFP8(PoolBackedModule):
 
             q_for_quant = q if q.dim() == 4 else q.unsqueeze(0)
             w_for_quant = weights if weights.dim() == 3 else weights.unsqueeze(0)
-            with record_function_range("dsv4.fp8.indexer.prefill.quant_q_rope"):
-                q_fp8, w_fold = indexer_q_rope_fp8_quant_fold(
-                    _as_bf16_contig(q_for_quant),
-                    _as_bf16_contig(w_for_quant),
+            _ppu_prefill = _is_ppu_device(x.device)
+            if _ppu_prefill:
+                q_roped_ppu = _apply_rope_torch(
+                    _as_bf16_contig(q_for_quant).view(-1, self.n_heads, INDEXER_HEAD_DIM),
                     attention_inputs.freqs_cis_slice,
                     self.rope_head_dim,
-                )
-
-            assert (
-                has_fp8_mqa_logits()
-            ), "deep_gemm.fp8_mqa_logits required for IndexerFP8 prefill"
+                ).view(-1, self.n_heads, INDEXER_HEAD_DIM)
+                w_flat_ppu = _as_bf16_contig(w_for_quant).view(-1, self.n_heads).float()
+            else:
+                with record_function_range("dsv4.fp8.indexer.prefill.quant_q_rope"):
+                    q_fp8, w_fold = indexer_q_rope_fp8_quant_fold(
+                        _as_bf16_contig(q_for_quant),
+                        _as_bf16_contig(w_for_quant),
+                        attention_inputs.freqs_cis_slice,
+                        self.rope_head_dim,
+                    )
+                assert (
+                    has_fp8_mqa_logits()
+                ), "deep_gemm.fp8_mqa_logits required for IndexerFP8 prefill"
             assert self._kv_pool_view.dim() == 3, (
                 "IndexerFP8 expects 3D ``_kv_pool_view`` "
                 "[num_blocks, eb, 132]; got dim="
@@ -1383,8 +1417,12 @@ class IndexerFP8(PoolBackedModule):
                 indexer_k_pending = None
             k_scale_flat = k_scale_buf.view(torch.float32).squeeze(-1)
 
-            q_score = q_fp8.view(M, self.n_heads, INDEXER_HEAD_DIM)
-            w_score = w_fold.view(M, self.n_heads)
+            if _ppu_prefill:
+                q_score = q_roped_ppu
+                w_score = w_flat_ppu
+            else:
+                q_score = q_fp8.view(M, self.n_heads, INDEXER_HEAD_DIM)
+                w_score = w_fold.view(M, self.n_heads)
             score_chunk_rows = _fp8_prefill_score_chunk_rows()
             chunked_score = score_chunk_rows > 0 and M > score_chunk_rows
             if not chunked_score:
@@ -1394,15 +1432,25 @@ class IndexerFP8(PoolBackedModule):
             for row_start in range(0, M, score_chunk_rows):
                 row_end = min(M, row_start + score_chunk_rows)
                 with record_function_range("dsv4.fp8.indexer.prefill.score"):
-                    logits = fp8_mqa_indexer_score(
-                        q_score[row_start:row_end],
-                        w_score[row_start:row_end],
-                        k_quant_flat,
-                        k_scale_flat,
-                        attention_inputs.ks[row_start:row_end],
-                        attention_inputs.ke[row_start:row_end],
-                        clean_logits=False,
-                    )
+                    if _ppu_prefill:
+                        logits = ppu_indexer_score_prefill(
+                            q_score[row_start:row_end],
+                            w_score[row_start:row_end],
+                            k_quant_flat,
+                            k_scale_flat,
+                            attention_inputs.ks[row_start:row_end],
+                            attention_inputs.ke[row_start:row_end],
+                        )
+                    else:
+                        logits = fp8_mqa_indexer_score(
+                            q_score[row_start:row_end],
+                            w_score[row_start:row_end],
+                            k_quant_flat,
+                            k_scale_flat,
+                            attention_inputs.ks[row_start:row_end],
+                            attention_inputs.ke[row_start:row_end],
+                            clean_logits=False,
+                        )
 
                 with record_function_range("dsv4.fp8.indexer.prefill.topk"):
                     _run_prefill_topk(

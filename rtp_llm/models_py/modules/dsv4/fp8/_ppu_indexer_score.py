@@ -121,3 +121,33 @@ def ppu_indexer_score(
     scored = F.relu(dots) * weights.float().unsqueeze(-1)  # [B,S,H,T]
     logits = scored.sum(dim=2)  # [B,S,T]
     return logits.view(B * S, max_ctx_len)
+
+
+def ppu_indexer_score_prefill(
+    q_bf16: torch.Tensor,         # [M, H, D=128] bf16 (post-RoPE from caller)
+    weights: torch.Tensor,        # [M, H] fp32 — per-head weights (scale folded)
+    k_quant: torch.Tensor,        # [N, D] float8_e4m3fn — gathered flat K
+    k_scale: torch.Tensor,        # [N] fp32 — per-token scale
+    cu_seqlen_ks: torch.Tensor,   # [M] int32 — per-row K start
+    cu_seqlen_ke: torch.Tensor,   # [M] int32 — per-row K end
+) -> torch.Tensor:
+    """PPU torch prefill indexer score (non-paged).
+
+    Same contract as ``fp8_mqa_indexer_score``: returns ``[M, N] fp32``.
+    Q is already roped by the caller. K is flat (already gathered from the
+    pool by ``_gather_prefill_k_cache``).
+    """
+    M, H, D = q_bf16.shape
+    N = k_quant.shape[0]
+    # Dequant K: fp8 * scale -> bf16
+    K_f32 = k_quant.float() * k_scale[:, None]  # [N, D]
+    # einsum: Q[M,H,D] @ K[N,D]^T -> [M,H,N]
+    dots = torch.einsum("mhd,nd->mhn", q_bf16.float(), K_f32)
+    # ReLU + weighted sum over H
+    scored = F.relu(dots) * weights.float().unsqueeze(-1)  # [M,H,N]
+    logits = scored.sum(dim=1)  # [M, N]
+    # Apply causal mask: positions outside [ks, ke) -> -inf (or just leave as-is
+    # since the caller topk handles masking). Match deep_gemm behavior:
+    # entries past ke are "untouched" (we leave them as computed; the topk
+    # path applies its own causal cap).
+    return logits
