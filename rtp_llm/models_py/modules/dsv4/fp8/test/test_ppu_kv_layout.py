@@ -74,5 +74,53 @@ class TestPpuKvLayoutRealKernel(unittest.TestCase):
         self.assertLess(err, 0.1, f"packed-pool kernel rel err {err}")
 
 
+
+@unittest.skipUnless(_PPU_REAL, "requires PPU flash_mla wheel (reduced sig) + CUDA")
+class TestSwaInsert656WriteReadCycle(unittest.TestCase):
+    """SWA-insert 656 branch -> decode op read (real kernel) == bf16 ref.
+
+    The GPU 584-byte triton insert kernel cannot compile on PPU (triton lacks
+    fp8e4nv), so the PPU path packs per-token in pure torch. This exercises the
+    full write->read cycle: quantize_and_insert_k_cache into a multi-block 656
+    pool, then SparseAttnV4DecodeFp8Op.forward through the real kernel.
+    """
+
+    def test_insert_then_decode(self):
+        from rtp_llm.models_py.modules.dsv4.fp8._swa_kv_insert_triton import (
+            quantize_and_insert_k_cache,
+        )
+        from rtp_llm.models_py.modules.dsv4.fp8.decode.fp8_sparse_attn_decode_op import (
+            SparseAttnV4DecodeFp8Op,
+        )
+
+        torch.manual_seed(0)
+        dev = "cuda"
+        H, HEAD, topk = 64, 512, 128
+        num_blocks, block_size = 2, 64
+        N = num_blocks * block_size
+        k = torch.randn(N, HEAD, dtype=torch.bfloat16, device=dev) * 0.2
+        pool = torch.zeros(num_blocks, block_size, PPU_KV_ENTRY_BYTES, dtype=torch.uint8, device=dev)
+        slot_mapping = torch.arange(N, dtype=torch.int64, device=dev)
+        quantize_and_insert_k_cache(k, pool, slot_mapping)  # -> 656 pure-torch branch
+        self.assertEqual(int(pool.reshape(N, -1).any(-1).sum()), N)
+
+        q = torch.randn(1, 1, H, HEAD, dtype=torch.bfloat16, device=dev) * 0.2
+        sink = torch.rand(H, dtype=torch.float32, device=dev) * 0.5 + 0.2
+        idx = torch.randint(0, N, (1, 1, topk), dtype=torch.int32, device=dev)
+        op = SparseAttnV4DecodeFp8Op(n_heads=H, head_dim=HEAD, softmax_scale=HEAD ** -0.5)
+        out = op.forward(q, pool, sink, idx, sched_meta=None)
+        self.assertEqual(tuple(out.shape), (1, 1, H, HEAD))
+        self.assertTrue(torch.isfinite(out).all().item())
+
+        sel = k[idx[0, 0].long()].float()
+        sc = torch.einsum("hd,kd->hk", q[0, 0].float(), sel) * (HEAD ** -0.5)
+        m = sc.amax(-1, keepdim=True)
+        e = torch.exp(sc - m)
+        denom = e.sum(-1, keepdim=True) + torch.exp(sink.view(H, 1) - m)
+        oref = torch.einsum("hk,kd->hd", e, sel) / denom
+        err = ((out[0, 0].float() - oref).norm() / oref.norm()).item()
+        self.assertLess(err, 0.1, f"insert->decode rel err {err}")
+
+
 if __name__ == "__main__":
     unittest.main()

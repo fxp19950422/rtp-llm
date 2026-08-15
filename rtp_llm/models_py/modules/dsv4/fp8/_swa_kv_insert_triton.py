@@ -26,6 +26,10 @@ import triton.language as tl
 from rtp_llm.models_py.modules.dsv4.fp8._swa_cp_byte_sliced import (
     CPByteSlicedSlotCompaction,
 )
+from rtp_llm.models_py.modules.dsv4.fp8._ppu_kv_layout import (
+    PPU_KV_ENTRY_BYTES,
+    pack_ppu_kv_656,
+)
 from rtp_llm.models_py.modules.dsv4.fp8._trap_utils import (
     trap_invalid_kv_access_enabled,
     validate_slot_mapping,
@@ -155,6 +159,30 @@ _TOKEN_DATA_SIZE = _TOKEN_FP8_DIM + _TOKEN_BF16_DIM * 2  # 576
 _INPUT_DIM = 512
 
 
+def _ppu_insert_k_cache_656(
+    k: torch.Tensor,
+    k_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+) -> None:
+    """PPU per-token FP8 KV insert into a 656-byte pool.
+
+    The PPU flash_mla kernel reads a per-token-contiguous 656-byte slot, so
+    (unlike the GPU 584-byte block-interleaved triton path) each token's K is
+    packed whole (Mapping A) and scattered to its slot. ``-1`` slots skipped.
+    """
+    if slot_mapping.dtype != torch.long:
+        slot_mapping = slot_mapping.to(torch.long)
+    valid = slot_mapping >= 0
+    if not bool(valid.any()):
+        return
+    kk = k[valid]
+    slots = slot_mapping[valid]
+    block_size = int(k_cache.shape[1])
+    blk = slots // block_size
+    pos = slots % block_size
+    k_cache[blk, pos] = pack_ppu_kv_656(kk)
+
+
 def quantize_and_insert_k_cache(
     k: torch.Tensor,  # [num_tokens, 512] bf16
     k_cache: torch.Tensor,  # [num_blocks, block_size, 584] uint8
@@ -176,6 +204,12 @@ def quantize_and_insert_k_cache(
         k.dim() == 2 and k.shape[1] == _INPUT_DIM
     ), f"K must be [num_tokens, 512], got {tuple(k.shape)}"
     assert k.dtype == torch.bfloat16, f"K must be bf16, got {k.dtype}"
+    # PPU flash_mla reads a per-token-contiguous 656-byte FP8 slot rather than
+    # the GPU 584-byte block-interleaved layout the triton kernel below writes;
+    # when the pool is allocated at the PPU width, pack per-token in pure torch.
+    if k_cache.dim() == 3 and k_cache.shape[-1] == PPU_KV_ENTRY_BYTES:
+        _ppu_insert_k_cache_656(k, k_cache, slot_mapping)
+        return
     assert (
         k_cache.dim() == 3 and k_cache.shape[-1] == 584 and k_cache.dtype == torch.uint8
     ), (
