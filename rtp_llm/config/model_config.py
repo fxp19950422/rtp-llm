@@ -661,6 +661,22 @@ class ModelConfig(CppModelConfig):
                 "Setting attn_config.kv_cache_dtype to FP8 based on quant_config.get_method().lower() == 'fp8'"
             )
 
+        # PPU: override FP8 KV entry bytes from 584 to 656.
+        # The PPU FlashMLA kernel uses a different per-token layout (656B:
+        # 512 fp8 nope + 16 fp32 scale + 128 bf16 rope) vs GPU (584B:
+        # 448 fp8 nope + 128 bf16 rope + 8 UE8M0 scale).
+        if (
+            self.attn_config.kv_cache_dtype == KvCacheDataType.FP8
+            and torch.cuda.is_available()
+            and "PPU" in torch.cuda.get_device_properties(0).name
+        ):
+            if hasattr(self.attn_config, "fp8_kv_entry_bytes_override"):
+                self.attn_config.fp8_kv_entry_bytes_override = 656
+                logging.info(
+                    "PPU detected: setting fp8_kv_entry_bytes_override=656 "
+                    "(PPU FlashMLA 656-byte per-token FP8 KV layout)"
+                )
+
         # Validate configuration with quant_config
         if quant_config:
             kv_cache_torch_dtype = kv_cache_dtype_to_torch_dtype(

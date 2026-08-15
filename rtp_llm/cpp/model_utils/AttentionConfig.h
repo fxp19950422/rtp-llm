@@ -73,6 +73,10 @@ struct AttentionConfigs {
     int    sliding_window         = 0;
     // Separate RoPE base for the compressed K branch (V4: rope_theta=10000 main, compress=160000)
     double compress_rope_theta    = 0.0;
+    // PPU override: when non-zero, use this instead of the compiled-in
+    // kDsv4KvEntryBytesFp8 (584). Set to 656 on PPU platforms where the
+    // FlashMLA kernel requires a different per-token FP8 KV layout.
+    uint32_t fp8_kv_entry_bytes_override = 0;
 
     // data type for attention computation
     c10::ScalarType dtype = c10::ScalarType::Half;

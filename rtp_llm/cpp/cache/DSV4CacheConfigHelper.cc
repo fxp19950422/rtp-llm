@@ -203,7 +203,9 @@ std::vector<DSV4PoolDesc> buildDSV4PoolDescs(const DSV4LayerSets&     sets,
     const uint32_t hca_state_dim = head_dim;
 
     const bool     fp8_kv              = (attn.kv_cache_dtype == KvCacheDataType::FP8);
-    const uint32_t kv_entry_bytes      = fp8_kv ? kDsv4KvEntryBytesFp8 : kDsv4KvEntryBytesBf16;
+    const uint32_t kv_entry_bytes      = fp8_kv
+        ? (attn.fp8_kv_entry_bytes_override > 0 ? attn.fp8_kv_entry_bytes_override : kDsv4KvEntryBytesFp8)
+        : kDsv4KvEntryBytesBf16;
     const uint32_t indexer_entry_bytes = fp8_kv ? kDsv4IndexerEntryBytesFp8 : kDsv4IndexerEntryBytesBf16;
 
     const uint32_t csa_state_eb =
