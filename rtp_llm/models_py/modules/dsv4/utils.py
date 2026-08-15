@@ -1,7 +1,21 @@
 """Shared DSV4 utility functions used across BF16 and FP8 paths."""
 
 import torch
-from deep_gemm.utils.layout import get_mn_major_tma_aligned_packed_ue8m0_tensor
+
+try:
+    from deep_gemm.utils.layout import get_mn_major_tma_aligned_packed_ue8m0_tensor
+except (ImportError, ModuleNotFoundError):
+    # PPU (deep_gemm ppu2.1.0) ships no FP8 TMA-packed UE8M0 layout helper.
+    # It is only used by the FP8 weight path (_v4_fp8_linear /
+    # _repack_v4_fp8_scale_to_int32); the PPU W8A8-INT8 path never calls it,
+    # but the unguarded top-level import previously broke importing this
+    # module (and the pure-torch _sparse_attn reference) on PPU.
+    def get_mn_major_tma_aligned_packed_ue8m0_tensor(*args, **kwargs):
+        raise RuntimeError(
+            "get_mn_major_tma_aligned_packed_ue8m0_tensor is unavailable in "
+            "this deep_gemm build (no FP8 support); the FP8 weight path is "
+            "not usable on this backend -- use the INT8 (W8A8) path instead."
+        )
 
 from rtp_llm.config.quant_config import Fp8BlockWiseQuantConfig
 from rtp_llm.models_py.modules.factory.linear import LinearFactory
