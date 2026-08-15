@@ -122,5 +122,37 @@ class TestSwaInsert656WriteReadCycle(unittest.TestCase):
         self.assertLess(err, 0.1, f"insert->decode rel err {err}")
 
 
+
+@unittest.skipUnless(torch.cuda.is_available(), "needs a CUDA device (triton import + fp8)")
+class TestSwaDequantGather656(unittest.TestCase):
+    """SWA dequant+gather 656 PPU branch round-trip: pack K -> 656 pool ->
+    dequantize_and_gather_k_cache (pure-torch PPU path) -> ~= K (fp8 floor).
+    The GPU 584 triton dequant kernel can't compile on PPU (fp8e4nv)."""
+
+    def test_dequant_gather_roundtrip(self):
+        try:
+            from rtp_llm.models_py.modules.dsv4.fp8._swa_dequant_triton import (
+                dequantize_and_gather_k_cache,
+            )
+        except Exception as e:  # noqa: BLE001
+            self.skipTest(f"_swa_dequant_triton import failed: {e}")
+
+        torch.manual_seed(0)
+        dev = "cuda"
+        HEAD = 512
+        num_blocks, block_size = 2, 64
+        N = num_blocks * block_size
+        k = torch.randn(N, HEAD, dtype=torch.bfloat16, device=dev) * 0.2
+        pool = pack_ppu_kv_656(k).view(num_blocks, block_size, PPU_KV_ENTRY_BYTES)
+        out = torch.zeros(1, N, HEAD, dtype=torch.bfloat16, device=dev)
+        seq_lens = torch.tensor([N], dtype=torch.int32, device=dev)
+        gather_lens = torch.tensor([N], dtype=torch.int32, device=dev)
+        block_table = torch.tensor([[0, 1]], dtype=torch.int32, device=dev)
+        dequantize_and_gather_k_cache(out, pool, seq_lens, gather_lens, block_table, block_size, 0)
+        err = ((out[0].float() - k.float()).norm() / k.float().norm()).item()
+        self.assertTrue(torch.isfinite(out).all().item())
+        self.assertLess(err, 0.06, f"dequant+gather rel err {err}")
+
+
 if __name__ == "__main__":
     unittest.main()

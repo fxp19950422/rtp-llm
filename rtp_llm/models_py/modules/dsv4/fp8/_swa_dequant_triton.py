@@ -68,6 +68,37 @@ SCALE_BYTES_PER_TOKEN = 8  # 7 real + 1 padding
 ENTRY_BYTES = TOKEN_DATA_SIZE + SCALE_BYTES_PER_TOKEN  # 584
 FP8_MAX = 448.0
 
+from rtp_llm.models_py.modules.dsv4.fp8._ppu_kv_layout import (  # noqa: E402
+    PPU_KV_ENTRY_BYTES,
+    dequant_ppu_kv_656,
+)
+
+
+def _ppu_dequant_and_gather_656(
+    out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
+):
+    """PPU per-token dequant+gather from a 656-byte pool (pure torch).
+
+    The GPU 584-byte triton dequant kernel cannot compile on PPU (triton has
+    no fp8e4nv), so dequantize the suffix ``gather_lens[r]`` tokens per request
+    with dequant_ppu_kv_656. Mirrors the triton gather: pos = seq_lens[r] -
+    gather_lens[r] + step; physical block via block_table; write into
+    ``out[r, offset:offset+g, :]``.
+    """
+    num_reqs = int(seq_lens.shape[0])
+    sl = seq_lens.reshape(-1).to(torch.long)
+    gl = sl if gather_lens is None else gather_lens.reshape(-1).to(torch.long)
+    bt = block_table.to(torch.long)
+    for r in range(num_reqs):
+        g = int(gl[r].item())
+        if g <= 0:
+            continue
+        start = int(sl[r].item()) - g
+        pos = start + torch.arange(g, device=out.device, dtype=torch.long)
+        pblk = bt[r, pos // block_size]
+        pib = pos % block_size
+        out[r, offset : offset + g, :] = dequant_ppu_kv_656(k_cache[pblk, pib])
+
 
 @triton.jit
 def _trap_invalid_kv_access(TRAP_INVALID_KV_ACCESS: tl.constexpr) -> None:
@@ -214,6 +245,14 @@ def dequantize_and_gather_k_cache(
       offset:       column offset in ``out`` to start writing.
     """
     assert out.dim() == 3 and out.shape[-1] == HEAD_DIM and out.dtype == torch.bfloat16
+    # PPU pools use the 656-byte per-token FP8 layout; the triton dequant
+    # kernel below needs triton fp8e4nv (unsupported on PPU), so dequant in
+    # pure torch when the pool is the PPU width.
+    if k_cache.dim() == 3 and k_cache.shape[-1] == PPU_KV_ENTRY_BYTES:
+        _ppu_dequant_and_gather_656(
+            out, k_cache, seq_lens, gather_lens, block_table, block_size, offset
+        )
+        return
     assert (
         k_cache.dim() == 3
         and k_cache.shape[-1] == ENTRY_BYTES
