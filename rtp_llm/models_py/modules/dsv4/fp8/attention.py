@@ -367,6 +367,8 @@ def _flash_mla_supports_attn_sink() -> bool:
         _FLASH_MLA_ATTN_SINK_SUPPORTED = supported
     return _FLASH_MLA_ATTN_SINK_SUPPORTED
 
+from rtp_llm.models_py.modules.dsv4.fp8._ppu_kv_layout import PPU_KV_ENTRY_BYTES
+
 _DSV4_FP8_KV_ENTRY_BYTES = 584
 
 # Call sites whose first byte-sliced (CP-RR) SWA cache write has been logged.
