@@ -231,3 +231,192 @@ def ppu_compress_kv_write(
     kblk = bkslot // kv_bs
     kpos = bkslot % kv_bs
     kv_cache[kblk, kpos] = packed
+
+
+# ---------------------------------------------------------------------------
+# Indexer 132B layout: full head_dim=128 in one fp8 quant block + fp32 scale.
+# The block-grouped format (K-all-then-scale-all) is handled at scatter time;
+# the per-token pack produces a contiguous 132-byte row [128 fp8 | 4 fp32].
+# ---------------------------------------------------------------------------
+_INDEXER_HEAD_DIM = 128
+_INDEXER_ENTRY_BYTES = 132
+_FP8_MAX = 448.0
+
+
+def pack_indexer_132(normed: torch.Tensor) -> torch.Tensor:
+    """Pack ``[T, 128]`` bf16 into ``[T, 132]`` uint8 (per-token fp8 + fp32 scale).
+
+    Quantization mirrors ``_indexer_k_quant_kernel`` (one quant block, absmax/448
+    scale) but uses torch ops (no triton float8e4nv). Result layout per token:
+      bytes [0:128] = float8_e4m3fn quantized dims
+      bytes [128:132] = fp32 scale (little-endian)
+    """
+    assert normed.dim() == 2 and normed.shape[1] == _INDEXER_HEAD_DIM
+    T = normed.shape[0]
+    dev = normed.device
+    f32 = normed.float()
+    absmax = f32.abs().amax(dim=-1)                         # [T]
+    scale = (absmax / _FP8_MAX).clamp_min(1e-12)            # [T]
+    scaled = f32 / scale[:, None]
+    fp8 = scaled.to(torch.float8_e4m3fn)                    # clamp+RNE
+    fp8_u8 = fp8.view(torch.uint8)                          # [T, 128]
+    scale_u8 = scale.to(torch.float32).view(torch.uint8).view(T, 4)
+    return torch.cat([fp8_u8, scale_u8], dim=-1)            # [T, 132]
+
+
+def dequant_indexer_132(pool: torch.Tensor) -> torch.Tensor:
+    """Dequantize ``[T, 132]`` uint8 → ``[T, 128]`` bf16."""
+    assert pool.dim() == 2 and pool.shape[1] == _INDEXER_ENTRY_BYTES
+    T = pool.shape[0]
+    fp8_raw = pool[:, :_INDEXER_HEAD_DIM].contiguous()
+    fp8 = fp8_raw.view(torch.float8_e4m3fn)
+    scale = pool[:, _INDEXER_HEAD_DIM:].contiguous().view(torch.float32)  # [T, 1]
+    return (fp8.float() * scale).to(torch.bfloat16)
+
+
+def _scatter_indexer_132_block_grouped(
+    packed: torch.Tensor,       # [T, 132] uint8 (per-token contiguous)
+    kv_cache: torch.Tensor,     # [num_blocks, block_size, 132] uint8
+    slots: torch.Tensor,        # [T] int64 — kv slot index per boundary token
+) -> None:
+    """Scatter per-token [128 fp8 | 4 scale] into the block-grouped KV pool.
+
+    The pool's physical byte layout per block is NOT ``[block_size, 132]``
+    per-token rows. It is block-grouped:
+      bytes [0, block_size*128): fp8 data (token_0 || token_1 || ...)
+      bytes [block_size*128, block_size*132): fp32 scales (4 each)
+    This function writes into the correct byte positions.
+    """
+    bs = int(kv_cache.shape[1])
+    # Work on a flat per-block view
+    flat = kv_cache.view(kv_cache.shape[0], bs * _INDEXER_ENTRY_BYTES)
+    for i in range(int(slots.shape[0])):
+        s = int(slots[i].item())
+        if s < 0:
+            continue
+        blk = s // bs
+        pos = s % bs
+        row = packed[i]                                        # [132]
+        fp8_data = row[:_INDEXER_HEAD_DIM]                     # [128]
+        scale_data = row[_INDEXER_HEAD_DIM:]                   # [4]
+        flat[blk, pos * _INDEXER_HEAD_DIM : pos * _INDEXER_HEAD_DIM + _INDEXER_HEAD_DIM] = fp8_data
+        flat[blk, bs * _INDEXER_HEAD_DIM + pos * 4 : bs * _INDEXER_HEAD_DIM + pos * 4 + 4] = scale_data
+
+
+def ppu_compress_kv_write_indexer(
+    state_cache: torch.Tensor,       # [num_state_blocks, ring, 2*coff*head_dim] fp32
+    token_to_req: torch.Tensor,      # [N] int
+    positions: torch.Tensor,         # [N] int
+    block_table: torch.Tensor,       # [B, stride] int — state-pool block table
+    rms_weight: torch.Tensor,        # [head_dim=128] bf16
+    rms_eps: float,
+    cos_sin_cache: torch.Tensor,     # [max_pos, rope_head_dim] fp32 (cos|sin)
+    kv_cache: torch.Tensor,          # [num_kv_blocks, kv_block_size, 132] uint8
+    kv_slot_mapping: torch.Tensor,   # [N] int — KV-pool slot per token (-1 skip)
+    kv_raw: torch.Tensor,            # [n_raw, coff*head_dim]
+    score_raw: torch.Tensor,         # [n_raw, coff*head_dim]
+    ape: torch.Tensor,               # [compress_ratio, coff*head_dim] fp32
+    seq_start: int,
+    disable_raw_path: bool,
+    *,
+    head_dim: int,
+    rope_head_dim: int,
+    compress_ratio: int,
+    overlap: bool,
+    state_tokens_per_block: int,
+    seq_start_per_req: torch.Tensor = None,
+    cu_seq_per_req: torch.Tensor = None,
+) -> None:
+    """Torch port of ``run_fused_compress_kv_write`` for the indexer 132B pool.
+
+    Same gather+compress+RoPE as ``ppu_compress_kv_write`` (656B), but packs
+    the FULL roped head_dim=128 result into one fp8 quant block + fp32 scale
+    and scatters into the block-grouped layout that ``fp8_paged_mqa_logits``
+    and ``_indexer_k_quant_kernel`` expect.
+    """
+    dev = positions.device
+    r = int(compress_ratio)
+    cf = 1 + int(overlap)
+    Wn = cf * r
+    ring = int(state_cache.shape[1])
+    sw = int(state_cache.shape[-1] // 2)
+    stride = int(block_table.shape[1])
+    num_sb = int(state_cache.shape[0])
+    kv_bs = int(kv_cache.shape[1])
+    half = int(rope_head_dim // 2)
+    sblk = int(state_tokens_per_block)
+
+    pos = positions.long()
+    req = token_to_req.long()
+    kslot = kv_slot_mapping.long()
+    n_raw = 0 if disable_raw_path else int(kv_raw.shape[0])
+    batched = (
+        (not disable_raw_path)
+        and seq_start_per_req is not None
+        and cu_seq_per_req is not None
+    )
+
+    bnd = ((pos + 1) % r == 0) & (kslot >= 0)
+    bi = bnd.nonzero(as_tuple=True)[0]
+    if bi.numel() == 0:
+        return
+    T = int(bi.numel())
+    bpos = pos[bi]
+    breq = req[bi]
+    bkslot = kslot[bi]
+
+    toks = torch.arange(Wn, device=dev)
+    gpos = bpos[:, None] - Wn + 1 + toks[None, :]
+    mask_pos = gpos >= 0
+    seg = (toks >= r).long()
+    seg_col = (seg[:, None] * head_dim + torch.arange(head_dim, device=dev)[None, :])
+    seg_col = seg_col[None].expand(T, Wn, head_dim)
+
+    if disable_raw_path:
+        use_raw = torch.zeros((T, Wn), dtype=torch.bool, device=dev)
+        kv_from_raw = torch.zeros((T, Wn, head_dim), dtype=torch.float32, device=dev)
+        score_from_raw = torch.zeros((T, Wn, head_dim), dtype=torch.float32, device=dev)
+    else:
+        if batched:
+            ssr = seq_start_per_req.long()[breq][:, None]
+            clo = cu_seq_per_req.long()[breq][:, None]
+            chi = cu_seq_per_req.long()[breq + 1][:, None]
+            flat_in_req = gpos - ssr
+            use_raw = mask_pos & (flat_in_req >= 0) & (flat_in_req < (chi - clo))
+            flat_idx = clo + flat_in_req
+        else:
+            flat_idx = gpos - int(seq_start)
+            use_raw = mask_pos & (flat_idx >= 0) & (flat_idx < n_raw)
+        flat_safe = flat_idx.clamp(0, max(n_raw - 1, 0))
+        kv_from_raw = torch.gather(kv_raw[flat_safe].float(), -1, seg_col)
+        score_from_raw = torch.gather(score_raw[flat_safe].float(), -1, seg_col)
+        ape_rows = (gpos % r).clamp_min(0)
+        ape_from = torch.gather(ape[ape_rows].float(), -1, seg_col)
+        score_from_raw = score_from_raw + ape_from
+
+    use_cache = mask_pos & ~use_raw
+    gsafe = gpos.clamp_min(0)
+    blk_log = (gsafe // sblk) % stride
+    block_num = block_table[breq[:, None].expand(T, Wn), blk_log].long()
+    valid_block = use_cache & (block_num > 0) & (block_num < num_sb)
+    bn_safe = torch.where(valid_block, block_num, torch.zeros_like(block_num))
+    ring_off = gsafe % ring
+    entry = state_cache[bn_safe, ring_off]
+    kv_from_cache = torch.gather(entry[..., :sw].float(), -1, seg_col)
+    score_from_cache = torch.gather(entry[..., sw:].float(), -1, seg_col)
+
+    ur = use_raw[..., None]
+    kv = torch.where(ur, kv_from_raw, kv_from_cache)
+    score = torch.where(ur, score_from_raw, score_from_cache)
+    final_valid = (use_raw | (use_cache & valid_block))[..., None]
+    score = torch.where(final_valid, score, torch.full_like(score, float("-inf")))
+    kv = torch.where(final_valid, kv, torch.zeros_like(kv))
+
+    cpos = (bpos // r) * r
+    cos = cos_sin_cache[cpos, :half]
+    sin = cos_sin_cache[cpos, half:]
+    normed = compress_windows_ppu(
+        kv.to(torch.bfloat16), score, cos, sin, rms_weight, rms_eps, rope_head_dim
+    )
+    packed = pack_indexer_132(normed)
+    _scatter_indexer_132_block_grouped(packed, kv_cache, bkslot)

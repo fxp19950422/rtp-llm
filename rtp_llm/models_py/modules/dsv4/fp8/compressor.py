@@ -84,9 +84,18 @@ from rtp_llm.models_py.modules.dsv4.fp8._compressor_vllm_triton import (
 from rtp_llm.models_py.modules.dsv4.fp8._kv_cache_utils import PoolBackedModule
 from rtp_llm.models_py.modules.dsv4.fp8._ppu_compressor import (
     ppu_compress_kv_write,
+    ppu_compress_kv_write_indexer,
     save_partial_states_ppu,
 )
 from rtp_llm.models_py.modules.dsv4.fp8._ppu_kv_layout import PPU_KV_ENTRY_BYTES
+
+
+def _is_ppu_device(device: torch.device) -> bool:
+    """Cached per-device check for PPU hardware (triton fp8e4nv unsupported)."""
+    if not torch.cuda.is_available():
+        return False
+    props = torch.cuda.get_device_properties(device)
+    return "PPU" in props.name
 
 # Process-local cache for the device-side cos_sin tensor derived from a
 # given freqs_cis source. DSV4 has ~91 CompressorFP8 instances (main +
@@ -898,12 +907,13 @@ class CompressorFP8(PoolBackedModule):
             cos_sin_cache = self._ensure_cos_sin_cache(kv_flat.device)
 
         # PPU has no ``triton.float8e4nv``; the fused compress→fp8-pack kernel
-        # cannot compile. When the bound main-KV pool is the 656-byte PPU layout
-        # (head_dim==512), route both the state write and the boundary compress
-        # write through pure-torch equivalents (``_ppu_compressor``).
+        # cannot compile. Route to pure-torch equivalents when:
+        #   - main CSA pool is 656-byte PPU layout (head_dim==512), or
+        #   - indexer pool (head_dim==128) on PPU hardware (132B same as GPU but
+        #     triton kernel won't compile).
         ppu_kv_write = (
-            self.head_dim == KV_HEAD_DIM
-            and int(self._kv_pool_view.shape[-1]) == PPU_KV_ENTRY_BYTES
+            (self.head_dim == KV_HEAD_DIM and int(self._kv_pool_view.shape[-1]) == PPU_KV_ENTRY_BYTES)
+            or (self.head_dim == INDEXER_HEAD_DIM and _is_ppu_device(kv_flat.device))
         )
 
         with record_function_range("dsv4.fp8.compressor.launch.save_partial_states"):
@@ -964,7 +974,12 @@ class CompressorFP8(PoolBackedModule):
 
         with record_function_range("dsv4.fp8.compressor.launch.compress_kv_write"):
             if ppu_kv_write:
-                ppu_compress_kv_write(
+                _ppu_write_fn = (
+                    ppu_compress_kv_write
+                    if self.head_dim == KV_HEAD_DIM
+                    else ppu_compress_kv_write_indexer
+                )
+                _ppu_write_fn(
                     state_cache_for_read,
                     meta.token_to_req,
                     meta.positions,
