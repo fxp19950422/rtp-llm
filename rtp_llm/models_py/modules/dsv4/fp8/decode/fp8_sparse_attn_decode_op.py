@@ -36,6 +36,11 @@ import torch
 # reproduce the sink + dual-pool merge in Python from the returned lse.
 _FLASH_MLA_KVCACHE_ATTN_SINK: Optional[bool] = None
 
+# The PPU flash_mla kernel is compiled only for the DeepSeek-V3 MLA geometry
+# (qk_dim = 512 nope + 64 rope = 576, head_dim_v = 512). DSV4 (head_dim=512)
+# is mapped onto it by zero-padding q/KV up to this width.
+_PPU_FLASH_MLA_QK_DIM = 576
+
 
 def _flash_mla_with_kvcache_supports_attn_sink() -> bool:
     """True for the GPU wheel (native attn_sink/dual-pool); False for the PPU
@@ -280,6 +285,13 @@ class SparseAttnV4DecodeFp8Op:
         ``cache_seqlens`` (the PPU kernel requires both non-None), preserving
         the GPU "indices consumed directly" semantics.
         """
+        # PPU flash_mla is fixed to qk_dim=576 (512 nope + 64 rope); DSV4's
+        # head_dim is 512. Zero-pad q to 576 so the padded (rope-region) dims
+        # contribute 0 to the scores while the value stays the full 512-d DSV4
+        # head (value == first head_dim_v=512 of the padded slot). The KV pool
+        # is packed the same way (DSV4's 512 in the fp8 nope region, rope
+        # region zeroed) by the PPU fp8 KV quant.
+        q = self._ppu_pad_q_to_kernel(q)
         o_main, lse_main = self._ppu_sparse_pool(q, kv_4d, topk_3d, topk_length, H)
         if extra_kv_4d is None:
             out = self._ppu_apply_sink(o_main, lse_main, attn_sink)
@@ -304,6 +316,26 @@ class SparseAttnV4DecodeFp8Op:
         col = torch.arange(topk, device=indices.device).view(1, 1, topk)
         keep = col < topk_length.to(indices.device).view(-1, 1, 1)
         return torch.where(keep, indices, torch.full_like(indices, -1))
+
+    @staticmethod
+    def _ppu_pad_q_to_kernel(q: torch.Tensor) -> torch.Tensor:
+        """Zero-pad q's last dim up to the PPU kernel's fixed qk_dim (576).
+
+        The PPU flash_mla kernel only supports the DeepSeek-V3 MLA geometry
+        (qk_dim=576 = 512 nope + 64 rope). DSV4 uses head_dim=512, so append
+        64 zeros; the extra dims land in the kernel's rope region and, being
+        zero in both q and the KV pool, contribute nothing to the scores.
+        """
+        cur = q.shape[-1]
+        if cur >= _PPU_FLASH_MLA_QK_DIM:
+            return q
+        pad = torch.zeros(
+            *q.shape[:-1],
+            _PPU_FLASH_MLA_QK_DIM - cur,
+            dtype=q.dtype,
+            device=q.device,
+        )
+        return torch.cat([q, pad], dim=-1).contiguous()
 
     def _ppu_sparse_pool(
         self,
