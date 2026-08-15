@@ -614,6 +614,28 @@ def _gather_k_cache_packed_kernel(
         )
 
 
+
+def _ppu_gather_k_cache_packed_656(
+    out: torch.Tensor,      # [B, max_tokens, 656] uint8
+    k_cache: torch.Tensor,  # [num_blocks, block_size, 656] uint8
+    seq_lens: torch.Tensor,
+    gather_lens: Optional[torch.Tensor],
+    block_table: torch.Tensor,
+    block_size: int,
+    offset: int,
+) -> None:
+    """PPU 656B per-token-contiguous gather (pure torch, no triton)."""
+    B = int(seq_lens.shape[0])
+    for r in range(B):
+        g = int(gather_lens[r]) if gather_lens is not None else int(seq_lens[r])
+        start = int(seq_lens[r]) - g
+        for i in range(g):
+            pos = start + i
+            blk = int(block_table[r, pos // block_size])
+            pib = pos % block_size
+            out[r, offset + i] = k_cache[blk, pib]
+
+
 def gather_k_cache_packed(
     out: torch.Tensor,
     k_cache: torch.Tensor,
@@ -626,8 +648,12 @@ def gather_k_cache_packed(
     """Gather FP8 K cache into compact per-token packed slots.
 
     Args mirror :func:`dequantize_and_gather_k_cache`, but ``out`` is
-    ``[B, max_tokens, 584] uint8`` rather than BF16.
+    ``[B, max_tokens, entry_bytes] uint8`` rather than BF16.
     """
+    # PPU 656B pool: per-token-contiguous — simple indexing gather (no triton).
+    if k_cache.dim() == 3 and k_cache.shape[-1] == PPU_KV_ENTRY_BYTES:
+        _ppu_gather_k_cache_packed_656(out, k_cache, seq_lens, gather_lens, block_table, block_size, offset)
+        return
     assert out.dim() == 3 and out.shape[-1] == ENTRY_BYTES and out.dtype == torch.uint8
     assert out.stride(2) == 1, f"out must have packed byte stride; got {out.stride()}"
     assert (
@@ -717,9 +743,14 @@ def _dequantize_packed_k_cache_flat_kernel(
 def dequantize_packed_k_cache_flat(out: torch.Tensor, packed: torch.Tensor) -> None:
     """Dequant compact packed FP8 slots into flat BF16 rows.
 
-    ``packed`` is ``[N, 584] uint8`` with per-token compact layout
-    ``[576 data | 8 scale]``. ``out`` is ``[N, 512] bf16``.
+    ``packed`` is ``[N, entry_bytes] uint8`` with per-token compact layout.
+    GPU 584B: ``[576 data | 8 scale]``. PPU 656B: per-token-contiguous.
+    ``out`` is ``[N, 512] bf16``.
     """
+    # PPU 656B: use dequant_ppu_kv_656 (per-token-contiguous, no triton).
+    if packed.dim() == 2 and packed.shape[-1] == PPU_KV_ENTRY_BYTES:
+        out[:] = dequant_ppu_kv_656(packed)
+        return
     assert out.dim() == 2 and out.shape[-1] == HEAD_DIM and out.dtype == torch.bfloat16
     assert out.stride(1) == 1, f"out must be contiguous by row; got {out.stride()}"
     assert (
@@ -886,15 +917,30 @@ def _dequantize_slots_kernel(
 
 
 def dequantize_slots_to_bf16(
-    pool_3d: torch.Tensor,  # [num_blocks, block_size, 584] uint8
+    pool_3d: torch.Tensor,  # [num_blocks, block_size, entry_bytes] uint8
     slot_indices: torch.Tensor,  # [N] int (flat slot ids; <0 = sentinel)
 ) -> torch.Tensor:
-    """Per-slot fancy-index dequant of canonical 584B FP8 KV → [N, 512] bf16.
+    """Per-slot fancy-index dequant of FP8 KV → [N, 512] bf16.
 
-    Replacement for the deleted ``_kv_fp8_dequant_canonical.unpack_kv_fp8_canonical``.
-    Striped-layout aware: addresses data and scale regions independently.
+    Supports both GPU 584B and PPU 656B per-token layouts.
     Sentinel rows (slot < 0) are zero-filled.
     """
+    # PPU 656B: per-token-contiguous — use dequant_ppu_kv_656 + slot indexing.
+    if pool_3d.dim() == 3 and pool_3d.shape[-1] == PPU_KV_ENTRY_BYTES:
+        block_size = int(pool_3d.shape[1])
+        N = int(slot_indices.numel())
+        out = torch.zeros((N, HEAD_DIM), dtype=torch.bfloat16, device=pool_3d.device)
+        if N == 0:
+            return out
+        slots = slot_indices.reshape(-1).long()
+        valid = slots >= 0
+        if bool(valid.any()):
+            vi = valid.nonzero(as_tuple=True)[0]
+            vs = slots[vi]
+            blk = vs // block_size
+            pos = vs % block_size
+            out[vi] = dequant_ppu_kv_656(pool_3d[blk, pos])
+        return out
     assert (
         pool_3d.dim() == 3
         and pool_3d.shape[-1] == ENTRY_BYTES
@@ -1198,9 +1244,10 @@ def dequantize_and_gather_k_cache_slots_cp_byte_sliced(
         .reshape(int(unique_blocks.numel()), cp_size * int(k_cache_raw.shape[1]))
         .contiguous()
     )  # [num_unique_blocks, full_block_bytes]
+    actual_entry_bytes = int(full_raw.shape[1]) // full_entries_per_block
     full_view = full_raw.as_strided(
-        (int(unique_blocks.numel()), full_entries_per_block, ENTRY_BYTES),
-        (int(full_raw.shape[1]), ENTRY_BYTES, 1),
+        (int(unique_blocks.numel()), full_entries_per_block, actual_entry_bytes),
+        (int(full_raw.shape[1]), actual_entry_bytes, 1),
     )
     restored = dequantize_slots_to_bf16(full_view, compact_slots.reshape(-1))
     restored_3d = restored.view(B, W, HEAD_DIM)

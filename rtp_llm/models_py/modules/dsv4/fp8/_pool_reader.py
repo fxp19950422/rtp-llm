@@ -272,7 +272,7 @@ class CPShardedPoolReader(CompressedKPoolReader):
         local_flat.record_stream(stream)
         with torch.cuda.stream(stream):
             gathered = torch.empty(
-                (world_size * int(local_flat.shape[0]), ENTRY_BYTES),
+                (world_size * int(local_flat.shape[0]), int(local_flat.shape[-1])),
                 dtype=local_flat.dtype,
                 device=device,
             )
@@ -406,11 +406,12 @@ class CPShardedPoolReader(CompressedKPoolReader):
         # block_table[r, :] holds this rank's local entries in compact form.
         # zeros() (not empty()) so the [actual, padded) tail of each request
         # is a deterministic 0 and contributes nothing to the gather.
+        pool_entry_width = int(k_cache.shape[-1])
         local_packed = torch.zeros(
             (
                 int(local_seq_lens_padded.shape[0]),
                 cfg.max_local_seq_len_padded,
-                ENTRY_BYTES,
+                pool_entry_width,
             ),
             dtype=torch.uint8,
             device=device,
@@ -425,12 +426,12 @@ class CPShardedPoolReader(CompressedKPoolReader):
                 block_size=block_size,
                 offset=0,
             )
-        # Step 2: pack to flat [total_local_kv, 584] (drop per-row padding).
+        # Step 2: pack to flat [total_local_kv, entry_width] (drop per-row padding).
         return _pack_padded_to_flat(
             local_packed,
             local_seq_lens_padded,
             cfg.total_local_kv,
-            ENTRY_BYTES,
+            pool_entry_width,
         )
 
     def _restore_dequant_scatter(
