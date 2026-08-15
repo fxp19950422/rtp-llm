@@ -153,6 +153,30 @@ class TestSwaDequantGather656(unittest.TestCase):
         self.assertTrue(torch.isfinite(out).all().item())
         self.assertLess(err, 0.06, f"dequant+gather rel err {err}")
 
+    def test_dequant_gather_slots_roundtrip(self):
+        try:
+            from rtp_llm.models_py.modules.dsv4.fp8._swa_dequant_triton import (
+                dequantize_and_gather_k_cache_slots,
+            )
+        except Exception as e:  # noqa: BLE001
+            self.skipTest(f"_swa_dequant_triton import failed: {e}")
+        torch.manual_seed(0)
+        dev = "cuda"
+        HEAD = 512
+        num_blocks, block_size = 2, 64
+        N = num_blocks * block_size
+        k = torch.randn(N, HEAD, dtype=torch.bfloat16, device=dev) * 0.2
+        pool = pack_ppu_kv_656(k).view(num_blocks, block_size, PPU_KV_ENTRY_BYTES)
+        slot = torch.arange(N, dtype=torch.int32, device=dev).view(1, N).clone()
+        slot[0, 5] = -1  # -1 => zero-fill + skip
+        out = torch.zeros(1, N, HEAD, dtype=torch.bfloat16, device=dev)
+        gl = torch.tensor([N], dtype=torch.int32, device=dev)
+        dequantize_and_gather_k_cache_slots(out, pool, slot, gl, 0)
+        valid = torch.arange(N, device=dev) != 5
+        err = ((out[0][valid].float() - k[valid].float()).norm() / k[valid].float().norm()).item()
+        self.assertLess(err, 0.06, f"slots dequant rel err {err}")
+        self.assertEqual(float(out[0, 5].abs().max()), 0.0)  # -1 row zeroed
+
 
 if __name__ == "__main__":
     unittest.main()

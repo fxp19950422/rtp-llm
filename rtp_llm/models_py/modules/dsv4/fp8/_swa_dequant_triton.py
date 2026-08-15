@@ -100,6 +100,32 @@ def _ppu_dequant_and_gather_656(
         out[r, offset : offset + g, :] = dequant_ppu_kv_656(k_cache[pblk, pib])
 
 
+def _ppu_dequant_and_gather_slots_656(
+    out, k_cache, slot_mapping, gather_lens, offset
+):
+    """PPU per-token dequant+gather from a 656-byte pool by flat global slot.
+
+    ``slot_mapping[r, j]`` is a global slot id (-1 => zero-fill + skip). Pure
+    torch (the GPU 584 triton kernel needs fp8e4nv, unsupported on PPU).
+    """
+    num_reqs, max_gl = int(slot_mapping.shape[0]), int(slot_mapping.shape[1])
+    bs = int(k_cache.shape[1])
+    sm = slot_mapping.to(device=out.device, dtype=torch.long)
+    gl = None if gather_lens is None else gather_lens.reshape(-1).to(torch.long)
+    for r in range(num_reqs):
+        g = max_gl if gl is None else int(gl[r].item())
+        if g <= 0:
+            continue
+        slots = sm[r, :g]
+        valid = slots >= 0
+        if not bool(valid.any()):
+            continue
+        vslots = slots[valid]
+        deq = dequant_ppu_kv_656(k_cache[vslots // bs, vslots % bs])
+        pos = torch.arange(g, device=out.device)[valid]
+        out[r, offset + pos, :] = deq
+
+
 @triton.jit
 def _trap_invalid_kv_access(TRAP_INVALID_KV_ACCESS: tl.constexpr) -> None:
     if TRAP_INVALID_KV_ACCESS:
@@ -436,6 +462,11 @@ def dequantize_and_gather_k_cache_slots(
     differs from the per-block ring entry count.
     """
     assert out.dim() == 3 and out.shape[-1] == HEAD_DIM and out.dtype == torch.bfloat16
+    if k_cache.dim() == 3 and k_cache.shape[-1] == PPU_KV_ENTRY_BYTES:
+        _ppu_dequant_and_gather_slots_656(
+            out, k_cache, slot_mapping, gather_lens, offset
+        )
+        return
     assert (
         k_cache.dim() == 3
         and k_cache.shape[-1] == ENTRY_BYTES
