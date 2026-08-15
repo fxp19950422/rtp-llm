@@ -1121,13 +1121,14 @@ def prepare_dequantize_and_gather_k_cache_slots_cp_byte_sliced(
             )
             .contiguous()
         )
+        actual_eb = int(full_raw.shape[1]) // pending.full_entries_per_block
         full_view = full_raw.as_strided(
             (
                 int(pending.unique_blocks.numel()),
                 pending.full_entries_per_block,
-                ENTRY_BYTES,
+                actual_eb,
             ),
-            (int(full_raw.shape[1]), ENTRY_BYTES, 1),
+            (int(full_raw.shape[1]), actual_eb, 1),
         )
         restored = dequantize_slots_to_bf16(
             full_view,

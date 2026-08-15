@@ -1924,7 +1924,7 @@ class AttentionFP8(nn.Module):
         # blocks is replaced by the kernel reading whatever physical
         # block_id maps to — caller must pass T ≤ what was written.
         pool_3d = self._pool_view_3d_fp8(attn_type)
-        if pool_3d is None or pool_3d.shape[-1] != _DSV4_FP8_KV_ENTRY_BYTES:
+        if pool_3d is None or pool_3d.shape[-1] not in (_DSV4_FP8_KV_ENTRY_BYTES, PPU_KV_ENTRY_BYTES):
             return None
         from rtp_llm.models_py.modules.dsv4.fp8._swa_dequant_triton import (
             dequantize_and_gather_k_cache,
