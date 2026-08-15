@@ -82,6 +82,11 @@ from rtp_llm.models_py.modules.dsv4.fp8._compressor_vllm_triton import (
     run_save_partial_states,
 )
 from rtp_llm.models_py.modules.dsv4.fp8._kv_cache_utils import PoolBackedModule
+from rtp_llm.models_py.modules.dsv4.fp8._ppu_compressor import (
+    ppu_compress_kv_write,
+    save_partial_states_ppu,
+)
+from rtp_llm.models_py.modules.dsv4.fp8._ppu_kv_layout import PPU_KV_ENTRY_BYTES
 
 # Process-local cache for the device-side cos_sin tensor derived from a
 # given freqs_cis source. DSV4 has ~91 CompressorFP8 instances (main +
@@ -892,16 +897,36 @@ class CompressorFP8(PoolBackedModule):
         with record_function_range("dsv4.fp8.compressor.launch.cos_sin_cache"):
             cos_sin_cache = self._ensure_cos_sin_cache(kv_flat.device)
 
+        # PPU has no ``triton.float8e4nv``; the fused compress→fp8-pack kernel
+        # cannot compile. When the bound main-KV pool is the 656-byte PPU layout
+        # (head_dim==512), route both the state write and the boundary compress
+        # write through pure-torch equivalents (``_ppu_compressor``).
+        ppu_kv_write = (
+            self.head_dim == KV_HEAD_DIM
+            and int(self._kv_pool_view.shape[-1]) == PPU_KV_ENTRY_BYTES
+        )
+
         with record_function_range("dsv4.fp8.compressor.launch.save_partial_states"):
-            run_save_partial_states(
-                kv_flat,
-                score_flat,
-                self.ape,
-                meta.positions,
-                self._state_pool_3d,
-                meta.state_slots,
-                compress_ratio=self.compress_ratio,
-            )
+            if ppu_kv_write:
+                save_partial_states_ppu(
+                    kv_flat,
+                    score_flat,
+                    self.ape,
+                    meta.positions,
+                    self._state_pool_3d,
+                    meta.state_slots,
+                    self.compress_ratio,
+                )
+            else:
+                run_save_partial_states(
+                    kv_flat,
+                    score_flat,
+                    self.ape,
+                    meta.positions,
+                    self._state_pool_3d,
+                    meta.state_slots,
+                    compress_ratio=self.compress_ratio,
+                )
 
         # Decode path passes seq_start=None: disable the raw branch so the
         # kernel only reads state_cache. seq_start value is then irrelevant.
@@ -938,30 +963,55 @@ class CompressorFP8(PoolBackedModule):
                 )
 
         with record_function_range("dsv4.fp8.compressor.launch.compress_kv_write"):
-            run_fused_compress_kv_write(
-                state_cache_for_read,
-                meta.token_to_req,
-                meta.positions,
-                meta.state_slots,
-                state_block_table_for_read,
-                self.norm.weight,
-                self.norm_eps,
-                cos_sin_cache,
-                self._kv_pool_view,
-                meta.kv_slots,
-                kv_flat,
-                score_flat,
-                self.ape,
-                0 if (raw_disabled or use_varlen_raw) else seq_start,
-                disable_raw_path=raw_disabled,
-                head_dim=self.head_dim,
-                rope_head_dim=self.rope_head_dim,
-                compress_ratio=self.compress_ratio,
-                overlap=self.overlap,
-                seq_start_per_req=meta.seq_start_per_req if use_varlen_raw else None,
-                cu_seq_per_req=meta.cu_seq_per_req if use_varlen_raw else None,
-                state_tokens_per_block=self._state_tokens_per_block,
-            )
+            if ppu_kv_write:
+                ppu_compress_kv_write(
+                    state_cache_for_read,
+                    meta.token_to_req,
+                    meta.positions,
+                    state_block_table_for_read,
+                    self.norm.weight,
+                    self.norm_eps,
+                    cos_sin_cache,
+                    self._kv_pool_view,
+                    meta.kv_slots,
+                    kv_flat,
+                    score_flat,
+                    self.ape,
+                    0 if (raw_disabled or use_varlen_raw) else seq_start,
+                    raw_disabled,
+                    head_dim=self.head_dim,
+                    rope_head_dim=self.rope_head_dim,
+                    compress_ratio=self.compress_ratio,
+                    overlap=self.overlap,
+                    state_tokens_per_block=self._state_tokens_per_block,
+                    seq_start_per_req=meta.seq_start_per_req if use_varlen_raw else None,
+                    cu_seq_per_req=meta.cu_seq_per_req if use_varlen_raw else None,
+                )
+            else:
+                run_fused_compress_kv_write(
+                    state_cache_for_read,
+                    meta.token_to_req,
+                    meta.positions,
+                    meta.state_slots,
+                    state_block_table_for_read,
+                    self.norm.weight,
+                    self.norm_eps,
+                    cos_sin_cache,
+                    self._kv_pool_view,
+                    meta.kv_slots,
+                    kv_flat,
+                    score_flat,
+                    self.ape,
+                    0 if (raw_disabled or use_varlen_raw) else seq_start,
+                    disable_raw_path=raw_disabled,
+                    head_dim=self.head_dim,
+                    rope_head_dim=self.rope_head_dim,
+                    compress_ratio=self.compress_ratio,
+                    overlap=self.overlap,
+                    seq_start_per_req=meta.seq_start_per_req if use_varlen_raw else None,
+                    cu_seq_per_req=meta.cu_seq_per_req if use_varlen_raw else None,
+                    state_tokens_per_block=self._state_tokens_per_block,
+                )
 
     # ----------------------------------------------------------------------
     # Overlap orchestration: split-phase prefill (start / finish).
