@@ -1292,7 +1292,12 @@ class AttentionFP8(nn.Module):
         coff_csa = 2  # CSA overlap=True
         coff_idx = 2  # Indexer's nested Compressor overlap=True
         # HCA uses coff=1 (overlap=False) so HCA_STATE vec_dim = 2*head_dim.
-        kv_spec = (torch.uint8, _DSV4_FP8_KV_ENTRY_BYTES)
+        # PPU uses a different per-token FP8 KV layout (656B vs GPU's 584B).
+        # Detect at construction time via device properties.
+        _kv_entry_bytes = _DSV4_FP8_KV_ENTRY_BYTES
+        if torch.cuda.is_available() and "PPU" in torch.cuda.get_device_properties(0).name:
+            _kv_entry_bytes = PPU_KV_ENTRY_BYTES
+        kv_spec = (torch.uint8, _kv_entry_bytes)
         indexer_kv_spec = (torch.uint8, _DSV4_FP8_INDEXER_ENTRY_BYTES)
         self._pool_spec: Dict[int, tuple] = {
             SWA_KV: kv_spec,
@@ -1431,9 +1436,12 @@ class AttentionFP8(nn.Module):
             raw = self._pool_raw_u8(SWA_KV)
             cp_ctx = getattr(self, "_cp_ctx", None)
             if raw is not None and cp_ctx is not None:
+                _eb = PPU_KV_ENTRY_BYTES if (
+                    "PPU" in torch.cuda.get_device_properties(0).name
+                ) else _DSV4_FP8_KV_ENTRY_BYTES
                 return (
                     int(raw.shape[1]) * int(cp_ctx.cp_size)
-                ) // _DSV4_FP8_KV_ENTRY_BYTES
+                ) // _eb
         return self._pool_entries_per_block(SWA_KV)
 
     def _build_swa_cp_byte_compaction(
