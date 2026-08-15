@@ -50,6 +50,8 @@ from rtp_llm.models_py.modules.dsv4.fp8._indexer_score import (
     has_fp8_paged_mqa_logits,
 )
 from rtp_llm.models_py.modules.dsv4.fp8._kv_cache_utils import PoolBackedModule
+from rtp_llm.models_py.modules.dsv4.fp8._ppu_indexer_score import ppu_indexer_score
+from rtp_llm.models_py.modules.dsv4.fp8.compressor import _is_ppu_device
 from rtp_llm.models_py.modules.dsv4.fp8.compressor import (
     CompressorFP8,
     CompressorMeta,
@@ -318,10 +320,13 @@ class IndexerFP8(PoolBackedModule):
             f"IndexerFP8 locked to index_head_dim={INDEXER_HEAD_DIM} "
             f"(matches CompressorFP8 132B layout); got {index_head_dim}"
         )
-        assert has_fp8_paged_mqa_logits(), (
-            "deep_gemm.fp8_paged_mqa_logits not available — IndexerFP8 cannot "
-            "operate without DeepGEMM. Use IndexerBF16 (or install deep_gemm)."
-        )
+        # PPU lacks deep_gemm but provides a pure-torch fallback via
+        # ppu_indexer_score; only assert on non-PPU platforms.
+        if torch.cuda.is_available() and not _is_ppu_device(torch.device("cuda")):
+            assert has_fp8_paged_mqa_logits(), (
+                "deep_gemm.fp8_paged_mqa_logits not available — IndexerFP8 cannot "
+                "operate without DeepGEMM. Use IndexerBF16 (or install deep_gemm)."
+            )
         assert layer_weights is not None, (
             "IndexerFP8 requires layer_weights — meta-tensor / stand-alone "
             "construction is not supported (use the BF16 path for that)."
@@ -653,32 +658,43 @@ class IndexerFP8(PoolBackedModule):
             T_static = self._kv_cache_t if self._kv_cache_t > 0 else T_cache
             T_max = max(32, min(T_cache, T_static))
 
-            q_fp8, w_fold = indexer_q_rope_fp8_quant_fold(
-                _as_bf16_contig(q),
-                _as_bf16_contig(weights),
-                freqs,
-                self.rope_head_dim,
-            )
             ctx_lens_2d = compressed_len.view(bsz, q_len)
             bt_i32 = self._kv_block_table[:bsz].to(torch.int32).contiguous()
-            # ``_kv_pool_view`` is 3D ``[num_blocks, eb, 132]`` from production
-            # (set by ``Attention._set_compressor_pool_context``); standalone
-            # tests still pass flat 2D. Flatten to ``[total_slots, 132]``
-            # (no copy — INDEXER pool is contiguous, no padding) for DeepGEMM.
-            pool_2d = (
-                self._kv_pool_view.flatten(0, 1)
-                if self._kv_pool_view.dim() == 3
-                else self._kv_pool_view
-            )
-            logits = fp8_paged_indexer_score(
-                q_fp8,
-                w_fold.view(bsz * q_len, self.n_heads),
-                pool_2d,
-                bt_i32,
-                ctx_lens_2d,
-                block_size=self._kv_eb,
-                max_ctx_len=T_max,
-            )  # [B*q_len, T_max] fp32
+            if _is_ppu_device(q.device):
+                # PPU: bypass triton fp8 quant + deep_gemm; use torch path.
+                logits = ppu_indexer_score(
+                    _as_bf16_contig(q),
+                    _as_bf16_contig(weights),
+                    freqs,
+                    self.rope_head_dim,
+                    self._kv_pool_view,
+                    bt_i32,
+                    ctx_lens_2d.to(torch.int32),
+                    T_max,
+                )
+            else:
+                q_fp8, w_fold = indexer_q_rope_fp8_quant_fold(
+                    _as_bf16_contig(q),
+                    _as_bf16_contig(weights),
+                    freqs,
+                    self.rope_head_dim,
+                )
+                # ``_kv_pool_view`` is 3D ``[num_blocks, eb, 132]`` from
+                # production; flatten to ``[total_slots, 132]`` for DeepGEMM.
+                pool_2d = (
+                    self._kv_pool_view.flatten(0, 1)
+                    if self._kv_pool_view.dim() == 3
+                    else self._kv_pool_view
+                )
+                logits = fp8_paged_indexer_score(
+                    q_fp8,
+                    w_fold.view(bsz * q_len, self.n_heads),
+                    pool_2d,
+                    bt_i32,
+                    ctx_lens_2d,
+                    block_size=self._kv_eb,
+                    max_ctx_len=T_max,
+                )
             score = logits.view(bsz, q_len, T_max)
 
             # Flash and Pro share this FP8 indexer. Decode and target verify
