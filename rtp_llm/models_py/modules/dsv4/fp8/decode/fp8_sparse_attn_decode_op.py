@@ -20,22 +20,57 @@ because all dev/CI/prod boxes carry flash_mla.
 
 from __future__ import annotations
 
+import inspect
 import logging
+import math
 from typing import Any, Optional
 
 import torch
 
+# The GPU flash_mla wheel exposes attn_sink / topk_length / extra_* kwargs on
+# ``flash_mla_with_kvcache`` and applies dual-pool softmax + attn-sink inside the
+# kernel. The PPU wheel ships only the reduced sparse signature
+# ``(q, k_cache, block_table, cache_seqlens, head_dim_v, tile_scheduler_metadata,
+# num_splits, softmax_scale, causal, is_fp8_kvcache, indices)`` and returns a
+# 2-based (log2) softmax_lse -- so on PPU we mask topk_length via indices, and
+# reproduce the sink + dual-pool merge in Python from the returned lse.
+_FLASH_MLA_KVCACHE_ATTN_SINK: Optional[bool] = None
+
+
+def _flash_mla_with_kvcache_supports_attn_sink() -> bool:
+    """True for the GPU wheel (native attn_sink/dual-pool); False for the PPU
+    wheel (reduced signature -> post-hoc sink + Python dual-pool merge)."""
+    global _FLASH_MLA_KVCACHE_ATTN_SINK
+    if _FLASH_MLA_KVCACHE_ATTN_SINK is None:
+        supported = True
+        try:
+            from flash_mla import (  # type: ignore[import-not-found]
+                flash_mla_with_kvcache as _fmk,
+            )
+
+            params = inspect.signature(_fmk).parameters
+            if params:
+                has_varkw = any(
+                    pm.kind == inspect.Parameter.VAR_KEYWORD for pm in params.values()
+                )
+                supported = has_varkw or ("attn_sink" in params)
+        except (ImportError, ValueError, TypeError):
+            supported = True
+        _FLASH_MLA_KVCACHE_ATTN_SINK = supported
+    return _FLASH_MLA_KVCACHE_ATTN_SINK
+
+
 _FLASH_MLA_AVAILABLE = False
 try:
-    if torch.version.cuda:
-        major, minor = map(int, torch.version.cuda.split(".")[:2])
-        if (major, minor) >= (12, 9):
-            from flash_mla import (
-                flash_mla_with_kvcache,  # type: ignore[import-not-found]
-            )
-            from flash_mla import get_mla_metadata  # type: ignore[import-not-found]
+    from flash_mla import flash_mla_with_kvcache  # type: ignore[import-not-found] # noqa: F401
+    from flash_mla import get_mla_metadata  # type: ignore[import-not-found] # noqa: F401
 
-            _FLASH_MLA_AVAILABLE = True
+    _cuda = torch.version.cuda
+    _ge_129 = bool(_cuda) and tuple(map(int, _cuda.split(".")[:2])) >= (12, 9)
+    # PPU wheel reports CUDA 12.6 but ships the sparse FP8 decode kernel; detect
+    # it via its reduced (no-attn_sink) signature so decode is enabled on PPU.
+    if _ge_129 or not _flash_mla_with_kvcache_supports_attn_sink():
+        _FLASH_MLA_AVAILABLE = True
 except (ImportError, AttributeError, ValueError) as e:
     logging.warning("[dsv4-fp8] flash_mla wheel unavailable (%s)", e)
 
@@ -163,6 +198,21 @@ class SparseAttnV4DecodeFp8Op:
         else:
             extra_topk_3d = None
 
+        if not _flash_mla_with_kvcache_supports_attn_sink():
+            return self._forward_flash_mla_ppu(
+                q=q,
+                kv_4d=kv_4d,
+                topk_3d=topk_3d,
+                attn_sink=attn_sink,
+                topk_length=topk_length,
+                extra_kv_4d=extra_kv_4d,
+                extra_topk_3d=extra_topk_3d,
+                extra_topk_length=extra_topk_length,
+                B=B,
+                q_len=q_len,
+                H=H,
+            )
+
         # Sparse FlashMLA consumes global slot ids from ``indices`` directly.
         # Its sparse branch does not pass block_table/cache_seqlens to the CUDA
         # kernel, so keep dense metadata disabled here.
@@ -192,3 +242,157 @@ class SparseAttnV4DecodeFp8Op:
         )
 
         return attn_out.view(B, q_len, H, self.head_dim).contiguous()
+
+    # ------------------------------------------------------------------
+    # PPU flash_mla_with_kvcache path (reduced signature, 2-based lse)
+    # ------------------------------------------------------------------
+    def _forward_flash_mla_ppu(
+        self,
+        *,
+        q: torch.Tensor,
+        kv_4d: torch.Tensor,
+        topk_3d: torch.Tensor,
+        attn_sink: torch.Tensor,
+        topk_length: Optional[torch.Tensor],
+        extra_kv_4d: Optional[torch.Tensor],
+        extra_topk_3d: Optional[torch.Tensor],
+        extra_topk_length: Optional[torch.Tensor],
+        B: int,
+        q_len: int,
+        H: int,
+    ) -> torch.Tensor:
+        """Reproduce the GPU dual-pool + attn-sink kernel on the PPU wheel.
+
+        The PPU ``flash_mla_with_kvcache`` lacks the ``attn_sink`` /
+        ``topk_length`` / ``extra_*`` kwargs and returns a 2-based (log2)
+        ``softmax_lse``.  Each verified primitive:
+
+          * ``topk_length`` -> mask indices at/after the per-request length to
+            -1 (the kernel ignores -1 / >= total slots).
+          * ``attn_sink``   -> post-hoc ``out *= sigmoid(lse*ln2 - sink)`` in
+            natural base (matches ``utils._sparse_attn`` / the prefill
+            ``_raw_q_merge_apply_sink`` correction).
+          * dual pool       -> two single-pool calls merged with a 2-based
+            online-softmax, equivalent to one call over the concatenated pool.
+
+        Sparse indices are global physical slot ids, so per-pool metadata is
+        rebuilt locally with an identity ``block_table`` + full-length
+        ``cache_seqlens`` (the PPU kernel requires both non-None), preserving
+        the GPU "indices consumed directly" semantics.
+        """
+        o_main, lse_main = self._ppu_sparse_pool(q, kv_4d, topk_3d, topk_length, H)
+        if extra_kv_4d is None:
+            out = self._ppu_apply_sink(o_main, lse_main, attn_sink)
+        else:
+            o_extra, lse_extra = self._ppu_sparse_pool(
+                q, extra_kv_4d, extra_topk_3d, extra_topk_length, H
+            )
+            o_merged, lse_merged = self._ppu_merge_pools(
+                o_main, lse_main, o_extra, lse_extra
+            )
+            out = self._ppu_apply_sink(o_merged, lse_merged, attn_sink)
+        return out.view(B, q_len, H, self.head_dim).contiguous()
+
+    @staticmethod
+    def _ppu_mask_topk_length(
+        indices: torch.Tensor, topk_length: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """Mask indices at column >= per-request ``topk_length`` to -1."""
+        if topk_length is None:
+            return indices
+        topk = indices.shape[-1]
+        col = torch.arange(topk, device=indices.device).view(1, 1, topk)
+        keep = col < topk_length.to(indices.device).view(-1, 1, 1)
+        return torch.where(keep, indices, torch.full_like(indices, -1))
+
+    def _ppu_sparse_pool(
+        self,
+        q: torch.Tensor,
+        k_cache_4d: torch.Tensor,
+        indices: torch.Tensor,
+        topk_length: Optional[torch.Tensor],
+        H: int,
+    ) -> tuple:
+        """One PPU sparse ``flash_mla_with_kvcache`` call.
+
+        Returns ``(out[B, q_len, H, head_dim], lse[B, q_len, H, 1])`` where the
+        lse is the kernel's 2-based (log2) softmax_lse reshaped for merge/sink.
+        """
+        from flash_mla import (  # type: ignore[import-not-found]
+            flash_mla_with_kvcache,
+            get_mla_metadata,
+        )
+
+        Bq, q_len = q.shape[0], q.shape[1]
+        indices = self._ppu_mask_topk_length(indices, topk_length).contiguous()
+        num_blocks = k_cache_4d.shape[0]
+        page_block_size = k_cache_4d.shape[1]
+        total_slots = num_blocks * page_block_size
+        cache_seqlens = torch.full(
+            (Bq,), total_slots, dtype=torch.int32, device=q.device
+        )
+        block_table = (
+            torch.arange(num_blocks, dtype=torch.int32, device=q.device)
+            .unsqueeze(0)
+            .expand(Bq, num_blocks)
+            .contiguous()
+        )
+        sched_meta, num_splits = get_mla_metadata(
+            cache_seqlens,
+            q_len * H,
+            1,
+            num_heads_q=H,
+            is_fp8_kvcache=True,
+            topk=indices.shape[-1],
+        )
+        out, lse = flash_mla_with_kvcache(
+            q=q,
+            k_cache=k_cache_4d,
+            block_table=block_table,
+            cache_seqlens=cache_seqlens,
+            head_dim_v=self.head_dim,
+            tile_scheduler_metadata=sched_meta,
+            num_splits=num_splits,
+            softmax_scale=self.softmax_scale,
+            is_fp8_kvcache=True,
+            indices=indices,
+        )
+        # kernel lse: [B, H, q_len] -> [B, q_len, H, 1]
+        lse_bqh1 = lse.permute(0, 2, 1).unsqueeze(-1).float()
+        return out, lse_bqh1
+
+    @staticmethod
+    def _ppu_merge_pools(
+        o1: torch.Tensor,
+        lse1: torch.Tensor,
+        o2: torch.Tensor,
+        lse2: torch.Tensor,
+    ) -> tuple:
+        """2-based online-softmax merge of two single-pool results.
+
+        ``lse*`` are 2-based [B, q_len, H, 1]; returns merged (out, 2-based lse).
+        """
+        m = torch.maximum(lse1, lse2)
+        w1 = torch.exp2(lse1 - m)
+        w2 = torch.exp2(lse2 - m)
+        denom = w1 + w2
+        merged = (w1 * o1.float() + w2 * o2.float()) / denom
+        merged_lse = m + torch.log2(denom)
+        return merged.to(o1.dtype), merged_lse
+
+    def _ppu_apply_sink(
+        self,
+        out: torch.Tensor,
+        lse_bqh1: torch.Tensor,
+        attn_sink: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """out[B, q_len, H, D] *= sigmoid(lse_natural - sink); lse is 2-based."""
+        if attn_sink is None:
+            return out
+        sink = attn_sink.to(device=out.device, dtype=torch.float32).view(1, 1, -1, 1)
+        lse_nat = lse_bqh1 * math.log(2.0)
+        factor = torch.sigmoid(lse_nat - sink)
+        factor = torch.where(
+            torch.isfinite(lse_bqh1), factor, torch.zeros_like(factor)
+        )
+        return (out.float() * factor).to(out.dtype)

@@ -8,6 +8,7 @@ import unittest
 
 import torch
 
+import rtp_llm.models_py.modules.dsv4.fp8.decode.fp8_sparse_attn_decode_op as decode_mod
 from rtp_llm.models_py.modules.dsv4.fp8.decode.fp8_sparse_attn_decode_op import (
     SparseAttnV4DecodeFp8Op,
 )
@@ -41,7 +42,12 @@ class TestSparseAttnV4DecodeFp8Op(unittest.TestCase):
 
         fake_flash_mla.flash_mla_with_kvcache = fake_flash_mla_with_kvcache
         old_flash_mla = sys.modules.get("flash_mla")
+        old_attn_sink_flag = decode_mod._FLASH_MLA_KVCACHE_ATTN_SINK
         sys.modules["flash_mla"] = fake_flash_mla
+        # This test asserts the GPU-path behaviour (dense metadata dropped);
+        # force GPU detection so it is independent of the host flash_mla wheel
+        # (the PPU wheel routes to the post-hoc sink path instead).
+        decode_mod._FLASH_MLA_KVCACHE_ATTN_SINK = True
         try:
             op = SparseAttnV4DecodeFp8Op(
                 n_heads=4,
@@ -73,6 +79,7 @@ class TestSparseAttnV4DecodeFp8Op(unittest.TestCase):
             self.assertIsNone(calls[0]["cache_seqlens"])
             self.assertTrue(torch.equal(calls[0]["indices"], topk))
         finally:
+            decode_mod._FLASH_MLA_KVCACHE_ATTN_SINK = old_attn_sink_flag
             if old_flash_mla is None:
                 sys.modules.pop("flash_mla", None)
             else:
