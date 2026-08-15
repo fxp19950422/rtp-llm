@@ -14,6 +14,7 @@ slow but correct. M6 will swap in FlashMLA sparse impl.
 
 import json
 import logging
+import math
 import os
 import threading
 from contextlib import contextmanager, suppress
@@ -5441,7 +5442,14 @@ class AttentionFP8(nn.Module):
                         indices=idx_c,
                         sm_scale=self.softmax_scale,
                     )
-                    o_part = self._raw_q_merge_apply_sink(o_part, lse_part)
+                    # PPU flash_mla_sparse_fwd returns a 2-based (log2)
+                    # lse, but _raw_q_merge_apply_sink applies the attn
+                    # sink in natural base (sigmoid(lse - sink) == exp
+                    # denominator). Convert log2 -> ln first so the sink
+                    # weight matches the reference softmax(scores, sink).
+                    o_part = self._raw_q_merge_apply_sink(
+                        o_part, lse_part * math.log(2.0)
+                    )
             with record_function_range("dsv4.fp8.attn.prefill.output_proj"):
                 self._prefill_output_proj_into(
                     o_part,
