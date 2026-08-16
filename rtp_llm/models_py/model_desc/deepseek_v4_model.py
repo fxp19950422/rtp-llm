@@ -804,14 +804,42 @@ class DeepSeekV4Model(GptModelBase):
                 _topk_len_swa = _torch.tensor(
                     [_first_topk_len_swa, 5], dtype=_torch.int32, device=device_str
                 )
-                _flash_mla_sparse_fwd(
-                    q=_q_swa,
-                    kv=_kv_swa,
-                    indices=_idx_swa,
-                    sm_scale=float(_swa_attn.softmax_scale),
-                    attn_sink=_swa_attn.attn_sink,
-                    topk_length=_topk_len_swa,
+                # PPU flash_mla_sparse_fwd ships the older signature
+                # (q, kv, indices, sm_scale, d_v) without attn_sink /
+                # topk_length kwargs. Mirror the runtime capability check
+                # the attention forward path uses so this JIT-warmup call
+                # doesn't TypeError on PPU. The prewarm output is discarded;
+                # we only need the kernel to compile, so on the no-kwarg
+                # build we mask invalid indices to -1 (kernel ignores those)
+                # instead of passing the unsupported kwargs.
+                from rtp_llm.models_py.modules.dsv4.fp8.attention import (
+                    _flash_mla_supports_attn_sink,
                 )
+
+                if _flash_mla_supports_attn_sink():
+                    _flash_mla_sparse_fwd(
+                        q=_q_swa,
+                        kv=_kv_swa,
+                        indices=_idx_swa,
+                        sm_scale=float(_swa_attn.softmax_scale),
+                        attn_sink=_swa_attn.attn_sink,
+                        topk_length=_topk_len_swa,
+                    )
+                else:
+                    _col_swa = _torch.arange(
+                        _idx_swa.shape[-1], device=device_str
+                    ).view(1, 1, _idx_swa.shape[-1])
+                    _idx_masked_swa = _torch.where(
+                        _col_swa < _topk_len_swa.view(-1, 1, 1),
+                        _idx_swa,
+                        _torch.full_like(_idx_swa, -1),
+                    )
+                    _flash_mla_sparse_fwd(
+                        q=_q_swa,
+                        kv=_kv_swa,
+                        indices=_idx_masked_swa,
+                        sm_scale=float(_swa_attn.softmax_scale),
+                    )
                 logging.info("[DeepSeekV4Model] flash_mla SWA kv_full prewarm done")
             except Exception:
                 logging.exception(
