@@ -523,7 +523,18 @@ class Int8PerChannelCompressedQuantConfig(CompressedTensorsQuantConfig):
         return [torch.float16, torch.bfloat16]
 
     def get_supported_kv_cache_dtypes(self) -> List[torch.dtype]:
-        return [torch.float16, torch.bfloat16, torch.int8]
+        # DeepSeek-V4-Flash-W8A8-INT8 pairs INT8 weight-only quantization with
+        # an FP8 KV cache (the 656-byte fp8 KV slot layout the DSV4 attention
+        # path reads/writes; kv_cache_scheme is null in the checkpoint, so the
+        # KV dtype is a deployment choice). AttentionFP8 requires fp8_kv_cache
+        # (kv_cache_dtype == FP8) to build the position_ids-carrying decode
+        # metadata, so FP8 must be an accepted KV cache dtype here.
+        return [
+            torch.float16,
+            torch.bfloat16,
+            torch.int8,
+            torch.float8_e4m3fn,
+        ]
 
     @classmethod
     def _from_config(cls, config: Dict[str, Any]) -> "QuantizationConfig":
