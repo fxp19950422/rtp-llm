@@ -695,6 +695,18 @@ def _warmup_fused_kv_compress_norm_rope_insert(
         run_fused_compress_kv_write,
     )
 
+    # PPU (ZW810E, sm8.0) has no ``triton.float8e4nv``; the fused
+    # compress->fp8-pack kernel ``run_fused_compress_kv_write`` cannot
+    # compile there (``type fp8e4nv not supported in this architecture``).
+    # CompressorFP8._launch already routes the forward path to the pure-torch
+    # ``ppu_compress_kv_write`` equivalents on PPU, so this triton kernel is
+    # never invoked at runtime -- warming it would only crash JIT compile.
+    # Skip the warmup on PPU to match the forward-path dispatch.
+    from rtp_llm.models_py.modules.dsv4.fp8.compressor import _is_ppu_device
+
+    if _is_ppu_device(device):
+        return
+
     head_dim = int(head_dim)
     rope_head_dim = int(rope_head_dim)
     compress_ratio = int(compress_ratio)
@@ -1853,6 +1865,14 @@ def warmup_fp8_mqa_logits_jit(
         return
     if not _fp8_mqa_logits_available():
         return
+    # PPU has no fp8e4nv and no deep_gemm fp8 MQA logits; IndexerFP8 routes the
+    # prefill/decode indexer to pure-torch ``ppu_indexer_score(_prefill)`` on PPU
+    # (see indexer.py), so this deep_gemm warmup is never exercised there. Skip
+    # to match the forward-path dispatch and avoid a compile/runtime crash.
+    from rtp_llm.models_py.modules.dsv4.fp8.compressor import _is_ppu_device
+
+    if _is_ppu_device(device):
+        return
     _assert_not_capturing()
 
     shape_keys = tuple(sorted(shapes.keys()))
@@ -1922,6 +1942,13 @@ def warmup_dsv4_fp8_swa_slot_dequant_jit(
         return
     device = torch.device(device)
     if not _is_cuda_device(device) or kv_cache is None:
+        return
+    # PPU has no fp8e4nv; the SWA slot dequant triton kernel cannot compile.
+    # The forward path uses the pure-torch ``_ppu_dequant_and_gather_slots_656``
+    # equivalent (see _swa_dequant_triton.py), so skip this warmup on PPU.
+    from rtp_llm.models_py.modules.dsv4.fp8.compressor import _is_ppu_device
+
+    if _is_ppu_device(device):
         return
     _assert_not_capturing()
 
