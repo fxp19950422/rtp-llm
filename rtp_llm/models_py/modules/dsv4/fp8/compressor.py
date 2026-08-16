@@ -48,17 +48,23 @@ _CUBLAS_GEMM_BF16_BF16_FP32 = getattr(rtp_llm_ops, "cublas_gemm_bf16_bf16_fp32",
 
 
 def _linear_bf16_bf16_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    """F.linear(x, weight) with BF16 operands and FP32 accumulation/output."""
+    """F.linear(x, weight) with BF16 operands and FP32 accumulation/output.
+
+    Uses the fused ``cublas_gemm_bf16_bf16_fp32`` C++ op when built. PPU has no
+    cuBLAS binding for it, so fall back to a pure-torch FP32 matmul (bf16
+    operands upcast to fp32) -- same FP32 output contract, numerically a safe
+    superset of bf16*bf16 + fp32-accumulate.
+    """
     assert x.dtype == torch.bfloat16, f"expected BF16 input, got {x.dtype}"
     assert weight.dtype == torch.bfloat16, f"expected BF16 weight, got {weight.dtype}"
     assert x.is_contiguous(), "expected contiguous input"
     assert weight.is_contiguous(), "expected contiguous weight"
-    assert (
-        _CUBLAS_GEMM_BF16_BF16_FP32 is not None
-    ), "cublas_gemm_bf16_bf16_fp32 op is not built"
     leading_shape = x.shape[:-1]
     x_2d = x.reshape(-1, x.shape[-1])
-    out_2d = _CUBLAS_GEMM_BF16_BF16_FP32(x_2d, weight)
+    if _CUBLAS_GEMM_BF16_BF16_FP32 is not None:
+        out_2d = _CUBLAS_GEMM_BF16_BF16_FP32(x_2d, weight)
+    else:
+        out_2d = torch.matmul(x_2d.to(torch.float32), weight.to(torch.float32).t())
     return out_2d.reshape(*leading_shape, weight.shape[0])
 
 
