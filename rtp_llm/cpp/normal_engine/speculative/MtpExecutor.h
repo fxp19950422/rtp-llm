@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <list>
 #include <memory>
 #include <vector>
@@ -195,6 +196,13 @@ private:
     kmonitor::MetricsReporterPtr                                             metrics_reporter_ = nullptr;
     MetricsLoopReporter<RtpLLMTokenPSMetrics, RtpLLMTokenPSMetricsCollector> tps_reporter_;
     WallClockMetricsLoopReporter<RtpLLMWallClockTokenPSMetrics, RtpLLMTokenPSMetricsCollector> wall_tps_reporter_;
+    // Env-gated speculative accept log (RTP_LLM_SP_METRICS_LOG_SEC, 0 = off by
+    // default). Cumulative counters flushed from process() on TP rank 0; works
+    // without a kmonitor sink, which PPU dev boxes do not have.
+    int64_t                              sp_log_propose_  = 0;
+    int64_t                              sp_log_accepted_ = 0;
+    int64_t                              sp_log_streams_  = 0;
+    std::chrono::steady_clock::time_point sp_log_last_     = std::chrono::steady_clock::now();
     std::shared_ptr<ExpertBalancer>                                                            expert_balancer_;
     size_t                                                                                     vocab_size_;
 

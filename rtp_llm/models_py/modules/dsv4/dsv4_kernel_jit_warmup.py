@@ -852,6 +852,23 @@ def _collect_dsv4_dense_gemm_shapes(model: Any) -> Dict[tuple[str, int, int], di
                 {"name": module_name, "weight": weight, "scale": scale},
             )
 
+        # W8A8-INT8 (PPU) dense linears. Without this the collector reported
+        # "fp8=0 fp8_fp4=0 total=0" on an INT8 checkpoint and no prefill GEMM
+        # was ever prewarmed, leaving the first request of each new chunk M to
+        # pay the DeepGEMM JIT compile.
+        if getattr(module, "storage", None) == "int8":
+            weight = getattr(module, "weight", None)
+            scale = getattr(module, "_int8_w_scale", None)
+            if weight is None or scale is None:
+                continue
+            n_value = int(getattr(module, "out_features", weight.shape[0]))
+            k_value = int(getattr(module, "in_features", weight.shape[1]))
+            _maybe_add_shape(
+                shapes,
+                _shape_key("int8", n_value, k_value),
+                {"name": module_name, "weight": weight, "scale": scale},
+            )
+
     for module_name, module in model.named_modules():
         cls_name = module.__class__.__name__
         if cls_name == "GroupedFP4Strategy":
@@ -872,16 +889,20 @@ def _collect_dsv4_dense_gemm_shapes(model: Any) -> Dict[tuple[str, int, int], di
     # health gate opens, the (kind, N, K) collected here is incomplete.
     fp8_keys = sorted(k for k in shapes if k[0] == "fp8")
     fp8_fp4_keys = sorted(k for k in shapes if k[0] == "fp8_fp4")
+    int8_keys = sorted(k for k in shapes if k[0] == "int8")
     logging.info(
-        "[DSV4 DenseGEMM] collected shapes: fp8=%d fp8_fp4=%d total=%d",
+        "[DSV4 DenseGEMM] collected shapes: fp8=%d fp8_fp4=%d int8=%d total=%d",
         len(fp8_keys),
         len(fp8_fp4_keys),
+        len(int8_keys),
         len(shapes),
     )
     if fp8_keys:
         logging.info("[DSV4 DenseGEMM]   fp8 (N,K): %s", fp8_keys)
     if fp8_fp4_keys:
         logging.info("[DSV4 DenseGEMM]   fp8_fp4 (N,K): %s", fp8_fp4_keys)
+    if int8_keys:
+        logging.info("[DSV4 DenseGEMM]   int8 (N,K): %s", int8_keys)
     return shapes
 
 
@@ -925,6 +946,52 @@ def _collect_dsv4_mhc_prenorm_shapes(model: Any) -> Dict[tuple[int, int], dict]:
         sorted(shapes.keys()),
     )
     return shapes
+
+
+def warmup_mhc_triton_kernels_jit(model: Any, *, device: torch.device) -> None:
+    """Prewarm the fused Triton mHC pre/head kernels so the first decode token
+    does not eat Triton JIT compilation. No-op unless the DSV4 HC backend
+    resolved to Triton (``TritonHCUnit`` / ``TritonHCHead`` live). Never raises:
+    a compile failure here is logged and left to the runtime fallback."""
+    units = []
+    heads = []
+    for _, module in model.named_modules():
+        cls = module.__class__.__name__
+        if cls == "TritonHCUnit":
+            units.append(module)
+        elif cls == "TritonHCHead":
+            heads.append(module)
+    if not units and not heads:
+        return
+    seen: set = set()
+    for module in units + heads:
+        hc = int(getattr(module, "hc_mult", 4) or 4)
+        dim = int(getattr(module, "dim", 0) or 0)
+        is_head = module.__class__.__name__ == "TritonHCHead"
+        key = (is_head, hc, dim)
+        if hc <= 0 or dim <= 0 or key in seen:
+            continue
+        seen.add(key)
+        # m=1 (decode) compiles both the Sinkhorn and readout kernels; T is a
+        # runtime arg, so larger prefill M reuses the same compiled kernel.
+        x = torch.zeros((1, hc, dim), dtype=torch.bfloat16, device=device)
+        try:
+            if is_head:
+                module.head(x)
+            else:
+                module.pre(x)
+        except Exception:
+            logging.exception(
+                "[DSV4 mHC Triton] warmup failed for %s hc=%d dim=%d",
+                module.__class__.__name__,
+                hc,
+                dim,
+            )
+    logging.info(
+        "[DSV4 mHC Triton] prewarm done: units=%d heads=%d",
+        len(units),
+        len(heads),
+    )
 
 
 def _collect_dsv4_mhc_head_fused_shapes(model: Any) -> Dict[tuple[int, int], dict]:
@@ -2103,6 +2170,23 @@ def _launch_dummy_gemm(
         del a, a_scale, out
         return
 
+    if kind == "int8":
+        # W8A8-INT8 (PPU): the dense int8 GEMM is JIT-compiled per (M, N, K)
+        # just like the FP8 path, so a prefill whose chunk M was never warmed
+        # pays the compile on the first request (measured: 43s TTFT for a
+        # 489-token prompt, 283ms once warm).
+        from rtp_llm.models_py.modules.dsv4.int8_gemm import (
+            int8_dense_gemm,
+            quantize_per_token_int8,
+        )
+
+        a = torch.zeros((m_value, k_value), dtype=torch.bfloat16, device=device)
+        a_i8, a_scale = quantize_per_token_int8(a)
+        out = torch.empty((m_value, n_value), dtype=torch.bfloat16, device=device)
+        int8_dense_gemm(a_i8, a_scale, info["weight"], info["scale"], out)
+        del a, a_i8, a_scale, out
+        return
+
     raise ValueError(f"unknown dense GEMM warmup kind={kind!r}")
 
 
@@ -2365,13 +2449,16 @@ def _launch_dummy_fp8_mqa_logits(
     ks = torch.zeros((seq_len,), dtype=torch.int32, device=device)
     ke = torch.full((seq_len,), seq_len_kv, dtype=torch.int32, device=device)
 
-    logits = deep_gemm.fp8_mqa_logits(
-        q,
-        (k, k_scale),
-        weights,
-        ks,
-        ke,
-        False,
-        0,
+    # ZW810E's deep_gemm.fp8_mqa_logits took a trailing max_seqlen_k positional
+    # (clean_logits, max_seqlen_k); the M890P (CUDA13) wheel dropped it, so passing
+    # 7 args crashes warmup with "takes 5 to 6 ... but 7 were given". Match the
+    # installed wheel's arity (see fp8._indexer_score.mqa_logits_takes_max_seqlen).
+    from rtp_llm.models_py.modules.dsv4.fp8._indexer_score import (
+        mqa_logits_takes_max_seqlen,
     )
+
+    mqa_args = [q, (k, k_scale), weights, ks, ke, False]
+    if mqa_logits_takes_max_seqlen():
+        mqa_args.append(0)
+    logits = deep_gemm.fp8_mqa_logits(*mqa_args)
     del q, k, k_scale, weights, ks, ke, logits

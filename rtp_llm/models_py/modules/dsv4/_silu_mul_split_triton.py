@@ -7,8 +7,11 @@ Replaces the per-expert chain in ``moe.py:Expert.forward``::
         gate = torch.clamp(gate, max=swiglu_limit)                  # 1 launch
     x = F.silu(gate) * up                                            # 2 launches
 
-with one Triton launch.  Inputs/outputs are FP32 (Expert.forward casts
-the FP8 GEMM output via ``.float()`` upstream).
+with one Triton launch.  The FP8 ``Expert.forward`` casts its GEMM output
+via ``.float()`` upstream and so passes FP32; the W8A8-INT8 shared expert
+keeps its BF16 GEMM output as-is.  Both are accepted -- the kernel loads
+into FP32 registers either way, so the math is identical and only the
+load/store width differs.
 
 Why a *split* kernel (vs the existing ``silu_and_mul`` that takes a
 concatenated ``[B, 2N]`` tensor): w1 and w3 are separate FP8 GEMMs
@@ -17,7 +20,8 @@ kernel would require a ``torch.cat`` (one extra launch) and a buffer
 allocation.  The split-input kernel avoids both.
 
 Shape contract (V4-Flash):
-  gate, up, out: [..., D] FP32, contiguous along the last dim.
+  gate, up, out: [..., D] FP32 or BF16 (both inputs the same dtype),
+  contiguous along the last dim.
   D is moe_intermediate_size for shared-expert (e.g. 2048).
 """
 
@@ -32,9 +36,9 @@ import triton.language as tl
 
 @triton.jit
 def _silu_mul_split_kernel(
-    gate_ptr,  # [N, D] fp32 contiguous
-    up_ptr,  # [N, D] fp32 contiguous
-    out_ptr,  # [N, D] fp32 contiguous
+    gate_ptr,  # [N, D] fp32/bf16 contiguous
+    up_ptr,  # [N, D] fp32/bf16 contiguous
+    out_ptr,  # [N, D] fp32/bf16 contiguous
     N: tl.int32,
     D: tl.int32,
     row_stride: tl.int32,  # stride between rows for gate/up/out (= D for contiguous)
@@ -61,16 +65,18 @@ def _silu_mul_split_kernel(
         u = tl.where(u < -CLAMP_LIMIT, -CLAMP_LIMIT, u)
         g = tl.where(g > CLAMP_LIMIT, CLAMP_LIMIT, g)
 
-    # F.silu(g) = g * sigmoid(g) (compute in fp32; inputs already fp32).
-    s = g * tl.sigmoid(g)
+    # F.silu(g) = g * sigmoid(g).  tl.sigmoid promotes to fp32, so BF16
+    # inputs get the same fp32 math as the FP32 callers; only the store
+    # narrows back to the tensor dtype.
+    s = g * tl.sigmoid(g.to(tl.float32))
     out = s * u
 
     tl.store(out_ptr + base + d_off, out, mask=mask)
 
 
 def silu_mul_split(
-    gate: torch.Tensor,  # [..., D] fp32 contiguous
-    up: torch.Tensor,  # [..., D] fp32 contiguous, same shape as gate
+    gate: torch.Tensor,  # [..., D] fp32/bf16 contiguous
+    up: torch.Tensor,  # [..., D] same dtype+shape as gate
     clamp_limit: float = 0.0,  # > 0 enables clamp(up,±L) + clamp(gate, max=L)
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
@@ -85,9 +91,11 @@ def silu_mul_split(
     Returns ``out`` (allocated when None).
     """
     assert gate.shape == up.shape, f"gate {gate.shape} vs up {up.shape}"
-    assert (
-        gate.dtype == torch.float32 and up.dtype == torch.float32
-    ), f"gate {gate.dtype} / up {up.dtype}; expect fp32"
+    # FP32 (FP8 expert path) and BF16 (W8A8-INT8 shared expert) are both
+    # exact here: the kernel promotes to FP32 registers before the sigmoid,
+    # so accepting BF16 only removes the caller's fp32 round-trip copies.
+    assert gate.dtype in (torch.float32, torch.bfloat16), f"gate {gate.dtype}"
+    assert up.dtype == gate.dtype, f"gate {gate.dtype} / up {up.dtype}; must match"
     assert gate.is_contiguous() and up.is_contiguous(), "gate/up must be contiguous"
 
     # Flatten leading dims; kernel works on [N, D].
@@ -98,7 +106,7 @@ def silu_mul_split(
     if out is None:
         out = torch.empty_like(gate)
     else:
-        assert out.shape == gate.shape and out.dtype == torch.float32
+        assert out.shape == gate.shape and out.dtype == gate.dtype
         assert out.is_contiguous()
 
     if N == 0 or D == 0:

@@ -38,6 +38,7 @@ from .shared_expert import (
     combine_routed_and_shared,
     get_shared_expert_executor,
 )
+from . import ll_chunk_align
 from .strategies.base import MoeCfg, _resolve_forced, select_strategy
 
 _FINAL_OUT_CACHE: dict[tuple, torch.Tensor] = {}
@@ -388,6 +389,23 @@ class MoE(nn.Module):
         return out.view(shape)
 
     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+        """Cross-rank-safe wrapper around the real body.
+
+        The prefill chunk loops below issue one EP dispatch/combine round per
+        chunk, and the chunk count comes from the *local* token count -- with
+        DP > 1 that desynchronises the collective and hangs the group. Vote on
+        the global count before any dispatch of this forward, then top this rank
+        up afterwards (see ``moe/ll_chunk_align.py``).
+        """
+        tokens = x.numel() // self.dim
+        plan = ll_chunk_align.begin_layer(
+            self, tokens, self._should_chunk(tokens), x.device
+        )
+        out = self._forward_impl(x, input_ids)
+        ll_chunk_align.finish_layer(plan)
+        return out
+
+    def _forward_impl(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
         from rtp_llm.models_py.modules.dsv4 import _record_tensor as _rt
 
         # Master switch: when MOEDBG=0 the AND short-circuits so neither the

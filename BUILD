@@ -138,6 +138,17 @@ config_setting(
     define_values = {"use_ppu": "true"},
 )
 
+# Strict superset of :using_cuda, so select()s that need a PPU-specific CUDA branch
+# resolve unambiguously (bazel prefers the more specialized match) instead of
+# erroring with "Illegal ambiguous match" against :using_cuda.
+config_setting(
+    name = "using_ppu_cuda",
+    define_values = {
+        "use_ppu": "true",
+        "using_cuda": "true",
+    },
+)
+
 config_setting(
     name = "using_remote_kv_cache",
     define_values = {"use_remote_kv_cache": "true"},

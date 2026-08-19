@@ -16,14 +16,25 @@ def _tilelang_available() -> bool:
     return importlib.util.find_spec("tilelang") is not None
 
 
+def _triton_available() -> bool:
+    import importlib.util
+
+    return importlib.util.find_spec("triton") is not None
+
+
 def _mode_from_env() -> HCMode:
     raw = os.environ.get("DSV4_HC_IMPL")
     if raw is None:
-        # Default: TileLang when the package is importable, else the PyTorch
-        # reference fallback. Backends without tilelang (e.g. PPU) then work
-        # out of the box instead of raising inside the TileLang kernel; an
-        # explicit DSV4_HC_IMPL still overrides this auto-detection.
-        return HCMode.TILELANG if _tilelang_available() else HCMode.FALLBACK
+        # Default preference: TileLang > Triton > PyTorch fallback. Backends
+        # without tilelang but with triton (e.g. PPU) get the fused Triton
+        # Sinkhorn instead of the ~40-launch eager fallback; backends with
+        # neither still work via the reference path. An explicit DSV4_HC_IMPL
+        # overrides this auto-detection.
+        if _tilelang_available():
+            return HCMode.TILELANG
+        if _triton_available():
+            return HCMode.TRITON
+        return HCMode.FALLBACK
     try:
         return HCMode(raw.lower())
     except ValueError as exc:
@@ -50,6 +61,21 @@ def build_hc_unit(
         from rtp_llm.models_py.modules.dsv4.hc.tilelang_impl import TileLangHCUnit
 
         return TileLangHCUnit(
+            fn,
+            base,
+            scale,
+            dim=dim,
+            hc_mult=hc_mult,
+            hc_sinkhorn_iters=hc_sinkhorn_iters,
+            norm_eps=norm_eps,
+            hc_eps=hc_eps,
+            layer_id=layer_id,
+            name=name,
+        )
+    if mode is HCMode.TRITON:
+        from rtp_llm.models_py.modules.dsv4.hc.triton_impl import TritonHCUnit
+
+        return TritonHCUnit(
             fn,
             base,
             scale,
@@ -93,6 +119,18 @@ def build_hc_head(
         from rtp_llm.models_py.modules.dsv4.hc.tilelang_impl import TileLangHCHead
 
         return TileLangHCHead(
+            fn,
+            base,
+            scale,
+            dim=dim,
+            hc_mult=hc_mult,
+            norm_eps=norm_eps,
+            hc_eps=hc_eps,
+        )
+    if mode is HCMode.TRITON:
+        from rtp_llm.models_py.modules.dsv4.hc.triton_impl import TritonHCHead
+
+        return TritonHCHead(
             fn,
             base,
             scale,

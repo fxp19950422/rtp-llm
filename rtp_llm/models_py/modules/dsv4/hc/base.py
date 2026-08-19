@@ -32,6 +32,7 @@ from rtp_llm.models_py.modules.dsv4._profiler import record_function_range
 
 class HCMode(str, Enum):
     TILELANG = "tilelang"
+    TRITON = "triton"
     FALLBACK = "fallback"
 
 

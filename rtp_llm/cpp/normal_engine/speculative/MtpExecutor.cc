@@ -27,6 +27,7 @@
 #include "rtp_llm/models_py/bindings/cuda/kernels/mtp_target_verify_prepare.h"
 #endif
 #include "autil/TimeUtility.h"
+#include <chrono>
 #include <limits>
 #include <cstdlib>
 #include <memory>
@@ -2055,6 +2056,38 @@ absl::Status MtpExecutor::process(const std::list<GenerateStreamPtr>& streams, i
         wall_tps_reporter_.report(&metrics_collector.tps_collector);
         metrics_reporter_->report<RtpLLMSpeculativeEngineMetrics, RtpLLMSpeculativeEngineMetricsCollector>(
             nullptr, &metrics_collector.sp_engine_collector);
+    }
+
+    // Env-gated throttled SP accept log for local benchmarking: PPU dev boxes
+    // have no kmonitor sink, so accept-length evidence comes from these lines.
+    // Deliberately independent of metrics_reporter_. RTP_LLM_SP_METRICS_LOG_SEC
+    // is 0 (disabled) by default, keeping behaviour identical to before.
+    if (isTpRank0() && metrics_collector.not_skip && !warm_up_) {
+        static const int sp_log_interval_sec = []() {
+            const char* env    = std::getenv("RTP_LLM_SP_METRICS_LOG_SEC");
+            const long  parsed = env != nullptr ? std::strtol(env, nullptr, 10) : 0;
+            return parsed > 0 ? static_cast<int>(parsed) : 0;
+        }();
+        if (sp_log_interval_sec > 0) {
+            sp_log_propose_ += metrics_collector.sp_engine_collector.total_propose_token_num;
+            sp_log_accepted_ += metrics_collector.sp_engine_collector.total_accepted_token_num;
+            sp_log_streams_ += metrics_collector.sp_engine_collector.total_stream_num;
+            const auto now = std::chrono::steady_clock::now();
+            if (now - sp_log_last_ >= std::chrono::seconds(sp_log_interval_sec)) {
+                sp_log_last_ = now;
+                const double accept_rate   = sp_log_propose_ > 0 ?
+                                                static_cast<double>(sp_log_accepted_) / static_cast<double>(sp_log_propose_) : 0.0;
+                const double avg_accept_len = sp_log_streams_ > 0 ?
+                                                static_cast<double>(sp_log_accepted_) / static_cast<double>(sp_log_streams_) : 0.0;
+                RTP_LLM_LOG_INFO("sp metrics: total_propose=%ld total_accepted=%ld stream_steps=%ld "
+                                 "avg_accept_len=%.4f accept_rate=%.4f",
+                                 sp_log_propose_,
+                                 sp_log_accepted_,
+                                 sp_log_streams_,
+                                 avg_accept_len,
+                                 accept_rate);
+            }
+        }
     }
 
     return absl::OkStatus();

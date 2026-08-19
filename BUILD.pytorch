@@ -83,6 +83,17 @@ cc_library(
         "torch.libs/libopenblasp*.so",
     ]),
     linkopts = select({
+        # PPU (M890P) ships CUDA 13: NVTX is header-only, torch 2.9 has no NVTX
+        # DT_NEEDED, and the SDK's libnvtx3interop.so symlink chain is broken, so link
+        # no NVTX library. Keep ahead of cuda_pre_12_9, which would want -lnvToolsExt.
+        "@//:using_ppu_cuda": [
+            "-L/usr/local/cuda/lib64",
+            "-L/usr/local/cuda/extras/CUPTI/lib64",
+            "-lcupti",
+            "-lcudart",
+            "-lnccl",
+            "-lcudnn",
+        ],
         "@//:cuda_pre_12_9": [
             "-L/usr/local/cuda/lib64",
             "-L/usr/local/cuda/extras/CUPTI/lib64",

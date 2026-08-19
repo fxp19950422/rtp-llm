@@ -38,6 +38,18 @@ bool cacheStatusSnapshotEnabled() {
     return env != nullptr && std::strcmp(env, "1") == 0;
 }
 
+// "kvc raw" diagnostic log interval. Default keeps the historical hard-coded
+// 3 minutes; benchmarks export RTP_LLM_KVC_LOG_INTERVAL_SEC for a denser KV
+// usage series. Unparseable or non-positive values fall back to 180s.
+std::chrono::seconds kvcRawLogInterval() {
+    const char* env = std::getenv("RTP_LLM_KVC_LOG_INTERVAL_SEC");
+    if (env == nullptr || *env == '\0') {
+        return std::chrono::seconds(180);
+    }
+    const long parsed = std::strtol(env, nullptr, 10);
+    return parsed > 0 ? std::chrono::seconds(parsed) : std::chrono::seconds(180);
+}
+
 }  // namespace
 
 KVCacheManager::KVCacheManager(const CacheConfig&                 config,
@@ -780,12 +792,13 @@ void KVCacheManager::allocateAndSync() {
 void KVCacheManager::reportMetricsLoop() {
     RTP_LLM_PROFILE_FUNCTION();
     kmonitor::MetricsTags tags;
-    // Raw "kvc raw" log lines are throttled to once every 3 minutes — kmonitor
-    // gauges still report every 1s so dashboards stay continuous, but the
-    // diagnostic log is intended for sporadic spot-checks, not per-tick spam.
-    // Initialise to "3 min ago" so the first iteration emits one line right
-    // away (gives operators an immediate baseline after restart).
-    constexpr auto kLogInterval  = std::chrono::minutes(3);
+    // Raw "kvc raw" log lines are throttled to RTP_LLM_KVC_LOG_INTERVAL_SEC
+    // (default 180s) — kmonitor gauges still report every 1s so dashboards stay
+    // continuous, but the diagnostic log is intended for sporadic spot-checks,
+    // not per-tick spam. Initialise to "one interval ago" so the first iteration
+    // emits one line right away (gives operators an immediate baseline after
+    // restart).
+    const auto     kLogInterval  = kvcRawLogInterval();
     auto           last_log_time = std::chrono::steady_clock::now() - kLogInterval;
     while (!stop_.load(std::memory_order_relaxed)) {
         if (!metrics_reporter_ || !allocator_) {

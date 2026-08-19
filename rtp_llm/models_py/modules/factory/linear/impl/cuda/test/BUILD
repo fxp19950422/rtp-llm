@@ -23,6 +23,12 @@ py_test(
 )
 
 py_test(
+    name = "int8_per_channel_linear_contract_test",
+    srcs = ["int8_per_channel_linear_contract_test.py"],
+    deps = py_test_deps,
+)
+
+py_test(
     name = "fp8_deepgemm_linear_sm100_test",
     srcs = [
         "fp8_deepgemm_linear_sm100_test.py",

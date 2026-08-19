@@ -93,6 +93,7 @@ py_library(
         "modules/dsv4/_fused_inv_rope_fp8_quant_triton.py",
         "modules/dsv4/_fused_rmsnorm_rope_triton.py",
         "modules/dsv4/_rope_only_triton.py",
+        "modules/dsv4/hc/_mhc_pre_triton.py",
         "modules/dsv4/moe/_mega_input_pack_triton.py",
         "modules/dsv4/moe/_mega_se_gate_pack_triton.py",
         "modules/dsv4/moe/_mega_se_input_pack_triton.py",

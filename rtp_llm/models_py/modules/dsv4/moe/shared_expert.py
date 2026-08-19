@@ -145,7 +145,15 @@ class W13SharedExpert(nn.Module):
     ) -> torch.Tensor:
         dtype = x.dtype
         with record_function_range("dsv4.shared_expert.w13"):
-            gate_up = self._apply_layer(self.w13, x).float()
+            gate_up = self._apply_layer(self.w13, x)
+            # The FP8 linear needs the FP32 round-trip that silu_mul_split was
+            # originally written for; the W8A8-INT8 GEMM already returns BF16
+            # and the kernel promotes to FP32 registers internally, so casting
+            # here only bought three full-width copies per layer
+            # (gate_up.float() + the two .contiguous() chunk copies + the
+            # hidden.to(dtype) on the way into w2).
+            if not self._is_int8:
+                gate_up = gate_up.float()
             gate, up = gate_up.chunk(2, dim=-1)
         with record_function_range("dsv4.shared_expert.silu_mul"):
             from .expert import require_silu_mul_split
@@ -158,7 +166,9 @@ class W13SharedExpert(nn.Module):
         if weights is not None:
             hidden = weights * hidden
         with record_function_range("dsv4.shared_expert.w2"):
-            return self._apply_layer(self.w2, hidden.to(dtype))
+            if hidden.dtype != dtype:
+                hidden = hidden.to(dtype)
+            return self._apply_layer(self.w2, hidden)
 
 
 class FusedSharedExpertFastPath:

@@ -1104,6 +1104,24 @@ class AttentionFP8(nn.Module):
                 .contiguous(),
                 persistent=False,
             )
+            # Dequantize ONCE at init. ``wo_a`` is a per-layer constant, but both
+            # output-projection call sites (decode ``output_proj.py`` and the
+            # prefill grouped matmul below) used to rebuild the bf16 weight on
+            # EVERY forward -- 2 copies + 1 mul over [G, R, K] per layer per
+            # step. On the wr0 M890P decode timeline that was the single largest
+            # remaining GPU cost after the W8A8 linear migration (~93ms of
+            # aten::copy_ + aten::mul across the trace). Hoisting it here is
+            # bit-identical (same dequant math) and also removes a per-step
+            # allocation, which is a prerequisite for CUDA-graph capture.
+            # Cost: one extra bf16 copy of wo_a per layer (int8 kept for
+            # debug / a future grouped-int8 GEMM).
+            self.register_buffer(
+                "_wo_a_bf16",
+                (
+                    self._wo_a_int8_w.to(torch.float32) * self._wo_a_int8_s
+                ).to(torch.bfloat16).contiguous(),
+                persistent=False,
+            )
         else:
             if tp_size > 1:
                 wo_a_w = wo_a_w[wo_a_row_slice].contiguous()
@@ -5762,14 +5780,12 @@ class AttentionFP8(nn.Module):
             rope_c = rope_c * fc.unsqueeze(1)  # broadcast over heads
             o_rot = o_rot.clone()
             o_rot[..., nope_dim:] = torch.view_as_real(rope_c).flatten(-2)
-        # --- grouped wo_a matmul (dequant int8 -> bf16) --------------------
+        # --- grouped wo_a matmul (weight dequantized once at init) ---------
         with record_function_range("dsv4.int8.attn.out.wo_a_grouped"):
             heads_per_group = self.n_heads // self.n_groups
             K = heads_per_group * self.head_dim
             o_grouped = o_rot.reshape(seqlen, self.n_groups, K).to(torch.bfloat16)
-            wo_a = (self._wo_a_int8_w.to(torch.float32) * self._wo_a_int8_s).to(
-                torch.bfloat16
-            )  # [G, R, K]
+            wo_a = self._wo_a_bf16  # [G, R, K] bf16, built in __init__
             o_proj = torch.einsum("mgk,grk->mgr", o_grouped, wo_a)  # [M, G, R]
         with record_function_range("dsv4.int8.attn.out.wo_b"):
             wo_b_in = o_proj.flatten(1).reshape(seqlen, -1)

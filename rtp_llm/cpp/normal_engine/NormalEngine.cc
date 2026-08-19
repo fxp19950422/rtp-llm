@@ -14,6 +14,9 @@
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include "autil/TimeUtility.h"
 #include "rtp_llm/cpp/normal_engine/speculative/MtpExecutor.h"
+#include "rtp_llm/models_py/bindings/core/ExecOps.h"
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAStream.h>
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -666,9 +669,37 @@ void NormalEngine::mayAddFakeStream(std::list<GenerateStreamPtr>& streams) {
                         has_decode = true;
                     }
                 }
-                if (!has_prefill && !runtime_config.use_batch_decode_scheduler) {
-                    streams.emplace_back(
-                        MtpExecutor::createMinFakePrefillStream(1, model_config_, runtime_config, resource_context_));
+                if (!runtime_config.use_batch_decode_scheduler) {
+                    // The 1-token fake prefill only exists to keep DeepEP normal
+                    // dispatch collectives balanced across DP ranks while some
+                    // rank runs a real context stream this cycle; its eager
+                    // full-depth forward costs >100 ms/step on DSV4-Flash. When
+                    // NO rank has a prefill stream, all ranks must skip it
+                    // together: the cross-rank vote is issued unconditionally
+                    // every cycle (NCCL ordering has to stay identical on all
+                    // ranks), and an all-zero vote leaves the prefill list
+                    // empty so MtpExecutor::prefillStep short-circuits via
+                    // skip_run without launching any forward.
+                    //
+                    // The vote runs on a dedicated pool stream: with async
+                    // decode the CPU enqueues a full step ahead of the GPU, so
+                    // reading the flag on the main stream blocks on the whole
+                    // backlog (~30 ms every few steps, 17.6 ms/cycle avg on
+                    // DSV4-Flash). On its own stream item() waits only for the
+                    // tiny vote + all-reduce kernels. Cross-rank ordering is
+                    // unaffected: collectives are matched by call order, not
+                    // by stream.
+                    at::cuda::CUDAStreamGuard vote_guard(at::cuda::getStreamFromPool(/*is_high_priority=*/false));
+                    auto flag_gpu = torch::full({1},
+                                                has_prefill ? 1 : 0,
+                                                torch::TensorOptions().dtype(torch::kInt).device(torch::kCUDA));
+                    execAllReduce(
+                        AllReduceParams{flag_gpu, ReduceOp::Max, /*overlapped=*/false, ParallelMode::DP_AND_TP});
+                    const bool any_rank_prefill = flag_gpu.item<int>() != 0;
+                    if (!has_prefill && any_rank_prefill) {
+                        streams.emplace_back(MtpExecutor::createMinFakePrefillStream(
+                            1, model_config_, runtime_config, resource_context_));
+                    }
                 }
                 if (!has_decode) {
                     streams.emplace_back(MtpExecutor::createMinFakeDecodeStream(

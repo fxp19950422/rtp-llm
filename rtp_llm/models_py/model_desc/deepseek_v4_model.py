@@ -46,6 +46,7 @@ from rtp_llm.models_py.modules.dsv4.decode.forward import (
     build_paged_pool_specs,
     forward_decode,
 )
+from rtp_llm.models_py.modules.dsv4.moe import ll_chunk_align
 from rtp_llm.models_py.modules.dsv4.moe.moe_layer import (
     chunked_moe_enabled,
     cp_padded_tokens_per_rank_bound,
@@ -899,6 +900,7 @@ class DeepSeekV4Model(GptModelBase):
                     warmup_fp8_mqa_logits_jit,
                     warmup_mhc_head_fused_jit,
                     warmup_mhc_prenorm_gemm_jit,
+                    warmup_mhc_triton_kernels_jit,
                 )
 
                 _jit_device = _torch.device(device_str)
@@ -1009,6 +1011,10 @@ class DeepSeekV4Model(GptModelBase):
                     _mhc_head_fused_shapes,
                     device=_jit_device,
                 )
+                # Prewarm the fused Triton mHC kernels (PPU / no-tilelang path).
+                # Internally fail-safe: never raises, so it cannot break the
+                # re-raising prewarm block below.
+                warmup_mhc_triton_kernels_jit(self.v4, device=_jit_device)
                 if (
                     self.fp8_kv_cache
                     and not self._is_decode_role
@@ -1264,6 +1270,18 @@ class DeepSeekV4Model(GptModelBase):
             )
             return PyModelOutputs(hidden)
         attn = inputs.attention_inputs
+
+        # Open a forward for the MoE cross-rank chunk alignment. Only the plain
+        # context branch counts as prefill: it is the one that can exceed the EP
+        # dispatch cap and is always eager, while verify/decode may run from a
+        # captured graph on one rank and eagerly on another, which would make a
+        # collective there non-rank-uniform (see moe/ll_chunk_align.py).
+        is_target_verify = bool(getattr(attn, "is_target_verify", False))
+        ll_chunk_align.begin_forward(
+            is_prefill=bool(attn.is_prefill)
+            and not is_target_verify
+            and not _is_decode_fmha(fmha_impl)
+        )
 
         # Subclass-overridable hidden-state preparation hooks.  When a
         # subclass (e.g. ``DeepSeekV4MtpModel``) overrides

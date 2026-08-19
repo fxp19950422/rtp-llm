@@ -223,6 +223,14 @@ class DeepepWrapperConfig:
             "FP8_PER_TENSOR_COMPRESSED",
             "FP8_DYNAMIC_PER_TENSOR",
             "W4A8_INT4_PER_CHANNEL",
+            # INT8 W8A8 (per-channel weight + per-token dynamic activation) is the
+            # same shape family as W4A8_INT4_PER_CHANNEL and is supported natively by
+            # the M890P deep_ep cu130 wheel (Buffer.low_latency_dispatch has
+            # use_int8/quant_size kwargs) and by deep_gemm's int8 masked/paged mqa
+            # kernels (m_grouped_gemm_int8_int8_bf16_nt_masked, int8_paged_mqa_logits).
+            # Without this branch DSV4-Flash-W8A8-INT8 falls back to normal EP
+            # dispatch, which py-spy showed dominates decode (73% GIL time).
+            "INT8_PER_CHANNEL_COMPRESSED",
         )
         is_per_group_fp4 = (
             quant_config is not None and quant_config.get_method() == "modelopt_fp4"
@@ -547,7 +555,11 @@ class DeepEPWrapper:
         return DeepEPBuffer(**init_kwargs)  # type: ignore
 
     def _init_low_latency_buffer(self, group: ProcessGroup) -> DeepEPBuffer:
-        """Initialize buffer for low-latency mode."""
+        """Initialize buffer for low-latency mode.
+
+        Also allocates NVL workspace (num_nvl_bytes) so the same buffer can
+        serve normal-mode dispatch() calls for the prefill fallback path.
+        """
         config = self._config
         num_rdma_bytes = DeepEPBuffer.get_low_latency_rdma_size_hint(
             config.ll_num_max_token_per_rank,
@@ -555,6 +567,10 @@ class DeepEPWrapper:
             config.ep_size,
             config.expert_num,
         )
+        # Allocate NVL workspace so normal dispatch() also works on this buffer
+        # (used by DSV4's dual-path strategy: decode=LL, prefill=NORMAL dispatch
+        # through the same buffer). Cost: +2GB/card.
+        num_nvl_bytes = int(2e9)
 
         if config.local_rank == 0:
             print(
@@ -570,7 +586,7 @@ class DeepEPWrapper:
 
         init_kwargs = {
             "group": group,
-            "num_nvl_bytes": 0,
+            "num_nvl_bytes": num_nvl_bytes,
             "num_rdma_bytes": num_rdma_bytes,
             "low_latency_mode": True,
             "num_qps_per_rank": num_qps_per_rank,

@@ -168,6 +168,15 @@ py_test(
 )
 
 py_test(
+    name = "test_deepep_ll_prefill_chunk",
+    srcs = ["test_deepep_ll_prefill_chunk.py"],
+    deps = [
+        "//rtp_llm/models_py:modules",
+        "//rtp_llm:testlib",
+    ],
+)
+
+py_test(
     name = "test_chunked_moe",
     srcs = ["test_chunked_moe.py"],
     deps = [

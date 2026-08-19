@@ -142,6 +142,15 @@ class RoutedExpertsStrategy(nn.Module):
             f"{self.__class__.__name__} does not support MegaMoE gate-pack"
         )
 
+    def pad_ll_calls(self, count: int) -> None:
+        """Issue ``count`` no-op EP dispatch rounds for cross-rank alignment.
+
+        Only strategies whose dispatch count depends on the local token count
+        need this (see ``moe/ll_chunk_align.py``); for everyone else the number
+        of collectives per forward is already rank-uniform.
+        """
+        return None
+
     @classmethod
     def can_handle(cls, cfg: MoeCfg) -> bool:
         """Whether this strategy is applicable for ``cfg`` in the current
@@ -234,6 +243,29 @@ def _resolve_forced(strategy_arg: Optional[str]) -> tuple[Optional[str], bool]:
     return strategy_arg, strategy_arg is not None  # ctor kwarg → strict
 
 
+# EP>1 strategies that do not go through Mega, in preference order. Only
+# reachable on backends that cannot run Mega at all (see
+# ``_mega_kernel_available``). ``deepep_low_latency`` is first because it drops
+# the per-layer device->host sync that normal-mode dispatch forces (its
+# ``can_handle`` returns False unless the wrapper is actually in LOW_LATENCY
+# mode, so this degrades to ``deepep`` on its own).
+_EP_NON_MEGA_FALLBACKS = ("deepep_low_latency", "deepep")
+
+
+def _mega_kernel_available() -> bool:
+    """Whether this backend ships the DeepGEMM ``fp8_fp4_mega_moe`` kernel.
+
+    Backends without it (e.g. PPU) cannot run MegaMoE at all, which is the only
+    situation where the strict Mega-only EP policy relaxes.
+    """
+    try:
+        import deep_gemm as _dg
+
+        return hasattr(_dg, "fp8_fp4_mega_moe")
+    except Exception:
+        return False
+
+
 def select_strategy(
     cfg: MoeCfg,
     forced: Optional[str] = None,
@@ -289,10 +321,22 @@ def select_strategy(
         for cls in _STRATEGY_PRIORITY:
             if cls.name == forced:
                 if cls.can_handle(cfg):
-                    if cfg.ep_size > 1 and cls.name not in (
-                        "mega",
-                        "mega_fused",
-                        "mega_se",
+                    # Mega-only EP policy, with one carve-out: on backends that
+                    # ship no Mega kernel the DeepEP strategies are the only way
+                    # to run EP at all, so forcing one there is legitimate (and
+                    # is how the two dispatch modes get A/B'd).
+                    if (
+                        cfg.ep_size > 1
+                        and cls.name
+                        not in (
+                            "mega",
+                            "mega_fused",
+                            "mega_se",
+                        )
+                        and not (
+                            cls.name in _EP_NON_MEGA_FALLBACKS
+                            and not _mega_kernel_available()
+                        )
                     ):
                         raise RuntimeError(
                             "DSV4 EP MoE requires MegaMoEStrategy. "
@@ -325,19 +369,13 @@ def select_strategy(
         # the int8-capable LocalLoop local compute) when it can handle the cfg.
         # Backends that DO ship the kernel keep the strict Mega-only EP policy
         # (fallback intentionally disabled there).
-        _mega_kernel_available = False
-        try:
-            import deep_gemm as _dg
-
-            _mega_kernel_available = hasattr(_dg, "fp8_fp4_mega_moe")
-        except Exception:
-            _mega_kernel_available = False
-        if not _mega_kernel_available:
-            deepep_cls = next(
-                (c for c in _STRATEGY_PRIORITY if c.name == "deepep"), None
-            )
-            if deepep_cls is not None and deepep_cls.can_handle(cfg):
-                return deepep_cls
+        if not _mega_kernel_available():
+            for _name in _EP_NON_MEGA_FALLBACKS:
+                deepep_cls = next(
+                    (c for c in _STRATEGY_PRIORITY if c.name == _name), None
+                )
+                if deepep_cls is not None and deepep_cls.can_handle(cfg):
+                    return deepep_cls
         from rtp_llm.models_py.modules.dsv4.moe.mega_buf import (
             _mega_moe_disabled_or_unavailable_reason,
         )

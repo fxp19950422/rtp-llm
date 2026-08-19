@@ -69,7 +69,11 @@ def decode_output_proj(
                 inverse=True,
             )
         o = o.reshape(bsz, q_len, attn.n_groups, -1)
-        wo_a = (attn._wo_a_int8_w.to(torch.float32) * attn._wo_a_int8_s).to(o.dtype)
+        # ``_wo_a_bf16`` is dequantized once in AttentionFP8.__init__ (wo_a is a
+        # per-layer constant). It used to be rebuilt here on every decode step
+        # (2 copies + 1 mul over [G, R, K] x 43 layers), which dominated decode
+        # GPU time after the W8A8 linear migration.
+        wo_a = attn._wo_a_bf16
         o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
         out = attn._lin(attn.wo_b, o.flatten(2))
         if attn.tp_size > 1:

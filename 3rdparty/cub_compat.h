@@ -16,7 +16,12 @@
 #ifndef RTP_LLM_3RDPARTY_CUB_COMPAT_H_
 #define RTP_LLM_3RDPARTY_CUB_COMPAT_H_
 
-#if defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ >= 13
+// Gate on CUB version, not just CUDA major: CCCL 3.x removed cub::Max/Min/Sum and
+// moved the iterators to thrust::, but the PPU SDK's CUDA 13 ships CUB 2.5.0
+// (CUB_VERSION 200500) which still provides them; aliasing again there makes every
+// reference ambiguous. (dsv4 890P adaptation)
+#if defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ >= 13 && \
+    (!defined(CUB_VERSION) || CUB_VERSION >= 300000)
 
 #include <cuda/functional>
 #include <thrust/iterator/counting_iterator.h>
@@ -57,6 +62,6 @@ using TransformInputIterator = ::thrust::transform_iterator<ConversionOp, InputI
 
 }  // namespace cub
 
-#endif  // __CUDACC_VER_MAJOR__ >= 13
+#endif  // __CUDACC_VER_MAJOR__ >= 13 && CUB_VERSION >= 300000
 
 #endif  // RTP_LLM_3RDPARTY_CUB_COMPAT_H_

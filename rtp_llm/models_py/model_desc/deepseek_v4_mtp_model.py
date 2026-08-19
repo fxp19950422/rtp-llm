@@ -28,6 +28,7 @@ from rtp_llm.models_py.model_desc.deepseek_v4_model import (
     Dsv4SharedRuntimeBufferStore,
 )
 from rtp_llm.models_py.modules import RMSNorm
+from rtp_llm.models_py.modules.dsv4.moe import ll_chunk_align
 from rtp_llm.models_py.modules.dsv4.chunk_env import (
     DEFAULT_DSV4_CHUNK_TOKENS,
     dsv4_chunk_tokens_from_env,
@@ -58,6 +59,10 @@ class DeepSeekV4MtpModel(DeepSeekV4Model):
             device_resource_config=device_resource_config,
         )
         Dsv4SharedRuntimeBufferStore.enable_mtp_hidden()
+        # Constructing the draft model marks the whole process as an MTP serve:
+        # ll_chunk_align gates its cross-rank vote on this (only MTP serves
+        # inject fake prefills, so only there is the vote rank-uniform).
+        ll_chunk_align.set_mtp_enabled(True)
         # MTP overrides for V4Args. ``DeepSeekV4Mtp._create_config``
         # already sets ``num_layers=1`` and ``layer_compress_ratios=[0]``
         # on the ModelConfig; we additionally drop the hash-router count

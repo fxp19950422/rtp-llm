@@ -129,6 +129,11 @@ class QuantizedLinear(nn.Module):
         self.weight = None
         self.scale = None
         self.scale_gemm = None
+        # W8A8 fast path: [N, 1] fp32 weight scale + capability latch. Both are
+        # resolved lazily (scale in ``bind_int8_weight``, latch on first int8
+        # forward) so non-int8 storages pay nothing.
+        self._int8_w_scale = None
+        self._int8_gemm_ok = None
 
     def bind_fp4_weight(
         self,
@@ -160,6 +165,11 @@ class QuantizedLinear(nn.Module):
         self.weight = weight
         self.scale = scale
         self.scale_gemm = None
+        # Per-out-channel scale normalised to the [N, 1] fp32 contiguous
+        # layout DeepGEMM's dense int8 GEMM consumes as its ``rhs`` scale.
+        self._int8_w_scale = (
+            scale.to(torch.float32).reshape(weight.shape[0], 1).contiguous()
+        )
 
     def dequant_weight(self, out_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
         """Return dequantized [out, in] weight in `out_dtype`.
@@ -218,19 +228,72 @@ class QuantizedLinear(nn.Module):
         )
         return out.to(x.dtype).reshape(*orig_shape[:-1], self.out_features)
 
+    def _int8_forward_w8a8(self, x: torch.Tensor) -> torch.Tensor:
+        """True W8A8: per-token INT8 quant + dense ``gemm_int8_int8_bf16_nt``.
+
+        Reads the int8 weight once instead of dequantizing it to BF16 every
+        call. Collapses N-D input to 2D ``[M, K]`` (the GEMM is 2D) and
+        restores the leading token layout, mirroring ``_fp4_forward_deepgemm``.
+        """
+        from rtp_llm.models_py.modules.dsv4.int8_gemm import (
+            int8_dense_gemm,
+            quantize_per_token_int8,
+        )
+
+        orig_shape = x.shape
+        x_2d = x.reshape(-1, self.in_features)
+        if x_2d.shape[0] == 0:
+            return x.new_empty(*orig_shape[:-1], self.out_features)
+        x_bf = x_2d if x_2d.dtype == torch.bfloat16 else x_2d.to(torch.bfloat16)
+        # ``.contiguous()`` is a no-op call on an already-contiguous tensor but
+        # a full-width copy otherwise; the reshape above keeps contiguity for
+        # the common case, so only pay for it when the caller handed us a view.
+        if not x_bf.is_contiguous():
+            x_bf = x_bf.contiguous()
+        x_i8, x_scale = quantize_per_token_int8(x_bf)
+        y = int8_dense_gemm(x_i8, x_scale, self.weight, self._int8_w_scale)
+        # ``y`` is BF16 from the GEMM; skip the cast when the caller already
+        # wants BF16 (the W8A8 path) instead of always round-tripping.
+        if y.dtype != x.dtype:
+            y = y.to(x.dtype)
+        return y.reshape(*orig_shape[:-1], self.out_features)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.storage == "bf16":
             return F.linear(x, self.weight)
         if self.storage == "fp4":
             return self._fp4_forward_deepgemm(x)
+        if self.storage == "int8":
+            # True W8A8 INT8 GEMM when the PPU kernel is present; otherwise the
+            # exact dequant path below. The capability is latched on first use
+            # (self-check): a kernel that rejects a shape falls back for good.
+            if self._int8_gemm_ok is None:
+                from rtp_llm.models_py.modules.dsv4.int8_gemm import (
+                    has_int8_dense_gemm,
+                )
+
+                self._int8_gemm_ok = has_int8_dense_gemm()
+            if self._int8_gemm_ok:
+                try:
+                    return self._int8_forward_w8a8(x)
+                except Exception as exc:
+                    import logging
+
+                    logging.getLogger(__name__).warning(
+                        "DSV4 INT8 dense GEMM failed (%s); falling back to "
+                        "dequant matmul (in=%d, out=%d).",
+                        exc,
+                        self.in_features,
+                        self.out_features,
+                    )
+                    self._int8_gemm_ok = False
         # FP8 / INT8: dequant weight to x's dtype on the fly.
         #
-        # For INT8 W8A8 this is the correctness path (weights exactly
-        # dequantized to bf16; activations stay bf16). It matches the FP8 path's
-        # current staging. The performant + numerically-W8A8 path -- per-token
-        # int8 activation quant + deep_gemm gemm_int8_int8_bf16_nt against the
-        # per-channel int8 weight -- is a follow-on that first needs the int8
-        # GEMM surfaced through deepgemm_wrapper (the wheel exports it; the
-        # wrapper currently only wraps fp8/fp4).
+        # For INT8 this is now the *fallback* (non-PPU wheels, or a kernel
+        # that rejected the shape above): weights exactly dequantized to bf16,
+        # activations stay bf16. The fast W8A8 path -- per-token int8 activation
+        # quant + deep_gemm ``gemm_int8_int8_bf16_nt`` against the per-channel
+        # int8 weight -- is handled by ``_int8_forward_w8a8`` above. FP8 always
+        # dequants here (its performant path lives in ``CudaFp8DeepGEMMLinear``).
         w = self.dequant_weight(out_dtype=x.dtype)
         return F.linear(x, w)

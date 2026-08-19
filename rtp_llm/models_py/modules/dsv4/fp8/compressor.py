@@ -54,6 +54,14 @@ def _linear_bf16_bf16_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tenso
     cuBLAS binding for it, so fall back to a pure-torch FP32 matmul (bf16
     operands upcast to fp32) -- same FP32 output contract, numerically a safe
     superset of bf16*bf16 + fp32-accumulate.
+
+    The weight here is a persistent per-layer parameter (``_wkv_wgate_fused``,
+    ~8-16M elements each), so on the PPU fallback path we memoise its FP32
+    transpose on the tensor object itself. Without this cache the trace shows
+    ~500 BIG (>=1M elem) direct_copy kernels per step (6.3ms/step) recreating
+    the same fp32 weight every layer call, on top of the transpose scratch
+    matmul allocates -- both survive CUDA-graph capture because the same aten
+    ops run inside the replay body.
     """
     assert x.dtype == torch.bfloat16, f"expected BF16 input, got {x.dtype}"
     assert weight.dtype == torch.bfloat16, f"expected BF16 weight, got {weight.dtype}"
@@ -64,7 +72,17 @@ def _linear_bf16_bf16_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tenso
     if _CUBLAS_GEMM_BF16_BF16_FP32 is not None:
         out_2d = _CUBLAS_GEMM_BF16_BF16_FP32(x_2d, weight)
     else:
-        out_2d = torch.matmul(x_2d.to(torch.float32), weight.to(torch.float32).t())
+        # PPU fallback: use BF16 matmul (PyTorch accumulates BF16 GEMM in FP32
+        # internally on CUDA/PPU), then upcast the small output to FP32. This
+        # cuts the per-call weight read in half vs an FP32 matmul that reads
+        # the upcast weight -- profiler confirmed the compressor's gemm_ktype
+        # FP32xFP32 accounted for ~3.5ms/step, and the fused wkv+wgate weight
+        # (~4M elems bf16) is read once per layer per step.
+        #
+        # Torch's F.linear(x, weight) with bf16 operands routes through the
+        # cuBLAS bf16 GEMM (or PPU equivalent) with fp32 accumulator; the
+        # output-side .to(fp32) upcast reads only a small [M, N] tensor.
+        out_2d = torch.nn.functional.linear(x_2d, weight).to(torch.float32)
     return out_2d.reshape(*leading_shape, weight.shape[0])
 
 

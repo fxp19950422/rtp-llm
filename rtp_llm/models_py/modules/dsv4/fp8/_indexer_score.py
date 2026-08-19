@@ -53,10 +53,30 @@ try:
         _deep_gemm, "get_paged_mqa_logits_metadata"
     )
     _HAS_DEEP_GEMM_MQA = hasattr(_deep_gemm, "fp8_mqa_logits")
+    # The ZW810E SDK's deep_gemm.fp8_mqa_logits took a trailing ``max_seqlen_k``
+    # positional (7 params); the M890P (CUDA13) wheel dropped it -- its signature
+    # is (q, kv_s, weights, ks, ke, clean_logits=True) = 6 params. Detect the
+    # arity once so both the production call and the JIT warmup pass the right
+    # number of args instead of crashing with "takes 5 to 6 ... but 7 were given".
+    import inspect as _inspect
+
+    try:
+        _MQA_LOGITS_NPARAMS = len(
+            _inspect.signature(_deep_gemm.fp8_mqa_logits).parameters
+        )
+    except (TypeError, ValueError):
+        _MQA_LOGITS_NPARAMS = 7
 except ImportError:
     _deep_gemm = None
     _HAS_DEEP_GEMM = False
     _HAS_DEEP_GEMM_MQA = False
+    _MQA_LOGITS_NPARAMS = 7
+
+
+def mqa_logits_takes_max_seqlen() -> bool:
+    """True when the installed deep_gemm.fp8_mqa_logits still accepts the legacy
+    trailing ``max_seqlen_k`` positional (ZW810E SDK). False on the M890P wheel."""
+    return _MQA_LOGITS_NPARAMS >= 7
 
 
 def has_fp8_paged_mqa_logits() -> bool:
@@ -69,6 +89,12 @@ def has_fp8_mqa_logits() -> bool:
 
 _sched_cache: Optional[torch.Tensor] = None
 _num_sms_cache: int = 0
+
+# Max ``next_n`` the deep_gemm paged_mqa_logits kernel accepts in one call
+# (jit_kernels/attention.py asserts ``next_n == 1 or next_n == 2``). Calls wider
+# than this are split along next_n by ``fp8_paged_indexer_score``; MTP verify
+# uses next_n = gen_num_per_cycle + 1, so gen>=3 depends on that split.
+_MAX_PAGED_NEXT_N: int = 2
 
 
 def _get_num_sms(device: torch.device) -> int:
@@ -114,18 +140,58 @@ def fp8_paged_indexer_score(
     kv_4d = kv_pool_uint8.view(num_blocks, block_size, 1, INDEXER_ENTRY_BYTES)
 
     num_sms = _get_num_sms(q_fp8.device)
-    schedule = _deep_gemm.get_paged_mqa_logits_metadata(
-        context_lens, block_size, num_sms
+    B, next_n, H, _D = q_fp8.shape
+
+    if next_n <= _MAX_PAGED_NEXT_N:
+        schedule = _deep_gemm.get_paged_mqa_logits_metadata(
+            context_lens, block_size, num_sms
+        )
+        return _deep_gemm.fp8_paged_mqa_logits(
+            q_fp8.contiguous(),
+            kv_4d,
+            w_fold.contiguous(),
+            context_lens,
+            block_table,
+            schedule,
+            max_ctx_len,
+        )
+
+    # deep_gemm's paged_mqa_logits kernel hard-asserts next_n in {1, 2}
+    # (jit_kernels/attention.py: `assert(next_n == 1 or next_n == 2)`).
+    # MTP verify passes next_n = gen_num_per_cycle + 1, so gen>=3 (next_n>=4)
+    # aborted the whole server with an empty-message AssertionError. Split the
+    # call along next_n into <=2-wide slices and stitch the rows back.
+    #
+    # This is exact, not an approximation: every output row (b, n) depends only
+    # on its own q row and its own context_lens[b, n] against the shared paged
+    # KV pool -- there is no cross-n reduction in the kernel. Row order in the
+    # flattened output is (b, n) major (b * next_n + n), matching the caller's
+    # ``logits.view(bsz, q_len, T_max)``. Loop bounds are static (next_n is
+    # fixed per graph), so this stays CUDA-graph-capture safe.
+    out = torch.empty(
+        (B * next_n, max_ctx_len), dtype=torch.float32, device=q_fp8.device
     )
-    return _deep_gemm.fp8_paged_mqa_logits(
-        q_fp8.contiguous(),
-        kv_4d,
-        w_fold.contiguous(),
-        context_lens,
-        block_table,
-        schedule,
-        max_ctx_len,
-    )
+    out_3d = out.view(B, next_n, max_ctx_len)
+    w_3d = w_fold.view(B, next_n, H)
+    for s in range(0, next_n, _MAX_PAGED_NEXT_N):
+        e = min(s + _MAX_PAGED_NEXT_N, next_n)
+        q_c = q_fp8[:, s:e].contiguous()
+        ctx_c = context_lens[:, s:e].contiguous()
+        w_c = w_3d[:, s:e].reshape(-1, H).contiguous()
+        sched_c = _deep_gemm.get_paged_mqa_logits_metadata(
+            ctx_c, block_size, num_sms
+        )
+        part = _deep_gemm.fp8_paged_mqa_logits(
+            q_c,
+            kv_4d,
+            w_c,
+            ctx_c,
+            block_table,
+            sched_c,
+            max_ctx_len,
+        )
+        out_3d[:, s:e] = part.view(B, e - s, max_ctx_len)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -180,12 +246,16 @@ def fp8_mqa_indexer_score(
     assert cu_seqlen_ks.shape[0] == q_fp8.shape[0]
     assert cu_seqlen_ke.shape[0] == q_fp8.shape[0]
 
-    return _deep_gemm.fp8_mqa_logits(
+    mqa_args = [
         q_fp8.contiguous(),
         (k_quant.contiguous(), k_scale.contiguous()),
         w_fold.contiguous(),
         cu_seqlen_ks.contiguous(),
         cu_seqlen_ke.contiguous(),
         clean_logits,
-        max_seqlen_k,
-    )
+    ]
+    # Legacy ZW810E deep_gemm also took a trailing max_seqlen_k; the M890P wheel
+    # dropped it (clean_logits is the final param). Only pass it when supported.
+    if mqa_logits_takes_max_seqlen():
+        mqa_args.append(max_seqlen_k)
+    return _deep_gemm.fp8_mqa_logits(*mqa_args)

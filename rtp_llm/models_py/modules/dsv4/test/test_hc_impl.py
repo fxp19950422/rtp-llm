@@ -88,7 +88,15 @@ class TestHCImpl(unittest.TestCase):
         reduced = head.head(x)
         self.assertEqual(tuple(reduced.shape), (2, 5, dim))
 
-    def test_factory_default_tilelang_fails_fast_on_cpu(self) -> None:
+    def test_factory_default_selection_order(self) -> None:
+        # Default (no DSV4_HC_IMPL) resolves in priority order
+        # tilelang > triton > fallback, per hc/factory._mode_from_env. Assert
+        # the concrete backend for whichever deps are importable in this env
+        # (PPU has triton but not tilelang; CI CUDA has tilelang).
+        from rtp_llm.models_py.modules.dsv4.hc import factory as hc_factory
+        from rtp_llm.models_py.modules.dsv4.hc.fallback_impl import FallbackHCUnit
+        from rtp_llm.models_py.modules.dsv4.hc.triton_impl import TritonHCUnit
+
         hc, dim = 4, 16
         fn, base, scale = _weights(hc, dim)
         with _env("DSV4_HC_IMPL", None):
@@ -102,10 +110,16 @@ class TestHCImpl(unittest.TestCase):
                 norm_eps=1e-6,
                 hc_eps=1e-6,
             )
-        self.assertIsInstance(unit, TileLangHCUnit)
-        x = torch.randn(2, 5, hc, dim, dtype=torch.bfloat16)
-        with self.assertRaises(RuntimeError):
-            unit.pre(x)
+        if hc_factory._tilelang_available():
+            self.assertIsInstance(unit, TileLangHCUnit)
+            # TileLang fails fast on CPU (no kernel), never silently falls back.
+            x = torch.randn(2, 5, hc, dim, dtype=torch.bfloat16)
+            with self.assertRaises(RuntimeError):
+                unit.pre(x)
+        elif hc_factory._triton_available():
+            self.assertIsInstance(unit, TritonHCUnit)
+        else:
+            self.assertIsInstance(unit, FallbackHCUnit)
 
     def test_tilelang_none_result_is_not_fallback(self) -> None:
         hc, dim = 4, 16
@@ -422,6 +436,91 @@ class TestHCImpl(unittest.TestCase):
             except RuntimeError as exc:
                 self.skipTest(str(exc))
         torch.testing.assert_close(tk_y, ref_y, atol=2e-2, rtol=2e-2)
+
+
+class TestTritonHCImpl(unittest.TestCase):
+    """TritonHCUnit / TritonHCHead must match the PyTorch fallback numerically.
+
+    Constructs both backends directly with identical weights (so tilelang
+    availability is irrelevant) and compares every output. Requires CUDA:
+    Triton kernels only run on device.
+    """
+
+    def _build_pair(self, hc, dim, iters, device):
+        from rtp_llm.models_py.modules.dsv4.hc.triton_impl import TritonHCUnit
+
+        fn, base, scale = _weights(hc, dim, device=device)
+        common = dict(
+            dim=dim,
+            hc_mult=hc,
+            hc_sinkhorn_iters=iters,
+            norm_eps=1e-6,
+            hc_eps=1e-6,
+        )
+        fb = FallbackHCUnit(fn, base, scale, **common)
+        tr = TritonHCUnit(fn, base, scale, **common)
+        return fb, tr
+
+    def _assert_pre_close(self, fb, tr, x):
+        # Guard against a silent Triton->fallback: if the kernel path is not
+        # actually taken, this test would compare fallback-vs-fallback and
+        # pass vacuously. Reset the module fail-latch and assert it stays clear.
+        import rtp_llm.models_py.modules.dsv4.hc.triton_impl as ti
+
+        ti._TRITON_FAIL_LOGGED = False
+        with torch.inference_mode():
+            ref_y, ref_post, ref_comb = fb.pre(x)
+            tk_y, tk_post, tk_comb = tr.pre(x)
+        self.assertFalse(
+            ti._TRITON_FAIL_LOGGED,
+            "TritonHCUnit.pre silently fell back to PyTorch; kernel path not exercised",
+        )
+        self.assertEqual(tuple(tk_y.shape), tuple(ref_y.shape))
+        self.assertEqual(tuple(tk_post.shape), tuple(ref_post.shape))
+        self.assertEqual(tuple(tk_comb.shape), tuple(ref_comb.shape))
+        # comb/post are fp32 (same 20-iter Sinkhorn, only fp assoc differs).
+        torch.testing.assert_close(tk_comb, ref_comb, atol=1e-3, rtol=1e-3)
+        torch.testing.assert_close(tk_post, ref_post, atol=1e-3, rtol=1e-3)
+        # y is bf16 (readout).
+        torch.testing.assert_close(tk_y, ref_y, atol=2e-2, rtol=2e-2)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_triton_pre_matches_fallback_flat(self) -> None:
+        hc, dim = 4, 128
+        fb, tr = self._build_pair(hc, dim, iters=20, device="cuda")
+        for T in (1, 5):
+            x = torch.randn(T, hc, dim, device="cuda", dtype=torch.bfloat16)
+            self._assert_pre_close(fb, tr, x)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_triton_pre_matches_fallback_batched(self) -> None:
+        hc, dim = 4, 128
+        fb, tr = self._build_pair(hc, dim, iters=20, device="cuda")
+        x = torch.randn(2, 3, hc, dim, device="cuda", dtype=torch.bfloat16)
+        self._assert_pre_close(fb, tr, x)
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_triton_head_matches_fallback(self) -> None:
+        from rtp_llm.models_py.modules.dsv4.hc.triton_impl import TritonHCHead
+        import rtp_llm.models_py.modules.dsv4.hc.triton_impl as ti
+
+        hc, dim = 4, 128
+        fn, base, scale = _weights(hc, dim, device="cuda")
+        common = dict(dim=dim, hc_mult=hc, norm_eps=1e-6, hc_eps=1e-6)
+        fb = FallbackHCHead(fn[:hc], base[:hc], scale[:1], **common)
+        tr = TritonHCHead(fn[:hc], base[:hc], scale[:1], **common)
+        for shape in ((1, hc, dim), (5, hc, dim), (2, 3, hc, dim)):
+            ti._TRITON_FAIL_LOGGED = False
+            x = torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
+            with torch.inference_mode():
+                ref = fb.head(x)
+                got = tr.head(x)
+            self.assertFalse(
+                ti._TRITON_FAIL_LOGGED,
+                "TritonHCHead.head silently fell back to PyTorch",
+            )
+            self.assertEqual(tuple(got.shape), tuple(ref.shape))
+            torch.testing.assert_close(got, ref, atol=2e-2, rtol=2e-2)
 
 
 if __name__ == "__main__":
