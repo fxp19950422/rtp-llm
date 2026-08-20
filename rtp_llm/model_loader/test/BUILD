@@ -13,6 +13,18 @@ py_test(
 )
 
 py_test(
+    name = "test_dsv4_checkpoint_inventory",
+    srcs = [
+        "dsv4_checkpoint_inventory.py",
+        "test_dsv4_checkpoint_inventory.py",
+    ],
+    deps = py_test_deps + [
+        "//rtp_llm/models_py/standalone:auto_model",
+    ],
+    env = {"CUDA_VISIBLE_DEVICES": ""},
+)
+
+py_test(
     name = "test_pure_tp_preshard",
     srcs = ["test_pure_tp_preshard.py"],
     # auto_model: this test imports rtp_llm.models weight infos.
