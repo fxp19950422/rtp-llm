@@ -86,16 +86,46 @@ class LoadConfig(BaseModel):
         # Validator removed - phy2log must be provided explicitly
         return self
 
-    def get_selected_experts(self, layer_id: int, expert_num):
-        selected_experts = range(expert_num)
+    def get_selected_experts(self, layer_id: int, expert_num: int) -> List[int]:
+        """Return the exact expert ownership of this EP rank.
+
+        Expert weights are materialized eagerly, so silently dropping a remainder
+        here corrupts routing while also making per-rank memory estimates wrong.
+        Keep the partition contract strict: every selected physical expert belongs
+        to exactly one EP rank and every EP rank owns the same number of entries.
+
+        ``phy2log`` may intentionally contain duplicate logical expert ids for EPLB;
+        partition its physical slots as-is instead of requiring unique ids.
+        """
+        if self.ep_size <= 0:
+            raise ValueError(f"ep_size must be positive, got {self.ep_size}")
+        if not 0 <= self.ep_rank < self.ep_size:
+            raise ValueError(
+                f"ep_rank must be in [0, {self.ep_size}), got {self.ep_rank}"
+            )
+        if expert_num < 0:
+            raise ValueError(f"expert_num must be non-negative, got {expert_num}")
+
         if self.phy2log:
-            selected_experts = self.phy2log[layer_id]
+            if not 0 <= layer_id < len(self.phy2log):
+                raise ValueError(
+                    f"layer_id must be in [0, {len(self.phy2log)}) when phy2log "
+                    f"is configured, got {layer_id}"
+                )
+            selected_experts = list(self.phy2log[layer_id])
+        else:
+            selected_experts = list(range(expert_num))
+
+        if len(selected_experts) % self.ep_size != 0:
+            raise ValueError(
+                "selected expert count must be divisible by ep_size: "
+                f"count={len(selected_experts)}, ep_size={self.ep_size}, "
+                f"layer_id={layer_id}"
+            )
+
         expert_per_ep = len(selected_experts) // self.ep_size
-        ep_rank = self.ep_rank
-        selected_experts = selected_experts[
-            expert_per_ep * ep_rank : expert_per_ep * (ep_rank + 1)
-        ]
-        return selected_experts
+        start = expert_per_ep * self.ep_rank
+        return selected_experts[start : start + expert_per_ep]
 
     def udpate_layer_experts(
         self,
