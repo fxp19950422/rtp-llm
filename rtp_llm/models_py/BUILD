@@ -8,6 +8,13 @@ py_library(
     visibility = ["//visibility:public"],
 )
 
+py_library(
+    name = "target_verify_contract",
+    srcs = ["speculative/target_verify_contract.py"],
+    deps = ["//rtp_llm:dsv4_contracts"],
+    visibility = ["//visibility:public"],
+)
+
 # flashinfer-python ships in the cuda12 and cuda13 locks
 flashinfer = ["flashinfer-python"]
 deep = ["deep_gemm", "deep_ep"]
