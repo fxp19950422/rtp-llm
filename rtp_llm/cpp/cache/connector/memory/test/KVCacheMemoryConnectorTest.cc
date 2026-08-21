@@ -7,6 +7,7 @@
 #include <cstring>
 #include <dirent.h>
 #include <execinfo.h>
+#include <map>
 #include <string>
 #include <sys/stat.h>
 #include <thread>
@@ -1007,6 +1008,52 @@ TEST_F(KVCacheMemoryConnectorTest, putToCache_DuplicateDiskItemRollsBackCacheRef
     conn->block_pool_->requestFree(held_memory_blocks);
 }
 
+TEST_F(KVCacheMemoryConnectorTest, allocateBackingsForWrite_PartialFailureRollsBackAllRequestRefs) {
+    const auto mem_size = memoryCacheBlockBytes();
+    ASSERT_GT(mem_size, 0u);
+    auto pool = ensureBlockPool(mem_size);
+    ASSERT_NE(pool, nullptr);
+    const auto free_before = pool->freeBlocksNum();
+    ASSERT_GT(free_before, 1u);
+
+    // Leave exactly one backing available: the first allocation succeeds and
+    // the second must fail, exercising allocateBackingsForWrite's rollback.
+    const auto held = pool->malloc(static_cast<int>(free_before - 1));
+    ASSERT_EQ(held.size(), free_before - 1);
+
+    std::vector<KVCacheMemoryConnector::CopyInfoPerKey> infos(2);
+    infos[0].is_complete = true;
+    infos[1].is_complete = true;
+    EXPECT_FALSE(connector_->allocateBackingsForWrite(infos));
+    EXPECT_EQ(pool->freeBlocksNum(), free_before - held.size());
+
+    pool->requestFree(held);
+    EXPECT_EQ(pool->freeBlocksNum(), free_before);
+}
+
+TEST_F(KVCacheMemoryConnectorTest, putToCache_MemoryBackingTransfersRequestRefBeforeEviction) {
+    const auto mem_size = memoryCacheBlockBytes();
+    ASSERT_GT(mem_size, 0u);
+    auto pool = ensureBlockPool(mem_size);
+    ASSERT_NE(pool, nullptr);
+    const auto free_before = pool->freeBlocksNum();
+
+    KVCacheMemoryConnector::CopyInfoPerKey copy_info;
+    ASSERT_TRUE(connector_->allocateOneBacking(copy_info));
+    ASSERT_EQ(copy_info.backing_type, CacheBackingType::MEMORY);
+    copy_info.cache_key   = 12001;
+    copy_info.is_complete = true;
+    connector_->putToCache(copy_info);
+    EXPECT_TRUE(copy_info.request_released);
+    EXPECT_TRUE(connector_->block_cache_->contains(copy_info.cache_key));
+
+    auto evicted = connector_->block_cache_->popOldestEvictable();
+    ASSERT_TRUE(evicted.has_value());
+    EXPECT_EQ(evicted->block_index, copy_info.mem_block);
+    connector_->releaseCacheBacking(*evicted);
+    EXPECT_EQ(pool->freeBlocksNum(), free_before);
+}
+
 TEST_F(KVCacheMemoryConnectorTest, validateCopyItemBacking_AcceptsUnsetDiskSlotForMemoryOnly) {
     MemoryOperationRequestPB::CopyItem item;
     item.set_backing_type(MemoryOperationRequestPB::MEMORY);
@@ -1901,6 +1948,47 @@ TEST_F(KVCacheMemoryConnectorTest, buildCopyPlanForWrite_SkipsHCAStateSlots) {
     EXPECT_EQ(plan->copy_infos[1].gpu_blocks, (std::vector<BlockIdxType>{12, 62, 2, 22, 32, 42, 62}));
 }
 
+TEST_F(KVCacheMemoryConnectorTest, typedPoolResolver_CoversAllSevenDsv4PoolTags) {
+    auto cfg    = createDsv4TypedConnectorConfig();
+    auto kv_cfg = kv_cache_config_;
+    kv_cfg.memory_cache_size_mb           = 64;
+    kv_cfg.memory_cache_sync_timeout_ms   = 1000;
+    kv_cfg.enable_prefix_tree_memory_cache = false;
+
+    auto conn = std::make_shared<KVCacheMemoryConnector>(cfg, kv_cfg, allocator_, server_addrs_);
+    conn->block_cache_ = std::make_shared<MemoryDiskBlockCache>();
+    ASSERT_NO_THROW(conn->initBlockPool());
+
+    const std::map<std::string, CacheBlockKind> expected = {
+        {"csa_kv", CacheBlockKind::COMPRESSED_KV},
+        {"hca_kv", CacheBlockKind::COMPRESSED_KV},
+        {"indexer_kv", CacheBlockKind::COMPRESSED_KV},
+        {"indexer_state", CacheBlockKind::STATE_SWA_KV},
+        {"csa_state", CacheBlockKind::STATE_SWA_KV},
+        {"swa_kv", CacheBlockKind::STATE_SWA_KV},
+    };
+    std::map<std::string, size_t> seen;
+    for (const auto& slot : conn->layerTagSlots()) {
+        const auto it = expected.find(slot.tag);
+        ASSERT_NE(it, expected.end()) << "unexpected typed slot tag=" << slot.tag;
+        EXPECT_EQ(conn->kindForSlot(slot), it->second);
+        auto pool = conn->memoryPoolFor(it->second);
+        ASSERT_NE(pool, nullptr) << "missing pool for tag=" << slot.tag;
+        EXPECT_EQ(slot.stride_bytes,
+                  cfg.kvBlockStrideBytesForGroup(static_cast<size_t>(slot.group_id))
+                      + cfg.kvScaleStrideBytesForGroup(static_cast<size_t>(slot.group_id)));
+        ++seen[slot.tag];
+    }
+    EXPECT_EQ(seen.size(), expected.size());
+    EXPECT_EQ(seen["csa_kv"], 1u);
+    EXPECT_EQ(seen["hca_kv"], 1u);
+    EXPECT_EQ(seen["indexer_kv"], 1u);
+    EXPECT_EQ(seen["indexer_state"], 1u);
+    EXPECT_EQ(seen["csa_state"], 1u);
+    EXPECT_EQ(seen["swa_kv"], 2u);
+    EXPECT_EQ(seen.count("hca_state"), 0u);
+}
+
 TEST_F(KVCacheMemoryConnectorTest, asyncMatch_ReturnNull_WhenGpuReuseLenGEKeysSize) {
     const size_t                           N = 3;
     CacheKeysType                          cache_keys{70001, 70002, 70003};
@@ -2168,6 +2256,32 @@ TEST_F(KVCacheMemoryConnectorTest, asyncRead_Success_WhenCacheEntryRemovedAfterM
     ASSERT_TRUE(waitUntilDone(ctx));
     EXPECT_TRUE(ctx->success());
     EXPECT_EQ(res->memoryReuseBlockNum(), static_cast<size_t>(read_block_num));
+}
+
+TEST_F(KVCacheMemoryConnectorTest, buildCopyPlanForRead_InFlightSourceReleasedByPlanDeleter) {
+    const CacheKeyType cache_key = 21501;
+    const auto         mem_size  = memoryCacheBlockBytes();
+    ASSERT_GT(mem_size, 0u);
+    auto pool = ensureBlockPool(mem_size);
+    ASSERT_NE(pool, nullptr);
+    const auto block_indices = putItemsToCache({cache_key}, mem_size);
+    ASSERT_EQ(block_indices.size(), 1u);
+
+    auto resource = makeCacheResource({cache_key}, {{1}, {1}, {1}, {1}});
+    auto plan = connector_->buildCopyPlanForRead(
+        resource->cacheKeys(), resource->layerBlocks(), /*start_index=*/0, /*read_num=*/1);
+    ASSERT_NE(plan, nullptr);
+    ASSERT_EQ(plan->copy_infos.size(), 1u);
+
+    // The source is pinned in-flight while the plan is alive, so it cannot be
+    // evicted.  Destroying the plan must release both the source request ref
+    // and the in-flight marker exactly once.
+    EXPECT_FALSE(connector_->block_cache_->popOldestEvictable().has_value());
+    plan.reset();
+    auto evicted = connector_->block_cache_->popOldestEvictable();
+    ASSERT_TRUE(evicted.has_value());
+    EXPECT_EQ(evicted->block_index, block_indices[0]);
+    connector_->releaseCacheBacking(*evicted);
 }
 
 TEST_F(KVCacheMemoryConnectorTest, asyncRead_Success_IncrementsReuseLen_ByMatchedPrefix) {
