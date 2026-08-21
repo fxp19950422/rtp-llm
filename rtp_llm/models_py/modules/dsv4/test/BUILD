@@ -207,6 +207,36 @@ py_test(
     target_compatible_with = _DSV4_CUDA13_ONLY,
 )
 
+# T15 numerical contracts are CPU-capable and intentionally remain compatible
+# on non-CUDA platforms. The router target contains an additional actual
+# Triton-fused case that reports UNVERIFIED/skipped when CUDA is unavailable.
+py_test(
+    name = "test_v4_router_contract",
+    srcs = ["test_v4_router_contract.py"],
+    deps = [
+        "//rtp_llm/models_py:modules",
+        "//rtp_llm:testlib",
+    ],
+)
+
+py_test(
+    name = "test_v4_local_moe_contract",
+    srcs = ["test_v4_local_moe_contract.py"],
+    deps = [
+        "//rtp_llm/models_py:modules",
+        "//rtp_llm:testlib",
+    ],
+)
+
+py_test(
+    name = "test_v4_tp_reduce_contract",
+    srcs = ["test_v4_tp_reduce_contract.py"],
+    deps = [
+        "//rtp_llm/models_py:modules",
+        "//rtp_llm:testlib",
+    ],
+)
+
 py_test(
     name = "test_indexer_topk_backend",
     srcs = ["test_indexer_topk_backend.py"],
