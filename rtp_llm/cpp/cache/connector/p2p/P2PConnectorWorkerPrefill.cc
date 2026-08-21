@@ -197,6 +197,7 @@ int P2PConnectorWorkerPrefill::sendLayerToPartitions(const std::shared_ptr<Layer
         send_req.unique_key  = partition_layer_key;
         send_req.block_info  = std::move(key_block_infos);
         send_req.deadline_ms = transfer_deadline_ms;
+        send_req.transfer_tag = cache_tag;
 
         ++count;
         sender_->send(send_req,

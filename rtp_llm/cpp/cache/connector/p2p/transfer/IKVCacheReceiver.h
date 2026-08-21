@@ -45,6 +45,8 @@ struct RecvRequest {
     std::string     unique_key;
     KeyBlockInfoMap block_info;
     int64_t         deadline_ms = 0;
+    // Required when descriptor-authorized transport is enabled.
+    std::string     transfer_tag;
 };
 
 using RecvRequestPtr = std::shared_ptr<RecvRequest>;

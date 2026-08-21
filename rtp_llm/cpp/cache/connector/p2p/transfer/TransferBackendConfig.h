@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
+#include <string>
 
 namespace rtp_llm {
 namespace transfer {
@@ -20,6 +22,10 @@ struct TransferBackendConfig {
     int64_t tcp_channel_sweep_interval_calls = 0;
     /// Tcp/Rdma TransferService::waitCheckProc 轮询间隔（微秒）；<=0 时实现侧按 1000（1ms）处理
     int64_t transfer_wait_check_interval_us = 1000;
+    // Explicit opt-in for descriptor-authorized transport.  Empty keeps the
+    // legacy ABI; enabled mode rejects peers without the descriptor hello.
+    bool require_descriptor_handshake = false;
+    std::function<bool(std::string&)> descriptor_wire_provider;
 };
 
 }  // namespace transfer

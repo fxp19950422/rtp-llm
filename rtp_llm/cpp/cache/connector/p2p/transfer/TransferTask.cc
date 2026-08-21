@@ -92,12 +92,12 @@ void TransferTask::notifyDone(bool success, TransferErrorCode error_code, const 
 // ==================== TransferTaskStore ====================
 
 std::shared_ptr<TransferTask>
-TransferTaskStore::addTask(const std::string& unique_key, transfer::KeyBlockInfoMap block_infos, int64_t deadline_ms) {
+TransferTaskStore::addTask(const std::string& unique_key, transfer::KeyBlockInfoMap block_infos, int64_t deadline_ms, std::string transfer_tag) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
     if (task_map_.find(unique_key) != task_map_.end()) {
         return nullptr;
     }
-    auto task             = std::make_shared<TransferTask>(std::move(block_infos), deadline_ms);
+    auto task             = std::make_shared<TransferTask>(std::move(block_infos), deadline_ms, std::move(transfer_tag));
     task_map_[unique_key] = task;
     return task;
 }

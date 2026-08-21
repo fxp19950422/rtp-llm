@@ -51,6 +51,7 @@ P2PConnectorWorkerDecode::buildRecvTasks(const std::vector<std::shared_ptr<Layer
             recv_req.unique_key  = partition_layer_key;
             recv_req.block_info  = std::move(key_block_infos);
             recv_req.deadline_ms = recv_task_deadline_ms;
+            recv_req.transfer_tag = cache_tag;
 
             auto task = receiver_->recv(recv_req);
             if (!task) {

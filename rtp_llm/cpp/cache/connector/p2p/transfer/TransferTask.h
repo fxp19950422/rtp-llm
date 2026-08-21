@@ -17,8 +17,9 @@ namespace transfer {
 /// @brief 单次 recv 任务（一层一个 partition），实现 IKVCacheRecvTask
 class TransferTask: public IKVCacheRecvTask {
 public:
-    TransferTask(KeyBlockInfoMap block_infos, int64_t deadline_ms):
-        block_infos_(std::move(block_infos)), deadline_ms_(deadline_ms), start_time_us_(currentTimeUs()) {}
+    TransferTask(KeyBlockInfoMap block_infos, int64_t deadline_ms, std::string transfer_tag = {}):
+        block_infos_(std::move(block_infos)), deadline_ms_(deadline_ms), transfer_tag_(std::move(transfer_tag)),
+        start_time_us_(currentTimeUs()) {}
     ~TransferTask() override = default;
 
 public:
@@ -34,6 +35,7 @@ public:
     const KeyBlockInfoMap& getBlockInfos() const {
         return block_infos_;
     }
+    const std::string& transferTag() const { return transfer_tag_; }
     void
     notifyDone(bool success, TransferErrorCode error_code = TransferErrorCode::OK, const std::string& error_msg = "");
 
@@ -52,6 +54,7 @@ public:
 private:
     KeyBlockInfoMap block_infos_;
     int64_t         deadline_ms_;
+    std::string     transfer_tag_;
     int64_t         start_time_us_      = 0;
     int64_t         total_cost_time_us_ = 0;
 
@@ -71,7 +74,7 @@ public:
 
     /// @brief 创建并注册一个新的 recv task
     std::shared_ptr<TransferTask>
-    addTask(const std::string& unique_key, KeyBlockInfoMap block_infos, int64_t deadline_ms);
+    addTask(const std::string& unique_key, KeyBlockInfoMap block_infos, int64_t deadline_ms, std::string transfer_tag = {});
 
     /// @brief 按 unique_key 查询 task（不转移所有权）
     std::shared_ptr<TransferTask> getTask(const std::string& unique_key) const;
