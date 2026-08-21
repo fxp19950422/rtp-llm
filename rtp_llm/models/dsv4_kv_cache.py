@@ -51,6 +51,11 @@ from rtp_llm.ops import (
     KVCacheSpecType,
     OpaqueBlockEntryCountMode,
 )
+from rtp_llm.models.dsv4_contracts import (
+    DSV4_SPECULATIVE_C4_MAX_QUERY_LEN,
+    Dsv4StateRingMode,
+    validate_dsv4_speculative_target_query_len,
+)
 
 # Byte-exact FP8 entry sizes of the DSv4 MLA/indexer kernels.  The pools are
 # declared as UINT8 so ``entry_elems`` is a byte count.
@@ -104,44 +109,12 @@ DSV4_FIXED_POOL_TAGS: tuple[str, ...] = (
 )
 
 
-class Dsv4StateRingMode(Enum):
-    """State-ring geometry selected explicitly by the runtime caller."""
-
-    NORMAL = "normal"
-    SPECULATIVE_TARGET_VERIFY = "speculative_target_verify"
-
-
 class Dsv4IndexerCacheMode(Enum):
     """Indexer-cache representation selected explicitly by the caller."""
 
     FOLLOW_KV = "follow_kv"
     FP8 = "fp8"
     FP4 = "fp4"
-
-
-def validate_dsv4_speculative_target_query_len(query_len: int) -> int:
-    """Validate target-verify q_len for the current C4 state-ring ordering.
-
-    State writers currently write all target-verify tokens before compressors
-    read their historical windows.  A 16-entry C4 ring is safe for q_len 1..9;
-    larger batches need a different geometry or write/read ordering.  Keep this
-    helper pure so the T20/T30 runtime wiring can reject unsupported requests
-    without environment-dependent mode inference.
-    """
-    if isinstance(query_len, bool) or not isinstance(query_len, Integral):
-        raise TypeError(
-            "DeepSeek-V4 speculative target query_len must be an integer: "
-            f"value={query_len!r}, type={type(query_len).__name__}"
-        )
-    query_len = int(query_len)
-    if not 1 <= query_len <= DSV4_SPECULATIVE_C4_MAX_QUERY_LEN:
-        raise ValueError(
-            "DeepSeek-V4 speculative target query_len is outside the safe "
-            "C4 state-ring range: "
-            f"query_len={query_len}, supported=1.."
-            f"{DSV4_SPECULATIVE_C4_MAX_QUERY_LEN}"
-        )
-    return query_len
 
 
 def _make_dsv4_desc(

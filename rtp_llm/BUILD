@@ -827,6 +827,12 @@ rename_wheel(
 )
 
 py_library(
+    name = "dsv4_contracts",
+    srcs = ["models/dsv4_contracts.py"],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
     name = "testlib",
     data = [
         "//rtp_llm/test/model_test/fake_test/testdata:testdata",
