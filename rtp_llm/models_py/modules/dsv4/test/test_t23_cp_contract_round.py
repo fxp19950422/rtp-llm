@@ -10,6 +10,7 @@ import contextlib
 import importlib.util
 import sys
 import types
+import traceback
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -267,3 +268,21 @@ def test_indexer_fp4_fp8_mismatch_oracle_rejects(pair):
 @_parametrize([68, 132])
 def test_indexer_matching_geometry_is_accepted_by_independent_oracle(entry):
     _validate_indexer_layout(entry, entry)
+
+
+if __name__ == "__main__":
+    failures = []
+    for name, function in sorted(globals().items()):
+        if not name.startswith("test_") or not callable(function):
+            continue
+        try:
+            function()
+            print("PASS", name)
+        except Exception as error:  # noqa: BLE001 - test harness must report all failures
+            failures.append((name, error))
+            print("FAIL", name, repr(error))
+            traceback.print_exc()
+    if failures:
+        print("FAILED", len(failures))
+        raise SystemExit(1)
+    print("ALL_PASS", len([name for name in globals() if name.startswith("test_")]))
