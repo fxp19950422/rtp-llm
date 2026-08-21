@@ -55,6 +55,10 @@ from rtp_llm.models_py.modules.dsv4.moe.moe_layer import (
     resolve_moe_max_tokens_per_rank,
 )
 from rtp_llm.models_py.modules.dsv4.prefill.forward import forward_prefill
+from rtp_llm.models_py.modules.dsv4.platform_provider import (
+    Dsv4ProviderCapability,
+    resolve_dsv4_platform_provider,
+)
 from rtp_llm.models_py.modules.dsv4.transformer import V4Args, V4Transformer
 from rtp_llm.utils.warmup import model_warm_up_enabled
 from rtp_llm.ops import RoleType
@@ -304,6 +308,12 @@ class DeepSeekV4Model(GptModelBase):
         py_hw_kernel_config=None,
         device_resource_config=None,
     ):
+        self._platform_provider = resolve_dsv4_platform_provider(
+            {
+                Dsv4ProviderCapability.BLOCK,
+                Dsv4ProviderCapability.TRANSFORMER,
+            }
+        )
         super().__init__(
             model_config,
             parallelism_config,
@@ -667,7 +677,12 @@ class DeepSeekV4Model(GptModelBase):
         torch.set_default_dtype(torch.bfloat16)
         try:
             with torch.device("meta"):
-                self.v4 = V4Transformer(self._v4_args, mw=self.weight)
+                self.v4 = self._platform_provider.build_transformer(
+                    V4Transformer,
+                    self._v4_args,
+                    self.weight,
+                    platform_provider=self._platform_provider,
+                )
         finally:
             torch.set_default_dtype(prev_dtype)
         if self._captures_aux_hidden:

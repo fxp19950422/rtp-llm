@@ -20,6 +20,11 @@ from rtp_llm.models_py.modules.dsv4 import _record_tensor as _rt
 from rtp_llm.models_py.modules.dsv4.block import Block
 from rtp_llm.models_py.modules.dsv4.cp import CPContext, build_cp_context
 from rtp_llm.models_py.modules.dsv4.hc import build_hc_head
+from rtp_llm.models_py.modules.dsv4.platform_provider import (
+    Dsv4PlatformProvider,
+    Dsv4ProviderCapability,
+    resolve_dsv4_platform_provider,
+)
 
 
 @dataclass
@@ -157,20 +162,38 @@ def _build_block(
     layer_id: int,
     args: V4Args,
     layer_weights: Optional[Dict[str, torch.Tensor]] = None,
+    platform_provider: Optional[Dsv4PlatformProvider] = None,
 ) -> Block:
-    return Block(**_block_kwargs(layer_id, args, layer_weights))
+    if platform_provider is None:
+        provider = resolve_dsv4_platform_provider({Dsv4ProviderCapability.BLOCK})
+    else:
+        provider = platform_provider
+    return provider.build_block(
+        Block, **_block_kwargs(layer_id, args, layer_weights)
+    )
 
 
 class V4Transformer(nn.Module):
     """Standalone V4 forward. No TP/EP/PP sharding (world_size=1)."""
 
-    def __init__(self, args: V4Args, mw):
+    def __init__(
+        self,
+        args: V4Args,
+        mw,
+        platform_provider: Optional[Dsv4PlatformProvider] = None,
+    ):
         """``mw`` is the framework's ``ModelWeights`` (with ``.global_weights``
         ``Dict[str, Tensor]`` keyed by ``W.*`` enum and ``.weights[layer_id]``
         per-layer dicts).  Required — every dsv4 sub-module reads its
         weights from ``mw`` at construction; there is no unit-test path
         that constructs the transformer with empty weights."""
         super().__init__()
+        if platform_provider is None:
+            self.platform_provider = resolve_dsv4_platform_provider(
+                {Dsv4ProviderCapability.BLOCK}
+            )
+        else:
+            self.platform_provider = platform_provider
         self.args = args
         self.max_seq_len = args.max_seq_len
         self.hc_mult = args.hc_mult
@@ -188,7 +211,12 @@ class V4Transformer(nn.Module):
 
         self.layers = nn.ModuleList(
             [
-                _build_block(i, args, layer_weights=mw.weights[i])
+                _build_block(
+                    i,
+                    args,
+                    layer_weights=mw.weights[i],
+                    platform_provider=self.platform_provider,
+                )
                 for i in range(args.n_layers)
             ]
         )
