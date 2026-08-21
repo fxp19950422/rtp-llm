@@ -15,3 +15,12 @@ py_test(
     ],
     target_compatible_with = _DSV4_CUDA13_ONLY,
 )
+
+py_test(
+    name = "test_target_verify_contract",
+    srcs = ["test_target_verify_contract.py"],
+    deps = [
+        "//rtp_llm:dsv4_contracts",
+        "//rtp_llm/models_py:target_verify_contract",
+    ],
+)
