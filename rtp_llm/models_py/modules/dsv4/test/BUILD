@@ -32,6 +32,14 @@ py_test(
 )
 
 py_test(
+    name = "test_t24_dp_contract_source",
+    srcs = ["test_t24_dp_contract_source.py"],
+    # This is data-only: the test parses checked-in Python sources and never
+    # imports the models library or its native dependencies.
+    data = ["//rtp_llm/models_py:modules"],
+)
+
+py_test(
     name = "test_cp_context_build",
     srcs = ["test_cp_context_build.py"],
     deps = _DSV4_TEST_DEPS,
