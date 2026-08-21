@@ -72,18 +72,18 @@ def _flat_1d(t: torch.Tensor) -> torch.Tensor:
     return t.reshape(-1).contiguous()
 
 
-# Exact SGLang radix-select TopK used by the shared DeepSeek V4 Flash/Pro FP8
-# indexer decode and target-verify path.
-_TOPK_V3_OK = hasattr(rtp_llm_ops, "topk_v3")
+# Ordered kernel candidates used by the shared DeepSeek V4 Flash/Pro FP8
+# indexer decode and target-verify path. Resolve them at call time: the native
+# bindings may finish loading after this module is imported.
+_DECODE_TOPK_CANDIDATES = ("topk_v3", "dsv4_persistent_topk")
+_MISSING_DECODE_TOPK_CANDIDATE = object()
 _FAST_PREFILL_TOPK_OK = hasattr(rtp_llm_ops, "fast_topk_v2_variable")
-_TOPK_V3_WORKSPACE_SIZE = 1024 * 1024  # 1 MB
+_DECODE_TOPK_WORKSPACE_SIZE = 1024 * 1024  # 1 MB
 _FAST_PREFILL_TOPK_MAX_INPUT_TOKENS = 12 * 1024
-_topk_v3_workspace_cache: Dict[torch.device, torch.Tensor] = {}
+_decode_topk_workspace_cache: Dict[torch.device, torch.Tensor] = {}
 
 
 def _topk_v3_enabled() -> bool:
-    if not _TOPK_V3_OK:
-        return False
     return os.environ.get("DSV4_TOPK_V3", "1") != "0"
 
 
@@ -196,34 +196,52 @@ def _fp8_prefill_score_chunk_rows() -> int:
     )
 
 
-def _get_topk_workspace(device: torch.device) -> torch.Tensor:
-    ws = _topk_v3_workspace_cache.get(device)
+def _decode_topk_capture_active(device: torch.device) -> bool:
+    return device.type == "cuda" and torch.cuda.is_current_stream_capturing()
+
+
+def _get_decode_topk_workspace(device: torch.device) -> torch.Tensor:
+    ws = _decode_topk_workspace_cache.get(device)
     if ws is None:
+        if _decode_topk_capture_active(device):
+            raise RuntimeError(
+                "decode TopK workspace must be warmed before graph capture"
+            )
         ws = torch.empty(
-            _TOPK_V3_WORKSPACE_SIZE, dtype=torch.uint8, device=device
+            _DECODE_TOPK_WORKSPACE_SIZE, dtype=torch.uint8, device=device
         )
-        _topk_v3_workspace_cache[device] = ws
+        _decode_topk_workspace_cache[device] = ws
     return ws
 
 
-def _run_topk_v3(
+def _run_decode_topk(
     logits: torch.Tensor,
     lengths: torch.Tensor,
     output: torch.Tensor,
     k: int,
     max_seq_len: int,
 ) -> bool:
-    if k not in (512, 1024, 2048) or not _topk_v3_enabled():
+    if k not in (512, 1024, 2048):
         return False
-    rtp_llm_ops.topk_v3(
-        logits,
-        lengths,
-        output,
-        _get_topk_workspace(logits.device),
-        k,
-        max_seq_len,
-    )
-    return True
+
+    for name in _DECODE_TOPK_CANDIDATES:
+        if name == "topk_v3" and not _topk_v3_enabled():
+            continue
+        op = getattr(rtp_llm_ops, name, _MISSING_DECODE_TOPK_CANDIDATE)
+        if op is _MISSING_DECODE_TOPK_CANDIDATE:
+            continue
+        if not callable(op):
+            raise TypeError(f"decode TopK candidate {name!r} is not callable")
+        op(
+            logits,
+            lengths,
+            output,
+            _get_decode_topk_workspace(logits.device),
+            k,
+            max_seq_len,
+        )
+        return True
+    return False
 
 
 class _IndexerFP8PrefillMeta(NamedTuple):
@@ -674,12 +692,13 @@ class IndexerFP8(PoolBackedModule):
             score = logits.view(bsz, q_len, T_max)
 
             # Flash and Pro share this FP8 indexer. Decode and target verify
-            # both flatten [B, q_len, T] into rows consumed by topk_v3.
+            # both flatten [B, q_len, T] into rows consumed by the selected
+            # decode TopK kernel. The native output order is non-contractual.
             K_eff = min(K, T_max)
             score_2d = score.view(bsz * q_len, T_max)
             lengths_i32 = compressed_len.view(bsz * q_len)
             out_topk_2d = out_topk_buffer.view(bsz * q_len, K)
-            if K_eff <= 0 or not _run_topk_v3(
+            if K_eff <= 0 or not _run_decode_topk(
                 score_2d, lengths_i32, out_topk_2d, K, T_max
             ):
                 out_topk_buffer.fill_(-1)
