@@ -21,6 +21,7 @@ namespace rtp_llm::test {
 
 inline constexpr uint32_t DSV4_FP8_KV_ENTRY_BYTES            = 584;
 inline constexpr uint32_t DSV4_FP8_INDEXER_ENTRY_BYTES       = 132;
+inline constexpr uint32_t DSV4_FP4_INDEXER_ENTRY_BYTES       = 68;
 inline constexpr size_t   DSV4_FP8_MLA_BLOCK_ALIGNMENT_BYTES = 576;
 inline constexpr uint32_t DSV4_SWA_WINDOW_ENTRIES            = 128;
 inline constexpr uint32_t DSV4_SPECULATIVE_C4_STATE_RING_ENTRIES   = 16;
@@ -29,6 +30,12 @@ inline constexpr uint32_t DSV4_SPECULATIVE_C128_STATE_RING_ENTRIES = 256;
 enum class Dsv4StateRingMode {
     NORMAL,
     SPECULATIVE_TARGET_VERIFY,
+};
+
+enum class Dsv4IndexerCacheMode {
+    FOLLOW_KV,
+    FP8,
+    FP4,
 };
 
 inline size_t alignDsv4Fp8KvBlockBytes(size_t natural, size_t extra_multiple = 1) {
@@ -339,7 +346,8 @@ inline void setHybridAttentionKvCacheSpecs(ModelConfig& model_config) {
 
 inline void setDsv4KvCacheSpecs(ModelConfig&             model_config,
                                 const std::vector<int>&  layer_compress_ratios,
-                                Dsv4StateRingMode state_ring_mode = Dsv4StateRingMode::NORMAL) {
+                                Dsv4StateRingMode state_ring_mode = Dsv4StateRingMode::NORMAL,
+                                Dsv4IndexerCacheMode indexer_cache_mode = Dsv4IndexerCacheMode::FOLLOW_KV) {
     const int layer_num = static_cast<int>(model_config.num_layers);
     model_config.hybrid_attention_config.hybrid_attention_types.assign(static_cast<size_t>(layer_num),
                                                                        HybridAttentionType::NONE);
@@ -347,8 +355,14 @@ inline void setDsv4KvCacheSpecs(ModelConfig&             model_config,
     const bool     fp8_kv = model_config.attn_config.kv_cache_dtype == KvCacheDataType::FP8;
     const uint32_t kv_entry_elems =
         fp8_kv ? DSV4_FP8_KV_ENTRY_BYTES : static_cast<uint32_t>(model_config.attn_config.size_per_head) * 2;
-    const uint32_t indexer_entry_elems =
+    const uint32_t legacy_indexer_entry_elems =
         fp8_kv ? DSV4_FP8_INDEXER_ENTRY_BYTES : static_cast<uint32_t>(model_config.attn_config.indexer_head_dim) * 2;
+    uint32_t indexer_entry_elems = legacy_indexer_entry_elems;
+    if (indexer_cache_mode == Dsv4IndexerCacheMode::FP8) {
+        indexer_entry_elems = DSV4_FP8_INDEXER_ENTRY_BYTES;
+    } else if (indexer_cache_mode == Dsv4IndexerCacheMode::FP4) {
+        indexer_entry_elems = DSV4_FP4_INDEXER_ENTRY_BYTES;
+    }
     const uint32_t head_dim         = static_cast<uint32_t>(model_config.attn_config.size_per_head);
     const uint32_t indexer_head_dim = static_cast<uint32_t>(model_config.attn_config.indexer_head_dim);
 

@@ -1,3 +1,4 @@
+import pickle
 from unittest import TestCase, main
 
 from rtp_llm.config.model_config import ModelConfig
@@ -5,6 +6,7 @@ from rtp_llm.models.deepseek_v4 import DeepSeekV4
 from rtp_llm.models.dsv4_kv_cache import (
     CSA_KV_TAG,
     CSA_STATE_TAG,
+    DSV4_FP4_INDEXER_ENTRY_BYTES,
     DSV4_FP8_INDEXER_ENTRY_BYTES,
     DSV4_FP8_KV_ENTRY_BYTES,
     DSV4_FP8_MLA_BLOCK_ALIGNMENT_BYTES,
@@ -14,6 +16,7 @@ from rtp_llm.models.dsv4_kv_cache import (
     DSV4_SPECULATIVE_C4_STATE_RING_ENTRIES,
     DSV4_SWA_WINDOW_ENTRIES,
     DSV4_TOKENS_PER_BLOCK,
+    Dsv4IndexerCacheMode,
     Dsv4StateRingMode,
     HCA_KV_TAG,
     HCA_STATE_TAG,
@@ -42,6 +45,7 @@ LAYER_COMPRESS_RATIOS = [4, 128, 0, 0, 4]
 HEAD_DIM = 512
 INDEXER_HEAD_DIM = 128
 FRAMEWORK_DEFAULT_TOKENS_PER_BLOCK = 64
+_DEFAULT_INDEXER_CACHE_MODE = object()
 
 
 class Dsv4KvCacheSpecTest(TestCase):
@@ -50,8 +54,9 @@ class Dsv4KvCacheSpecTest(TestCase):
         fp8_kv=True,
         fixed_pool_use_host_memory=False,
         state_ring_mode=Dsv4StateRingMode.NORMAL,
+        indexer_cache_mode=_DEFAULT_INDEXER_CACHE_MODE,
     ):
-        return build_dsv4_kv_cache_spec_descs(
+        kwargs = dict(
             layer_num=len(LAYER_COMPRESS_RATIOS),
             layer_compress_ratios=LAYER_COMPRESS_RATIOS,
             fp8_kv=fp8_kv,
@@ -60,6 +65,9 @@ class Dsv4KvCacheSpecTest(TestCase):
             fixed_pool_use_host_memory=fixed_pool_use_host_memory,
             state_ring_mode=state_ring_mode,
         )
+        if indexer_cache_mode is not _DEFAULT_INDEXER_CACHE_MODE:
+            kwargs["indexer_cache_mode"] = indexer_cache_mode
+        return build_dsv4_kv_cache_spec_descs(**kwargs)
 
     def _by_tag(self, layer_descs):
         return {desc.tag: desc for descs in layer_descs for desc in descs}
@@ -261,11 +269,175 @@ class Dsv4KvCacheSpecTest(TestCase):
         self.assertEqual(by_tag[CSA_STATE_TAG].entry_elems, 4 * HEAD_DIM)
         self.assertEqual(by_tag[HCA_STATE_TAG].entry_elems, 2 * HEAD_DIM)
 
+    def test_default_and_explicit_follow_kv_descriptors_serialize_identically(self):
+        default_descs = self._build()
+        explicit_descs = self._build(
+            indexer_cache_mode=Dsv4IndexerCacheMode.FOLLOW_KV
+        )
+
+        self.assertEqual(
+            pickle.dumps(default_descs, protocol=pickle.HIGHEST_PROTOCOL),
+            pickle.dumps(explicit_descs, protocol=pickle.HIGHEST_PROTOCOL),
+        )
+
+    def test_default_non_fp8_preserves_legacy_descriptor_serialization(self):
+        default_descs = self._build(fp8_kv=False)
+        explicit_compat_descs = self._build(
+            fp8_kv=False,
+            indexer_cache_mode=Dsv4IndexerCacheMode.FOLLOW_KV,
+        )
+        self.assertEqual(
+            self._by_tag(default_descs)[INDEXER_KV_TAG].entry_elems,
+            INDEXER_HEAD_DIM * 2,
+        )
+        self.assertEqual(
+            pickle.dumps(default_descs, protocol=pickle.HIGHEST_PROTOCOL),
+            pickle.dumps(explicit_compat_descs, protocol=pickle.HIGHEST_PROTOCOL),
+        )
+
+    def test_explicit_fp8_is_independent_of_main_kv_dtype(self):
+        for fp8_kv in (True, False):
+            with self.subTest(fp8_kv=fp8_kv):
+                by_tag = self._by_tag(
+                    self._build(
+                        fp8_kv=fp8_kv,
+                        indexer_cache_mode=Dsv4IndexerCacheMode.FP8,
+                    )
+                )
+                self.assertEqual(
+                    by_tag[INDEXER_KV_TAG].entry_elems,
+                    DSV4_FP8_INDEXER_ENTRY_BYTES,
+                )
+
+    def test_explicit_fp4_changes_only_indexer_kv_entry_geometry(self):
+        fp8_descs = self._build(indexer_cache_mode=Dsv4IndexerCacheMode.FP8)
+        fp4_descs = self._build(indexer_cache_mode=Dsv4IndexerCacheMode.FP4)
+        fp8_by_tag = self._by_tag(fp8_descs)
+        fp4_by_tag = self._by_tag(fp4_descs)
+
+        self.assertEqual(
+            fp4_by_tag[INDEXER_KV_TAG].entry_elems,
+            DSV4_FP4_INDEXER_ENTRY_BYTES,
+        )
+        self.assertNotEqual(
+            pickle.dumps(fp8_by_tag[INDEXER_KV_TAG]),
+            pickle.dumps(fp4_by_tag[INDEXER_KV_TAG]),
+        )
+        for tag in fp8_by_tag.keys() - {INDEXER_KV_TAG}:
+            self.assertEqual(
+                pickle.dumps(fp8_by_tag[tag]),
+                pickle.dumps(fp4_by_tag[tag]),
+                tag,
+            )
+
+    def test_indexer_mode_is_independent_of_main_kv_dtype(self):
+        fp8_main = self._by_tag(
+            self._build(fp8_kv=True, indexer_cache_mode=Dsv4IndexerCacheMode.FP4)
+        )
+        non_fp8_main = self._by_tag(
+            self._build(fp8_kv=False, indexer_cache_mode=Dsv4IndexerCacheMode.FP4)
+        )
+        self.assertEqual(
+            fp8_main[INDEXER_KV_TAG].entry_elems,
+            DSV4_FP4_INDEXER_ENTRY_BYTES,
+        )
+        self.assertEqual(
+            non_fp8_main[INDEXER_KV_TAG].entry_elems,
+            DSV4_FP4_INDEXER_ENTRY_BYTES,
+        )
+        self.assertNotEqual(
+            fp8_main[CSA_KV_TAG].entry_elems,
+            non_fp8_main[CSA_KV_TAG].entry_elems,
+        )
+
+    def test_rejects_implicit_or_invalid_indexer_cache_mode(self):
+        for mode in ("fp4", True, 1, None):
+            with self.subTest(mode=mode), self.assertRaisesRegex(
+                TypeError,
+                "indexer_cache_mode must be a Dsv4IndexerCacheMode",
+            ):
+                self._build(indexer_cache_mode=mode)
+
+    def test_fp4_mode_preserves_normal_and_speculative_state_rings(self):
+        for state_ring_mode in (
+            Dsv4StateRingMode.NORMAL,
+            Dsv4StateRingMode.SPECULATIVE_TARGET_VERIFY,
+        ):
+            with self.subTest(state_ring_mode=state_ring_mode):
+                fp8_by_tag = self._by_tag(
+                    self._build(
+                        state_ring_mode=state_ring_mode,
+                        indexer_cache_mode=Dsv4IndexerCacheMode.FP8,
+                    )
+                )
+                fp4_by_tag = self._by_tag(
+                    self._build(
+                        state_ring_mode=state_ring_mode,
+                        indexer_cache_mode=Dsv4IndexerCacheMode.FP4,
+                    )
+                )
+                for tag in (
+                    INDEXER_STATE_TAG,
+                    CSA_STATE_TAG,
+                    HCA_STATE_TAG,
+                    SWA_KV_TAG,
+                ):
+                    self.assertEqual(
+                        pickle.dumps(fp8_by_tag[tag]),
+                        pickle.dumps(fp4_by_tag[tag]),
+                        tag,
+                    )
+
+    def test_fp4_indexer_production_block_split_literal_oracle(self):
+        # Independent SGLang-fork geometry oracle: do not construct expected
+        # values from production constants or from the production writer.
+        raw_tokens_per_page = 256
+        compression_ratio = 4
+        packed_bytes_per_entry = 64
+        scale_bytes_per_entry = 4
+        entries = raw_tokens_per_page // compression_ratio
+        data_bytes = entries * packed_bytes_per_entry
+        scale_bytes = entries * scale_bytes_per_entry
+        physical_bytes = data_bytes + scale_bytes
+
+        self.assertEqual(entries, 64)
+        self.assertEqual((data_bytes, scale_bytes, physical_bytes), (4096, 256, 4352))
+        self.assertEqual(physical_bytes // entries, 68)
+
+        # Raw token 255 completes compressed slot 63 in page 0; raw token 259
+        # completes slot 0 in page 1.  Data and raw UE8M0 scales occupy
+        # separate physical slabs inside the same cache block.
+        for raw_token, expected_page, expected_slot in (
+            (3, 0, 0),
+            (255, 0, 63),
+            (259, 1, 0),
+        ):
+            compressed_position = (raw_token + 1) // compression_ratio - 1
+            page = compressed_position // entries
+            slot = compressed_position % entries
+            self.assertEqual((page, slot), (expected_page, expected_slot))
+
+            data_begin = slot * packed_bytes_per_entry
+            data_end = data_begin + packed_bytes_per_entry
+            scale_begin = data_bytes + slot * scale_bytes_per_entry
+            scale_end = scale_begin + scale_bytes_per_entry
+            self.assertLessEqual(data_end, data_bytes)
+            self.assertGreaterEqual(scale_begin, data_bytes)
+            self.assertLessEqual(scale_end, physical_bytes)
+
+        last_data_end = entries * packed_bytes_per_entry
+        last_scale_end = data_bytes + entries * scale_bytes_per_entry
+        guard_begin = physical_bytes
+        self.assertEqual(last_data_end, 4096)
+        self.assertEqual(last_scale_end, guard_begin)
+
     def test_non_fp8_entry_elems(self):
         by_tag = self._by_tag(self._build(fp8_kv=False))
         self.assertEqual(by_tag[CSA_KV_TAG].entry_elems, HEAD_DIM * 2)
         self.assertEqual(by_tag[HCA_KV_TAG].entry_elems, HEAD_DIM * 2)
         self.assertEqual(by_tag[SWA_KV_TAG].entry_elems, HEAD_DIM * 2)
+        # FOLLOW_KV is the compatibility-only default and preserves the old
+        # non-FP8 indexer width for existing public callers.
         self.assertEqual(by_tag[INDEXER_KV_TAG].entry_elems, INDEXER_HEAD_DIM * 2)
         # Fixed-state entry sizes do not depend on the KV dtype.
         self.assertEqual(by_tag[INDEXER_STATE_TAG].entry_elems, 4 * INDEXER_HEAD_DIM)

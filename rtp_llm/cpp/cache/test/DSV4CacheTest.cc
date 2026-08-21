@@ -230,6 +230,14 @@ static std::vector<int> makeProLayerCompressRatios() {
     return ratios;
 }
 
+static std::vector<int> makeFlashLayerCompressRatios() {
+    std::vector<int> ratios = {0, 0};
+    for (int i = 2; i < 43; ++i) {
+        ratios.push_back((i % 2 == 0) ? 4 : 128);
+    }
+    return ratios;
+}
+
 static ModelConfig makeProModelConfig() {
     ModelConfig mc;
     mc.num_layers                                                = 61;
@@ -260,13 +268,9 @@ static ModelConfig makeFlashModelConfig() {
     mc.attn_config.indexer_head_num = 64;
     mc.attn_config.indexer_topk     = 512;
     mc.attn_config.tokens_per_block = kDsv4TokensPerBlock;
-    std::vector<int> ratios         = {0, 0};
-    for (int i = 2; i < 43; i++) {
-        ratios.push_back((i % 2 == 0) ? 4 : 128);
-    }
     mc.hybrid_attention_config.enable_hybrid_attention           = true;
     mc.hybrid_attention_config.enable_independent_kv_cache_pools = true;
-    setDsv4KvCacheSpecs(mc, ratios);
+    setDsv4KvCacheSpecs(mc, makeFlashLayerCompressRatios());
     return mc;
 }
 
@@ -714,6 +718,78 @@ TEST(HybridPoolConfigCreatorTest, FlashProduction256GeometryUsesSevenExactPoolSt
     EXPECT_EQ(config.specForGroup(gidForTag(config, "csa_state"))->block_size_bytes(), 8u * 2048u * 4u);
     EXPECT_EQ(config.specForGroup(gidForTag(config, "hca_state"))->block_size_bytes(), 128u * 1024u * 4u);
     EXPECT_EQ(config.specForGroup(gidForTag(config, "swa_kv"))->block_size_bytes(), 74880u);
+}
+
+TEST(HybridPoolConfigCreatorTest, FlashProduction256Fp4IndexerUsesEmbeddedScaleStride) {
+    auto mc                                = makeFlashModelConfig();
+    mc.attn_config.kv_cache_dtype          = KvCacheDataType::FP8;
+    mc.attn_config.tokens_per_block        = 256;
+    mc.attn_config.kernel_tokens_per_block = 256;
+    setDsv4KvCacheSpecs(
+        mc, makeFlashLayerCompressRatios(), Dsv4StateRingMode::NORMAL, Dsv4IndexerCacheMode::FP4);
+
+    ParallelismConfig pc;
+    auto              config = CacheConfigCreator::createBasicConfig(mc, pc, false, 0);
+    const auto  indexer_gid  = gidForTag(config, "indexer_kv");
+    const auto& indexer_spec = config.specForGroup(indexer_gid);
+
+    ASSERT_NE(indexer_spec, nullptr);
+    EXPECT_EQ(indexer_spec->tag, "indexer_kv");
+    EXPECT_EQ(indexer_spec->block_payload_bytes(), 64u * 68u);
+    EXPECT_EQ(indexer_spec->block_size_bytes(), 4352u);
+    EXPECT_EQ(indexer_spec->scale_block_size_bytes(), 0u);
+    EXPECT_EQ(config.kvBlockStrideBytesForGroup(indexer_gid), 4352u);
+
+    const auto pool_config = BlockPoolConfigHelper::createConfigForGroup(config, indexer_gid);
+    ASSERT_EQ(pool_config.memory_layouts.size(), 1u);
+    EXPECT_EQ(pool_config.memory_layouts[0].kv_block_stride_bytes, 4352u);
+}
+
+TEST(HybridPoolConfigCreatorTest, Fp8AndFp4IndexerFingerprintsAreNotEquivalent) {
+    auto fp8_mc                                = makeFlashModelConfig();
+    fp8_mc.attn_config.kv_cache_dtype          = KvCacheDataType::FP8;
+    fp8_mc.attn_config.tokens_per_block        = 256;
+    fp8_mc.attn_config.kernel_tokens_per_block = 256;
+    setDsv4KvCacheSpecs(
+        fp8_mc, makeFlashLayerCompressRatios(), Dsv4StateRingMode::NORMAL, Dsv4IndexerCacheMode::FP8);
+
+    auto fp4_mc                                = fp8_mc;
+    setDsv4KvCacheSpecs(
+        fp4_mc, makeFlashLayerCompressRatios(), Dsv4StateRingMode::NORMAL, Dsv4IndexerCacheMode::FP4);
+
+    ParallelismConfig pc;
+    auto              fp8_config = CacheConfigCreator::createBasicConfig(fp8_mc, pc, false, 0);
+    auto              fp4_config = CacheConfigCreator::createBasicConfig(fp4_mc, pc, false, 0);
+    const auto& fp8_spec = fp8_config.specForGroup(gidForTag(fp8_config, "indexer_kv"));
+    const auto& fp4_spec = fp4_config.specForGroup(gidForTag(fp4_config, "indexer_kv"));
+
+    ASSERT_NE(fp8_spec, nullptr);
+    ASSERT_NE(fp4_spec, nullptr);
+    EXPECT_EQ(fp8_spec->tag, fp4_spec->tag);
+    EXPECT_EQ(fp8_spec->block_size_bytes(), 8448u);
+    EXPECT_EQ(fp4_spec->block_size_bytes(), 4352u);
+    EXPECT_NE(fp8_spec->fingerprint(), fp4_spec->fingerprint());
+}
+
+TEST(HybridPoolConfigCreatorTest, MixedIndexerGeometryForOneTagFailsFast) {
+    auto mc                                = makeFlashModelConfig();
+    mc.attn_config.kv_cache_dtype          = KvCacheDataType::FP8;
+    mc.attn_config.tokens_per_block        = 256;
+    mc.attn_config.kernel_tokens_per_block = 256;
+    setDsv4KvCacheSpecs(
+        mc, makeFlashLayerCompressRatios(), Dsv4StateRingMode::NORMAL, Dsv4IndexerCacheMode::FP8);
+
+    bool mutated_one_indexer = false;
+    for (auto& desc : mc.kv_cache_spec_descs.at(4)) {
+        if (desc.tag == "indexer_kv") {
+            desc.entry_elems    = DSV4_FP4_INDEXER_ENTRY_BYTES;
+            mutated_one_indexer = true;
+        }
+    }
+    ASSERT_TRUE(mutated_one_indexer);
+
+    ParallelismConfig pc;
+    EXPECT_THROW((void)CacheConfigCreator::createBasicConfig(mc, pc, false, 0), std::exception);
 }
 
 TEST(HybridPoolConfigCreatorTest, SpeculativeTargetVerifyKeepsExplicitDoubleRingGeometry) {
