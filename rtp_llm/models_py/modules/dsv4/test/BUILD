@@ -22,6 +22,16 @@ py_test(
 )
 
 py_test(
+    name = "test_t24_dp_contract",
+    srcs = ["test_t24_dp_contract.py"],
+    deps = [
+        "//rtp_llm/models_py:modules",
+        "//rtp_llm:testlib",
+    ],
+    target_compatible_with = _DSV4_CUDA13_ONLY,
+)
+
+py_test(
     name = "test_cp_context_build",
     srcs = ["test_cp_context_build.py"],
     deps = _DSV4_TEST_DEPS,
