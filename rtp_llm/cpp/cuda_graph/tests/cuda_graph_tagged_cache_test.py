@@ -49,6 +49,36 @@ class TaggedSequenceLengthModel:
         return PyModelOutputs(inputs.input_hiddens + signature)
 
 
+class NumericalStatusModel:
+    numerical_status_scope = "origin_row"
+
+    def prepare_fmha_impl(self, inputs: PyModelInputs, is_cuda_graph: bool = False):
+        return None
+
+    def forward(self, inputs: PyModelInputs, fmha_impl=None) -> PyModelOutputs:
+        live_rows = inputs.input_ids.shape[0]
+        inputs.numerical_status.values[:live_rows].bitwise_or_(inputs.input_ids)
+        return PyModelOutputs(inputs.input_hiddens[:, :HIDDEN_SIZE])
+
+
+class CallableNumericalStatusModel(NumericalStatusModel):
+    def __init__(self) -> None:
+        self.scope_calls = 0
+
+    def numerical_status_scope(self) -> str:
+        self.scope_calls += 1
+        return "origin_row"
+
+
+class BatchNumericalStatusModel(NumericalStatusModel):
+    numerical_status_scope = "batch"
+
+    def forward(self, inputs: PyModelInputs, fmha_impl=None) -> PyModelOutputs:
+        flag = inputs.input_ids.ne(0).any().to(torch.int32).reshape(1)
+        inputs.numerical_status.values.bitwise_or_(flag)
+        return PyModelOutputs(inputs.input_hiddens)
+
+
 def _tag_attention_inputs(
     common: PyAttentionInputs, tags: list[str], values: dict[str, int]
 ) -> dict[str, PyAttentionInputs]:
@@ -408,6 +438,187 @@ class TestCudaGraphTaggedCache(unittest.TestCase):
                     output.hidden_states,
                     expected_signature.unsqueeze(0).expand_as(output.hidden_states),
                 )
+
+    def test_numerical_status_uses_fixed_per_graph_storage_and_replay_reset(self) -> None:
+        runner = CudaGraphRunner()
+        runner.init_decode(
+            NumericalStatusModel(),
+            HIDDEN_SIZE,
+            TOKENS_PER_BLOCK,
+            TOKENS_PER_BLOCK,
+            TOKENS_PER_BLOCK,
+            [2, 4],
+            GROUP_TAGS,
+        )
+
+        first = _build_decode_inputs(GROUP_TAGS, {"full": 0, "aux": 0}, batch_size=1)
+        first.input_ids.fill_(7)
+        self.assertTrue(runner.canRun(first))
+        first_output = runner.forward(first)
+        torch.cuda.synchronize()
+        self.assertEqual(first_output.numerical_status.live_rows, 1)
+        self.assertEqual(first_output.numerical_status.values.numel(), 2)
+        torch.testing.assert_close(
+            first_output.numerical_status.values,
+            torch.tensor([7, 0], dtype=torch.int32, device="cuda"),
+        )
+        with self.assertRaises((AttributeError, TypeError)):
+            first_output.numerical_status = first_output.numerical_status
+        first_address = first_output.numerical_status.values.data_ptr()
+
+        clean = _build_decode_inputs(GROUP_TAGS, {"full": 0, "aux": 0}, batch_size=1)
+        clean.input_ids.zero_()
+        self.assertTrue(runner.canRun(clean))
+        clean_output = runner.forward(clean)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            clean_output.numerical_status.values,
+            torch.zeros(2, dtype=torch.int32, device="cuda"),
+        )
+        self.assertEqual(clean_output.numerical_status.values.data_ptr(), first_address)
+
+        larger = _build_decode_inputs(GROUP_TAGS, {"full": 0, "aux": 0}, batch_size=3)
+        larger.input_ids.copy_(torch.tensor([1, 0, 2], dtype=torch.int32, device="cuda"))
+        self.assertTrue(runner.canRun(larger))
+        larger_output = runner.forward(larger)
+        torch.cuda.synchronize()
+        self.assertEqual(larger_output.numerical_status.live_rows, 3)
+        torch.testing.assert_close(
+            larger_output.numerical_status.values,
+            torch.tensor([1, 0, 2, 0], dtype=torch.int32, device="cuda"),
+        )
+        self.assertNotEqual(larger_output.numerical_status.values.data_ptr(), first_address)
+
+    def test_batch_numerical_status_uses_scalar_storage(self) -> None:
+        runner = CudaGraphRunner()
+        runner.init_decode(
+            BatchNumericalStatusModel(),
+            HIDDEN_SIZE,
+            TOKENS_PER_BLOCK,
+            TOKENS_PER_BLOCK,
+            TOKENS_PER_BLOCK,
+            [2],
+            GROUP_TAGS,
+        )
+
+        failed = _build_decode_inputs(GROUP_TAGS, {"full": 0, "aux": 0}, batch_size=1)
+        failed.input_ids.fill_(1)
+        self.assertTrue(runner.canRun(failed))
+        failed_output = runner.forward(failed)
+        torch.cuda.synchronize()
+        self.assertEqual(failed_output.numerical_status.values.shape, (1,))
+        torch.testing.assert_close(
+            failed_output.numerical_status.values,
+            torch.ones(1, dtype=torch.int32, device="cuda"),
+        )
+
+        clean = _build_decode_inputs(GROUP_TAGS, {"full": 0, "aux": 0}, batch_size=1)
+        clean.input_ids.zero_()
+        self.assertTrue(runner.canRun(clean))
+        clean_output = runner.forward(clean)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(
+            clean_output.numerical_status.values,
+            torch.zeros(1, dtype=torch.int32, device="cuda"),
+        )
+
+    def test_status_scope_callable_is_resolved_once_before_graph_runner(self) -> None:
+        model = CallableNumericalStatusModel()
+        runner = CudaGraphRunner()
+        runner.init_decode(
+            model,
+            HIDDEN_SIZE,
+            TOKENS_PER_BLOCK,
+            TOKENS_PER_BLOCK,
+            TOKENS_PER_BLOCK,
+            [2],
+            GROUP_TAGS,
+        )
+        self.assertEqual(model.scope_calls, 1)
+
+    def test_prefill_status_capacity_uses_captured_input_ids_not_hidden_hold(self) -> None:
+        runner = CudaGraphRunner()
+        runner.init_prefill(
+            NumericalStatusModel(),
+            2,
+            TOKENS_PER_BLOCK,
+            TOKENS_PER_BLOCK,
+            TOKENS_PER_BLOCK,
+            [4],
+            HIDDEN_SIZE,
+            GROUP_TAGS,
+        )
+
+        inputs = _build_prefill_inputs(
+            GROUP_TAGS, {"full": 0, "aux": 0}, seq_len=3
+        )
+        self.assertTrue(runner.canRun(inputs))
+        output = runner.forward(inputs)
+        torch.cuda.synchronize()
+        # The hidden capture hold is 2 * max_seq_len (=16) rows, whereas the
+        # graph-key input_ids view and its status capacity are exactly 4.
+        self.assertEqual(output.numerical_status.values.numel(), 4)
+        self.assertEqual(output.numerical_status.live_rows, 3)
+
+    def test_fixed_mtp_prefill_status_keeps_fixed_input_capacity(self) -> None:
+        runner = CudaGraphRunner()
+        runner.init_prefill(
+            NumericalStatusModel(),
+            2,
+            TOKENS_PER_BLOCK,
+            TOKENS_PER_BLOCK,
+            TOKENS_PER_BLOCK,
+            [2],
+            HIDDEN_SIZE,
+            GROUP_TAGS,
+            2,
+            2,
+        )
+
+        inputs = _build_prefill_inputs(
+            GROUP_TAGS, {"full": 0, "aux": 0}, seq_len=2
+        )
+        inputs.input_hiddens = torch.zeros(
+            (2, HIDDEN_SIZE * 2), dtype=torch.bfloat16, device="cuda"
+        )
+        self.assertTrue(runner.canRun(inputs))
+        output = runner.forward(inputs)
+        torch.cuda.synchronize()
+        self.assertEqual(output.numerical_status.live_rows, 2)
+        self.assertEqual(output.numerical_status.values.numel(), 4)
+
+    def test_numerical_status_source_fence_orders_100_cross_stream_replays(self) -> None:
+        runner = CudaGraphRunner()
+        runner.init_decode(
+            NumericalStatusModel(),
+            HIDDEN_SIZE,
+            TOKENS_PER_BLOCK,
+            TOKENS_PER_BLOCK,
+            TOKENS_PER_BLOCK,
+            [2],
+            GROUP_TAGS,
+        )
+
+        streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+        observed = torch.empty(100, dtype=torch.int32, device="cuda")
+        expected = torch.empty_like(observed)
+        for iteration in range(100):
+            value = iteration % 7 + 1
+            stream = streams[iteration % len(streams)]
+            with torch.cuda.stream(stream):
+                inputs = _build_decode_inputs(
+                    GROUP_TAGS, {"full": 0, "aux": 0}, batch_size=1
+                )
+                inputs.input_ids.fill_(value)
+                self.assertTrue(runner.canRun(inputs))
+                output = runner.forward_with_numerical_status_snapshot(inputs)
+                observed[iteration].copy_(output.numerical_status.values[0])
+                expected[iteration].fill_(value)
+
+        # The source fence and D2D snapshots must make one tail wait sufficient
+        # even though every replay changes streams.
+        torch.cuda.synchronize()
+        torch.testing.assert_close(observed, expected)
 
 
 if __name__ == "__main__":

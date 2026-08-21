@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -432,6 +433,33 @@ Scenario makeMtpScenario() {
     return scenario;
 }
 
+GptModelInputs makeNumericalStatusInputs(int32_t token_count) {
+    RTP_LLM_CHECK_WITH_INFO(token_count > 0 && token_count <= 64,
+                            "numerical-status test token count must be in [1, 64]");
+    auto inputs = makeInputs(/*input_lengths=*/{token_count},
+                             /*request_ids=*/{501},
+                             /*cache_keys=*/{5101},
+                             /*cache_keys_width=*/1,
+                             /*block_ids=*/{1},
+                             /*group_count=*/1,
+                             /*block_table_width=*/1,
+                             /*global_tokens_per_block=*/64,
+                             /*global_stride_bytes=*/16);
+    inputs.pd_separation = false;
+    return inputs;
+}
+
+Scenario makeNumericalStatusScenario(bool enable_micro_batch) {
+    auto config = makeCacheConfig({{"default", 64, 16}});
+    auto layout = makeLayout(config);
+    Scenario scenario{
+        std::move(config), std::move(layout.layout), std::move(layout.base_addresses), makeNumericalStatusInputs(4)};
+    if (enable_micro_batch) {
+        scenario.device_resources.enable_layer_micro_batch = static_cast<int>(MicroBatchType::DS_PREFILL);
+    }
+    return scenario;
+}
+
 Scenario makeScenario(const std::string& name) {
     if (name == "multi_tag") {
         return makeMultiTagScenario();
@@ -445,7 +473,55 @@ Scenario makeScenario(const std::string& name) {
     if (name == "mtp_sub_config") {
         return makeMtpScenario();
     }
+    if (name == "micro_batch_disabled") {
+        return makeNumericalStatusScenario(/*enable_micro_batch=*/true);
+    }
     throw std::invalid_argument("unknown PyWrappedModel cache-store integration scenario: " + name);
+}
+
+void ensureRuntimeInitialized() {
+    static std::once_flag runtime_once;
+    std::call_once(runtime_once, []() {
+        initRuntime(/*device_id=*/0,
+                    /*trace_memory=*/false,
+                    /*enable_comm_overlap=*/false,
+                    MlaOpsType::AUTO);
+    });
+}
+
+GptModelInitParams makeModelParams(const Scenario&                    scenario,
+                                   const std::shared_ptr<KVCacheManager>& manager,
+                                   HWKernelConfig                     hw_kernel_config = {}) {
+    Weights weights;
+    weights.layers.resize(1);
+    GptModelDescription description;
+    description.data_type                    = DataType::TYPE_FP16;
+    description.norm_type                    = NormType::rmsnorm;
+    description.attention_conf.head_num      = 1;
+    description.attention_conf.kv_head_num   = 1;
+    description.attention_conf.size_per_head = 1;
+
+    const auto& active_config = scenario.mtp_cache_config_index.has_value() ?
+                                    manager->getMTPModuleCacheConfig(*scenario.mtp_cache_config_index) :
+                                    manager->cacheConfig();
+    return GptModelInitParams{weights,
+                              description,
+                              scenario.layout,
+                              scenario.model_id,
+                              scenario.parallelism,
+                              std::move(hw_kernel_config),
+                              ProfilingDebugLoggingConfig{},
+                              RuntimeConfig{},
+                              ConcurrencyConfig{},
+                              SpeculativeExecutionConfig{},
+                              scenario.device_resources,
+                              MlaOpsType::AUTO,
+                              /*max_seq_len=*/64,
+                              /*hidden_size=*/1,
+                              active_config.seq_size_per_block,
+                              active_config.kernel_seq_size_per_block,
+                              manager,
+                              scenario.mtp_cache_config_index};
 }
 
 py::dict serializeResult(const RecordingCacheStore& store, const std::map<std::string, uintptr_t>& base_addresses) {
@@ -485,13 +561,7 @@ py::dict serializeResult(const RecordingCacheStore& store, const std::map<std::s
 }
 
 py::dict runPyWrappedModelCacheStoreScenario(py::object py_model, const std::string& scenario_name) {
-    static std::once_flag runtime_once;
-    std::call_once(runtime_once, []() {
-        initRuntime(/*device_id=*/0,
-                    /*trace_memory=*/false,
-                    /*enable_comm_overlap=*/false,
-                    MlaOpsType::AUTO);
-    });
+    ensureRuntimeInitialized();
 
     auto scenario    = makeScenario(scenario_name);
     auto cache_store = std::make_shared<RecordingCacheStore>();
@@ -502,45 +572,144 @@ py::dict runPyWrappedModelCacheStoreScenario(py::object py_model, const std::str
                                                     scenario.parallelism);
     manager->setCacheStore(cache_store);
 
-    Weights weights;
-    weights.layers.resize(1);
-    GptModelDescription description;
-    description.data_type                    = DataType::TYPE_FP16;
-    description.norm_type                    = NormType::rmsnorm;
-    description.attention_conf.head_num      = 1;
-    description.attention_conf.kv_head_num   = 1;
-    description.attention_conf.size_per_head = 1;
+    auto params = makeModelParams(scenario, manager);
 
-    const auto&        active_config = scenario.mtp_cache_config_index.has_value() ?
-                                           manager->getMTPModuleCacheConfig(*scenario.mtp_cache_config_index) :
-                                           manager->cacheConfig();
-    GptModelInitParams params{weights,
-                              description,
-                              scenario.layout,
-                              scenario.model_id,
-                              scenario.parallelism,
-                              HWKernelConfig{},
-                              ProfilingDebugLoggingConfig{},
-                              RuntimeConfig{},
-                              ConcurrencyConfig{},
-                              SpeculativeExecutionConfig{},
-                              scenario.device_resources,
-                              MlaOpsType::AUTO,
-                              /*max_seq_len=*/64,
-                              /*hidden_size=*/1,
-                              active_config.seq_size_per_block,
-                              active_config.kernel_seq_size_per_block,
-                              manager,
-                              scenario.mtp_cache_config_index};
-
+    bool status_ring_configured = false;
+    bool eager_status_allocated = false;
     {
         PyWrappedModel model(params, std::move(py_model));
         if (scenario.replace_cp_processor) {
             model.context_parallel_processor_ = std::make_unique<TestContextParallelProcessor>(scenario.parallelism);
         }
         (void)model.forward(scenario.inputs);
+        status_ring_configured = model.numerical_status_ring_ != nullptr;
+        eager_status_allocated = model.eager_numerical_status_.defined();
     }
-    return serializeResult(*cache_store, scenario.base_addresses);
+    auto result                       = serializeResult(*cache_store, scenario.base_addresses);
+    result["status_ring_configured"] = status_ring_configured;
+    result["eager_status_allocated"] = eager_status_allocated;
+    return result;
+}
+
+py::dict runPyWrappedModelNumericalStatusScenario(py::object                 py_model,
+                                                  const std::vector<int32_t>& live_rows,
+                                                  bool                       hold_leases,
+                                                  bool                       consume_on_aux_stream,
+                                                  int64_t                    expected_throw_index,
+                                                  bool                       read_values) {
+    ensureRuntimeInitialized();
+    RTP_LLM_CHECK_WITH_INFO(!live_rows.empty(), "numerical-status test requires at least one forward");
+
+    auto scenario = makeNumericalStatusScenario(/*enable_micro_batch=*/false);
+    auto manager  = std::make_shared<KVCacheManager>(scenario.manager_config,
+                                                    /*warmup=*/true,
+                                                    /*metrics_reporter=*/nullptr,
+                                                    KVCacheConfig{},
+                                                    scenario.parallelism);
+    auto params = makeModelParams(scenario, manager);
+
+    std::vector<NumericalStatusView> held_statuses;
+    std::vector<torch::Tensor>       observed_values;
+    std::vector<int64_t>             observed_numel;
+    std::vector<int64_t>             observed_live_rows;
+    std::vector<uint64_t>            observed_epochs;
+    std::vector<uintptr_t>           observed_addresses;
+    if (hold_leases) {
+        held_statuses.reserve(live_rows.size());
+    }
+    observed_values.reserve(live_rows.size());
+    observed_numel.reserve(live_rows.size());
+    observed_live_rows.reserve(live_rows.size());
+    observed_epochs.reserve(live_rows.size());
+    observed_addresses.reserve(live_rows.size());
+
+    const std::array producer_streams = {
+        cuda_graph::graphGetStreamFromPool(/*is_high_priority=*/false),
+        cuda_graph::graphGetStreamFromPool(/*is_high_priority=*/true)};
+    const auto consumer_stream = cuda_graph::graphGetStreamFromPool(/*is_high_priority=*/false);
+    {
+        PyWrappedModel model(params, std::move(py_model));
+        for (size_t index = 0; index < live_rows.size(); ++index) {
+            const int32_t                rows = live_rows[index];
+            cuda_graph::GraphStreamGuard producer_guard(producer_streams[index % producer_streams.size()]);
+            GptModelOutputs outputs;
+            bool            caught_expected_failure = false;
+            try {
+                if (rows == 0) {
+                    PyWrappedModel::NumericalStatusSourceFenceGuard status_fence(&model);
+                    auto source = model.prepareEagerNumericalStatus(/*live_rows=*/0);
+                    status_fence.arm(/*used_cuda_graph=*/false);
+                    outputs = model.attachNumericalStatus(
+                        GptModelOutputs{}, source, /*used_cuda_graph=*/false, &status_fence);
+                } else {
+                    auto inputs = makeNumericalStatusInputs(rows);
+                    outputs     = model.forward(inputs);
+                }
+            } catch (const std::exception&) {
+                RTP_LLM_CHECK_WITH_INFO(expected_throw_index == static_cast<int64_t>(index),
+                                        "unexpected numerical-status test forward failure at %zu",
+                                        index);
+                model.releaseBuffers();
+                caught_expected_failure = true;
+            }
+            if (caught_expected_failure) {
+                continue;
+            }
+            RTP_LLM_CHECK_WITH_INFO(expected_throw_index != static_cast<int64_t>(index),
+                                    "numerical-status test expected forward %zu to throw",
+                                    index);
+            auto status = outputs.numerical_status;
+            RTP_LLM_CHECK_WITH_INFO(status.defined(), "numerical-status test model returned NONE status");
+
+            observed_numel.push_back(status.values.numel());
+            observed_live_rows.push_back(status.live_rows);
+            observed_epochs.push_back(status.epoch);
+            observed_addresses.push_back(reinterpret_cast<uintptr_t>(status.values.data_ptr()));
+
+            if (!read_values) {
+                // A lease with no device reader may be dropped without a
+                // consumed event; slot reuse waits on ready_event.
+            } else if (consume_on_aux_stream) {
+                status.waitReady(consumer_stream);
+                cuda_graph::GraphStreamGuard consumer_guard(consumer_stream);
+                observed_values.push_back(status.values.clone());
+                status.markConsumed(consumer_stream);
+            } else {
+                const auto producer_stream = producer_streams[index % producer_streams.size()];
+                status.waitReady(producer_stream);
+                observed_values.push_back(status.values.clone());
+                status.markConsumed(producer_stream);
+            }
+            if (hold_leases) {
+                held_statuses.push_back(std::move(status));
+            }
+            model.releaseBuffers();
+        }
+
+        // One tail synchronization covers every producer, snapshot, auxiliary
+        // consumer, and reuse fence in the sequence. The runtime lifecycle
+        // above never synchronizes the host.
+        cuda_graph::graphDeviceSynchronize();
+    }
+
+    py::list values;
+    for (const auto& device_values : observed_values) {
+        auto cpu_values = device_values.cpu().contiguous();
+        py::list one;
+        const auto* data = cpu_values.data_ptr<int32_t>();
+        for (int64_t i = 0; i < cpu_values.numel(); ++i) {
+            one.append(data[i]);
+        }
+        values.append(std::move(one));
+    }
+
+    py::dict result;
+    result["numel"]     = observed_numel;
+    result["live_rows"] = observed_live_rows;
+    result["epochs"]    = observed_epochs;
+    result["addresses"] = observed_addresses;
+    result["values"]    = std::move(values);
+    return result;
 }
 
 }  // namespace
@@ -552,4 +721,12 @@ PYBIND11_MODULE(libth_pywrapped_model_cache_store_integration_test, m) {
           &rtp_llm::test::runPyWrappedModelCacheStoreScenario,
           py::arg("py_model"),
           py::arg("scenario_name"));
+    m.def("run_numerical_status_scenario",
+          &rtp_llm::test::runPyWrappedModelNumericalStatusScenario,
+          py::arg("py_model"),
+          py::arg("live_rows"),
+          py::arg("hold_leases")          = false,
+          py::arg("consume_on_aux_stream") = false,
+          py::arg("expected_throw_index")  = -1,
+          py::arg("read_values")           = true);
 }
