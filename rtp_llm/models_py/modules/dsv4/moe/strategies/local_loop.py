@@ -94,6 +94,15 @@ def _select_mn_major_scale_for_index(
 class LocalLoopStrategy(RoutedExpertsStrategy):
     name = "local_loop"
 
+    # Explicit orchestration contract consumed by ``MoE``.  Gate emits
+    # normalized (unscaled) route weights for this strategy; Expert/fast paths
+    # apply each weight after W2, and MoE applies route_scale to the routed sum.
+    route_weight_contract = "post_w2_normalized_then_scale_v1"
+
+    # T15 is TP-neutral.  T21 may set/wire a value >1 once it owns the routed
+    # weight sharding; MoE then reduces the routed result before shared add.
+    routed_tp_size = 1
+
     @classmethod
     def can_handle(cls, cfg: MoeCfg) -> bool:
         # Universal fallback — accepts every cfg. Strategy registry order
@@ -270,7 +279,12 @@ class LocalLoopStrategy(RoutedExpertsStrategy):
             idx, top = torch.where(indices == i)
             if idx.numel() == 0:
                 continue
-            y[idx] = y[idx] + expert(x[idx], weights[idx, top, None]).float()
+            contribution = expert(x[idx], weights[idx, top, None]).float()
+            # Hash tables are allowed to repeat an eid in multiple top-k
+            # slots. ``index_add_`` preserves every contribution when ``idx``
+            # contains duplicate token rows; advanced-index assignment would
+            # silently keep only one of them.
+            y.index_add_(0, idx, contribution)
         return y
 
     def _forward_graph_safe(
@@ -293,9 +307,9 @@ class LocalLoopStrategy(RoutedExpertsStrategy):
           * ``mask[N]``      = True iff any topk slot of token routes to i
           * ``per_token_w[N, 1]`` = sum of router weights on slots == i
             (zero for tokens not routed to i)
-          * ``Expert.forward(x, per_token_w)`` applies ``per_token_w *
-            (silu(gate)*up)`` BEFORE the down projection — so unrouted
-            tokens contribute exactly zero without explicit masking.
+          * ``Expert.forward(x, per_token_w)`` applies ``per_token_w`` after
+            the down projection. Unrouted tokens therefore contribute exactly
+            zero without changing the activation seen by W4A4 quantization.
 
         Inefficiency: every expert sees every token (vs. only routed
         tokens in the eager path). For decode (N ≤ max_bs ~32) the
@@ -425,8 +439,6 @@ class LocalLoopStrategy(RoutedExpertsStrategy):
                     gate_f = torch.clamp(gate_f, max=swiglu_limit)
                 sm_fp32 = torch.nn.functional.silu(gate_f) * up_f
 
-            # Apply router weight BEFORE w2 (matches Expert.forward semantics).
-            sm_fp32 = sm_fp32 * router_w  # [1, inter]
             sm_bf16 = sm_fp32.to(torch.bfloat16)
 
             # Quant for w2 input
@@ -446,8 +458,9 @@ class LocalLoopStrategy(RoutedExpertsStrategy):
                 delta,
                 recipe_a=(1, _FP8_BLOCK), recipe_b=(1, _FP4_BLOCK),
             )
-            # Accumulate (router_w already folded into sm above).
-            y.add_(delta.float())
+            # Router weighting is an output operation.  Keeping it after W2
+            # prevents the weight from perturbing W4A4 activation quantization.
+            y.add_(delta.float() * router_w)
 
         return y
 
@@ -571,7 +584,6 @@ class LocalLoopStrategy(RoutedExpertsStrategy):
                         gate_f = torch.clamp(gate_f, max=swiglu_limit)
                     sm_fp32 = torch.nn.functional.silu(gate_f) * up_f
 
-                sm_fp32 = sm_fp32 * router_w
                 sm_bf16 = sm_fp32.to(torch.bfloat16)
 
                 sm_fp8, sm_scale = sgl_per_token_group_quant_fp8(
@@ -589,7 +601,7 @@ class LocalLoopStrategy(RoutedExpertsStrategy):
                     delta,
                     recipe_a=(1, _FP8_BLOCK), recipe_b=(1, _FP4_BLOCK),
                 )
-                # Accumulate into y[n]
-                y[n : n + 1].add_(delta.float())
+                # Apply the route weight only after the W2 projection.
+                y[n : n + 1].add_(delta.float() * router_w)
 
         return y

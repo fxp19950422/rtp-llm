@@ -42,6 +42,20 @@ from .strategies.base import MoeCfg, _resolve_forced, select_strategy
 
 _FINAL_OUT_CACHE: dict[tuple, torch.Tensor] = {}
 _CHUNKED_MOE_LOGGED = False
+_POST_W2_ROUTE_WEIGHT_CONTRACT = "post_w2_normalized_then_scale_v1"
+
+
+def _all_reduce_routed_tp(routed: torch.Tensor) -> torch.Tensor:
+    """Sum a TP-sharded routed result, failing closed without collectives."""
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        raise RuntimeError(
+            "TP-sharded DSV4 routed experts require initialized "
+            "torch.distributed collectives"
+        )
+
+    from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
+
+    return all_reduce(routed, Group.TP)
 
 # Default per-rank MoE prefill chunk size for DeepSeek-V4-Flash long-context
 # serving.  With 1M context and CP=4, a rank can see up to 262144 local tokens.
@@ -144,6 +158,12 @@ class MoE(nn.Module):
     DeepEPStrategy or MegaMoEStrategy handles the cross-rank dispatch.
     """
 
+    # Defaults keep hand-built test doubles and all pre-contract strategies on
+    # the legacy Gate-scaled route-weight path. Real strategy construction
+    # only opts in through an explicit class declaration.
+    _post_w2_route_weight_contract = False
+    _routed_tp_size = 1
+
     def __init__(
         self,
         layer_id: int,
@@ -225,6 +245,15 @@ class MoE(nn.Module):
         )
         forced, strict = _resolve_forced(strategy)
         strategy_cls = select_strategy(cfg, forced=forced, strict=strict)
+        declared_route_contract = vars(strategy_cls).get("route_weight_contract")
+        if declared_route_contract not in (None, _POST_W2_ROUTE_WEIGHT_CONTRACT):
+            raise RuntimeError(
+                f"Unsupported {strategy_cls.__name__}.route_weight_contract="
+                f"{declared_route_contract!r}"
+            )
+        self._post_w2_route_weight_contract = (
+            declared_route_contract == _POST_W2_ROUTE_WEIGHT_CONTRACT
+        )
         # Strategies that fold the shared expert into their routed kernel
         # (MegaMoEFusedStrategy / MegaMoEStrategySE) own the shared-expert
         # weights themselves and produce ``routed + shared`` directly; the
@@ -264,12 +293,48 @@ class MoE(nn.Module):
         # (e.g. LocalLoopStrategy.experts ModuleList) propagate through
         # ``MoE.to(device)``.
         self._strategy = strategy_cls(cfg)
+        if self._post_w2_route_weight_contract:
+            # This is deliberately a required part of the declared contract,
+            # not a best-effort attribute fallback. T21 owns wiring values >1
+            # when routed W2 is actually TP-sharded.
+            self._routed_tp_size = int(self._strategy.routed_tp_size)
+            if self._routed_tp_size < 1:
+                raise ValueError(
+                    f"routed_tp_size must be positive, got {self._routed_tp_size}"
+                )
+            if self._routed_includes_shared:
+                raise RuntimeError(
+                    "post-W2 route weighting requires standalone shared expert"
+                )
         self._gate_pack_static = os.environ.get(
             "MOEDBG", "0"
         ) == "0" and self._strategy.can_use_gate_pack_static(self.gate)
+        if self._post_w2_route_weight_contract and self._gate_pack_static:
+            raise RuntimeError(
+                "post-W2 route weighting does not support fused gate-pack"
+            )
         self._strategy._gate_pack_warmup_enabled = self._gate_pack_static
         self._strategy._gate_pack_route_scale = float(self.gate.route_scale)
         self._strategy.setup_weights(layer_weights)
+
+    def _route(self, x: torch.Tensor, input_ids: torch.Tensor):
+        """Run Gate under the selected strategy's explicit weight contract."""
+        if self._post_w2_route_weight_contract:
+            return self.gate(x, input_ids, include_route_scale=False)
+        return self.gate(x, input_ids)
+
+    def _finish_routed(self, routed: torch.Tensor) -> torch.Tensor:
+        """Apply route scale, then TP reduction, before any shared add."""
+        if not self._post_w2_route_weight_contract:
+            return routed
+
+        routed = routed.float() * float(self.gate.route_scale)
+        tp_size = int(self._routed_tp_size)
+        if tp_size < 1:
+            raise RuntimeError(f"routed_tp_size must be positive, got {tp_size}")
+        if tp_size > 1:
+            routed = _all_reduce_routed_tp(routed)
+        return routed
 
     def _should_chunk(self, tokens: int) -> bool:
         max_tokens = int(self.max_tokens_per_rank)
@@ -327,7 +392,7 @@ class MoE(nn.Module):
             return
 
         with record_function_range("dsv4.moe.gate"):
-            weights, indices = self.gate(x, input_ids)
+            weights, indices = self._route(x, input_ids)
 
         if self._routed_includes_shared:
             # Fused strategy returns ``routed + shared`` directly.
@@ -341,6 +406,7 @@ class MoE(nn.Module):
         try:
             with record_function_range("dsv4.moe.routed_experts"):
                 routed = self._strategy(x, weights, indices)
+                routed = self._finish_routed(routed)
         except Exception:
             with record_function_range("dsv4.moe.shared_expert_finish"):
                 self._shared_executor.finish()
@@ -468,7 +534,7 @@ class MoE(nn.Module):
             if _dbg:
                 self.gate._dbg_prefix = f"L{self.layer_id:02d}_moe_gate"
             try:
-                weights, indices = self.gate(x, input_ids_flat)
+                weights, indices = self._route(x, input_ids_flat)
             finally:
                 if _dbg:
                     self.gate._dbg_prefix = None
@@ -516,6 +582,7 @@ class MoE(nn.Module):
         try:
             with record_function_range("dsv4.moe.routed_experts"):
                 y = self._strategy(x, weights, indices)
+                y = self._finish_routed(y)
         except Exception:
             with record_function_range("dsv4.moe.shared_expert_finish"):
                 self._shared_executor.finish()

@@ -69,12 +69,46 @@ def _select_routes_with_nonfinite_fallback(
     route_scale: float,
     normalize: bool,
     indices: Optional[torch.Tensor] = None,
+    router_logits: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Select routes without exposing non-finite router outputs downstream."""
-    # ranking_scores contains original_scores plus the optional bias, so every
-    # non-finite original score remains non-finite here as well.
-    row_is_finite = torch.isfinite(ranking_scores).all(dim=-1)
+    """Select deterministic routes and contain bad router rows on device.
 
+    ``ranking_scores`` may include the correction bias, while weights always
+    come from ``original_scores``.  Ties are resolved by expert id ascending.
+    A row containing a non-finite router logit, activated score, or ranking
+    score is replaced wholesale with experts ``0..topk-1`` and uniform finite
+    weights.  All decisions stay tensor-side; there is no host synchronization.
+    """
+    if original_scores.dim() != 2 or ranking_scores.shape != original_scores.shape:
+        raise ValueError(
+            "original_scores and ranking_scores must be same-shape 2D tensors, "
+            f"got {tuple(original_scores.shape)} and {tuple(ranking_scores.shape)}"
+        )
+    if ranking_scores.device != original_scores.device:
+        raise ValueError(
+            "ranking_scores must be on the same device as original_scores, got "
+            f"{ranking_scores.device} and {original_scores.device}"
+        )
+    n_tokens, n_experts = original_scores.shape
+    if not 1 <= int(topk) <= n_experts:
+        raise ValueError(f"topk must be in [1, {n_experts}], got {topk}")
+    if router_logits is not None and router_logits.shape != original_scores.shape:
+        raise ValueError(
+            "router_logits must match original_scores, got "
+            f"{tuple(router_logits.shape)} and {tuple(original_scores.shape)}"
+        )
+    if router_logits is not None and router_logits.device != original_scores.device:
+        raise ValueError(
+            "router_logits must be on the same device as original_scores, got "
+            f"{router_logits.device} and {original_scores.device}"
+        )
+
+    row_is_finite = torch.isfinite(original_scores).all(dim=-1)
+    row_is_finite = row_is_finite & torch.isfinite(ranking_scores).all(dim=-1)
+    if router_logits is not None:
+        row_is_finite = row_is_finite & torch.isfinite(router_logits).all(dim=-1)
+
+    supplied_indices = indices is not None
     if indices is None:
         safe_ranking_scores = torch.nan_to_num(
             ranking_scores,
@@ -82,16 +116,51 @@ def _select_routes_with_nonfinite_fallback(
             posinf=-float("inf"),
             neginf=-float("inf"),
         )
-        indices = safe_ranking_scores.topk(topk, dim=-1)[1]
+        # The expert axis is naturally eid-ascending.  Stable descending sort
+        # therefore implements the canonical (score desc, eid asc) ordering.
+        indices = torch.argsort(
+            safe_ranking_scores, dim=-1, descending=True, stable=True
+        )[:, :topk]
+    else:
+        if indices.shape != (n_tokens, topk):
+            raise ValueError(
+                f"indices must have shape {(n_tokens, topk)}, "
+                f"got {tuple(indices.shape)}"
+            )
+        if indices.dtype != torch.long:
+            raise TypeError(f"indices must have dtype torch.long, got {indices.dtype}")
+        if indices.device != original_scores.device:
+            raise ValueError(
+                "indices must be on the same device as scores, got "
+                f"{indices.device} and {original_scores.device}"
+            )
+
+    # Hash routes are supplied by the checkpoint, but a bad score row still
+    # uses the same canonical containment route as learned routing.
+    fallback_indices = torch.arange(
+        topk, dtype=indices.dtype, device=indices.device
+    ).view(1, topk)
+    indices = torch.where(
+        row_is_finite.unsqueeze(-1),
+        indices,
+        fallback_indices.expand(n_tokens, topk),
+    )
+    # ``torch._assert_async`` validates supplied/hash ids on device without a
+    # Python bool conversion (and therefore without a CUDA host sync). Bad rows
+    # have already been replaced, so arbitrary checkpoint ids there are safe.
+    if supplied_indices:
+        torch._assert_async(
+            ((indices >= 0) & (indices < n_experts)).all(),
+            f"finite router rows require expert ids in [0, {n_experts})",
+        )
 
     weights = original_scores.gather(1, indices)
     if normalize:
         weights = weights / (weights.sum(dim=-1, keepdim=True) + 1e-12)
     weights = weights * route_scale
 
-    # A bad router row must not reach MegaMoE. PyTorch topk still returns valid
-    # indices after the replacement above; use uniform finite weights for the
-    # whole row so later quantization/dispatch kernels never consume NaN/Inf.
+    # Use uniform finite weights for the whole bad row so later quantization /
+    # dispatch kernels never consume NaN/Inf.
     fallback_weight = float(route_scale) / float(topk)
     weights = torch.where(
         row_is_finite.unsqueeze(-1),
@@ -173,7 +242,11 @@ class Gate(nn.Module):
         return cached
 
     def forward(
-        self, x: torch.Tensor, input_ids: Optional[torch.Tensor] = None
+        self,
+        x: torch.Tensor,
+        input_ids: Optional[torch.Tensor] = None,
+        *,
+        include_route_scale: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         from rtp_llm.models_py.modules.dsv4 import _record_tensor as _rt
 
@@ -196,8 +269,11 @@ class Gate(nn.Module):
         else:
             x_bf16 = x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16)
             scores = F.linear(x_bf16, self._weight_bf16()).float()
+        router_logits = scores
         if _dbg is not None:
             _rt.record_if_level(2, f"{_dbg}_linear_scores", scores)
+
+        effective_route_scale = float(self.route_scale) if include_route_scale else 1.0
 
         # P2 fast path: fuse softplus+sqrt+bias+topk+normalize for the
         # default V4 score_func='sqrtsoftplus' + non-hash routing.
@@ -206,11 +282,16 @@ class Gate(nn.Module):
             and self.bias is not None
             and _use_fused_gate(self.score_func, x.size(0))
         ):
+            # The fused kernel owns its raw-logit / bias finite guard and
+            # canonical bad-row fallback. For finite FP32 inputs its stable
+            # softplus is finite and non-negative, sqrt is bounded by
+            # sqrt(f32_max), and adding finite FP32 bias cannot overflow.
+            # Returning directly preserves the one-kernel fast path.
             return fused_sqrtsoftplus_gate(
                 scores.contiguous(),
                 self.bias.contiguous(),
                 topk=self.topk,
-                route_scale=float(self.route_scale),
+                route_scale=effective_route_scale,
                 norm_eps=1e-12,
             )
 
@@ -239,7 +320,8 @@ class Gate(nn.Module):
             original_scores,
             scores,
             self.topk,
-            float(self.route_scale),
+            effective_route_scale,
             self.score_func != "softmax",
             indices,
+            router_logits=router_logits,
         )
