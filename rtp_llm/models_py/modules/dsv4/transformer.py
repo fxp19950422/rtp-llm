@@ -169,7 +169,7 @@ def _build_block(
     else:
         provider = platform_provider
     return provider.build_block(
-        Block, **_block_kwargs(layer_id, args, layer_weights)
+        Block, **_block_kwargs(layer_id, args, layer_weights), platform_provider=provider
     )
 
 
@@ -471,6 +471,7 @@ class V4Transformer(nn.Module):
         input_ids: torch.Tensor,  # [T_total] int (== [B] for q_len=1)
         attn_metadata: "DSv4DecodeAttnMetadata",  # type: ignore[name-defined]
         kv_cache=None,
+        numerical_status=None,
     ) -> torch.Tensor:
         """Decode-only forward.
 
@@ -486,7 +487,13 @@ class V4Transformer(nn.Module):
         h = self.embed(input_ids_2d)  # [B, q_len, dim]
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)  # [B, q_len, hc, dim]
         for layer in self.layers:
-            h = layer.forward_decode(h, attn_metadata, input_ids_2d, kv_cache=kv_cache)
+            h = layer.forward_decode(
+                h,
+                attn_metadata,
+                input_ids_2d,
+                kv_cache=kv_cache,
+                numerical_status=numerical_status,
+            )
         h = self._hc_head_reduce(h)  # [B, q_len, dim]
         # Framework RMSNorm wants 2D — flatten to [T_total, dim] and
         # return that directly (the next reshape would no-op anyway).
@@ -501,6 +508,7 @@ class V4Transformer(nn.Module):
         kv_cache=None,
         block_tables_by_type=None,
         sequence_lengths: Optional[torch.Tensor] = None,
+        numerical_status=None,
     ) -> torch.Tensor:
         """Standalone forward.
 
@@ -609,6 +617,7 @@ class V4Transformer(nn.Module):
                 cu_seqlens,
                 kv_cache=kv_cache,
                 block_tables_by_type=block_tables_by_type,
+                numerical_status=numerical_status,
             )
             if _rt_on:
                 _rt.record(f"layer{li:02d}_out", h_flat)

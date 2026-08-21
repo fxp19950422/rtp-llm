@@ -19,6 +19,13 @@ class Dsv4ProviderCapability(str, Enum):
 
     BLOCK = "block"
     TRANSFORMER = "transformer"
+    ATTENTION = "attention"
+    MOE = "moe"
+
+
+class Dsv4AttentionLayout(str, Enum):
+    FLAT = "flat"
+    PADDED = "padded"
 
 
 class Dsv4PlatformProvider(Protocol):
@@ -35,11 +42,20 @@ class Dsv4PlatformProvider(Protocol):
         self, default_factory: Callable[..., Any], *args: Any, **kwargs: Any
     ) -> Any: ...
 
+    def build_attention(
+        self, default_factory: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any: ...
+
+    def build_moe(
+        self, default_factory: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any: ...
+
 
 class DefaultDsv4PlatformProvider:
     """Provider preserving the existing constructors and runtime behavior."""
 
     name = "cuda"
+    attention_layout = Dsv4AttentionLayout.FLAT
     capabilities = frozenset(
         {
             Dsv4ProviderCapability.BLOCK,
@@ -69,6 +85,17 @@ def _normalize_capabilities(
         raise ValueError(f"invalid DSV4 provider capability: {error}") from error
 
 
+def resolve_dsv4_attention_layout(
+    provider: Dsv4PlatformProvider,
+) -> Dsv4AttentionLayout:
+    """Resolve layout only for providers that explicitly own attention."""
+
+    capabilities = _normalize_capabilities(getattr(provider, "capabilities", ()))
+    if Dsv4ProviderCapability.ATTENTION not in capabilities:
+        return Dsv4AttentionLayout.FLAT
+    return Dsv4AttentionLayout(getattr(provider, "attention_layout"))
+
+
 def _validate_provider(provider: Dsv4PlatformProvider) -> None:
     name = getattr(provider, "name", None)
     if not isinstance(name, str) or not name.strip():
@@ -77,6 +104,8 @@ def _validate_provider(provider: Dsv4PlatformProvider) -> None:
     methods = {
         Dsv4ProviderCapability.BLOCK: "build_block",
         Dsv4ProviderCapability.TRANSFORMER: "build_transformer",
+        Dsv4ProviderCapability.ATTENTION: "build_attention",
+        Dsv4ProviderCapability.MOE: "build_moe",
     }
     for capability in capabilities:
         method_name = methods[capability]
@@ -85,6 +114,13 @@ def _validate_provider(provider: Dsv4PlatformProvider) -> None:
                 f"DSV4 provider {name!r} declares {capability.value!r} "
                 f"but has no callable {method_name}"
             )
+    if Dsv4ProviderCapability.ATTENTION in capabilities:
+        try:
+            Dsv4AttentionLayout(getattr(provider, "attention_layout"))
+        except (AttributeError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"DSV4 provider {name!r} must declare a valid attention_layout"
+            ) from error
 
 
 class Dsv4PlatformProviderRegistry:
@@ -193,12 +229,14 @@ def resolve_dsv4_platform_provider(
 
 
 __all__ = [
+    "Dsv4AttentionLayout",
     "DefaultDsv4PlatformProvider",
     "Dsv4PlatformProvider",
     "Dsv4PlatformProviderRegistry",
     "Dsv4ProviderCapability",
     "get_dsv4_platform_provider_capabilities",
     "register_dsv4_platform_provider",
+    "resolve_dsv4_attention_layout",
     "resolve_dsv4_platform_provider",
     "validate_dsv4_platform_provider_capabilities",
 ]

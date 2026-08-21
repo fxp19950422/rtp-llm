@@ -1298,6 +1298,7 @@ class DeepSeekV4Model(GptModelBase):
                 inputs,
                 fmha_impl,
                 prepare_hidden_fn=prep_decode,
+                numerical_status=inputs.numerical_status,
             )
         elif attn.is_prefill:
             return forward_prefill(
@@ -1306,6 +1307,7 @@ class DeepSeekV4Model(GptModelBase):
                 self.parallelism_config,
                 inputs,
                 prepare_hidden_fn=prep_prefill,
+                numerical_status=inputs.numerical_status,
             )
         else:
             return forward_decode(
@@ -1315,4 +1317,5 @@ class DeepSeekV4Model(GptModelBase):
                 inputs,
                 fmha_impl,
                 prepare_hidden_fn=prep_decode,
+                numerical_status=inputs.numerical_status,
             )

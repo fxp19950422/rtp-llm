@@ -299,6 +299,7 @@ def forward_layers(
     input_ids: torch.Tensor,  # [T_total]
     attn_metadata: Any,  # DSv4DecodeAttnMetadata
     prepare_hidden_fn: Optional[Any] = None,
+    numerical_status=None,
 ) -> torch.Tensor:
     """qwen3-style decode per-layer loop. Same body shape as the prefill
     helper (:func:`rtp_llm.models_py.modules.dsv4.prefill.forward.forward_layers`)
@@ -332,7 +333,7 @@ def forward_layers(
         _rt.record("decode_embed_hc_expanded", h)
     capture_ids = frozenset(v4.capture_aux_hidden_layer_ids)
     for layer_idx, layer in enumerate(v4.layers):
-        h = layer.forward_decode(h, attn_metadata, input_ids, kv_cache=kv_cache)
+        h = layer.forward_decode(h, attn_metadata, input_ids, kv_cache=kv_cache, numerical_status=numerical_status)
         if layer_idx in capture_ids:
             v4.capture_aux_hidden(layer_idx, h)
         if _rt_on:
@@ -382,6 +383,7 @@ def forward_decode(
     inputs: Any,  # PyModelInputs
     fmha_impl: Any = None,  # Optional[DSv4DecodeFmhaImpl]
     prepare_hidden_fn: Optional[Any] = None,
+    numerical_status=None,
 ) -> Any:  # PyModelOutputs
     """Batched decode arm — full orchestration used by
     ``DeepSeekV4Model.forward`` dispatcher.
@@ -473,6 +475,7 @@ def forward_decode(
         input_ids,
         meta,
         prepare_hidden_fn=prepare_hidden_fn,
+        numerical_status=numerical_status,
     )  # [B, q_len, dim]
     hidden = h.reshape(B * q_len, v4_args.dim)  # packed [T_total, dim]
     if _fwd_dbg.enabled():

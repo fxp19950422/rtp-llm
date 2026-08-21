@@ -297,6 +297,7 @@ def forward_layers(
     block_tables_by_type: Optional[Dict[str, torch.Tensor]],
     attn_inputs: Optional[PyAttentionInputs] = None,
     prepare_hidden_fn: Optional[Any] = None,
+    numerical_status=None,
 ) -> torch.Tensor:
     """Flat per-layer loop — vLLM-aligned layout.
 
@@ -520,6 +521,7 @@ def forward_layers(
                     cu_seqlens,  # [B+1]
                     kv_cache=kv_cache,
                     block_tables_by_type=block_tables_by_type,
+                    numerical_status=numerical_status,
                 )  # [T, hc, dim]
                 if layer_idx in capture_ids:
                     v4.capture_aux_hidden(layer_idx, h)
@@ -675,6 +677,7 @@ def forward_prefill(
     parallelism_config: Optional[ParallelismConfig],
     inputs: PyModelInputs,
     prepare_hidden_fn: Optional[Any] = None,
+    numerical_status=None,
 ) -> PyModelOutputs:
     """Prefill dispatcher — single :func:`forward_layers` call on the full
     flat ``[T_total]`` batch (vLLM-aligned).
@@ -745,5 +748,6 @@ def forward_prefill(
         block_tables_by_type,
         attn_inputs=attn,
         prepare_hidden_fn=prepare_hidden_fn,
+        numerical_status=numerical_status,
     )  # [T_total, dim]
     return PyModelOutputs(hidden)
