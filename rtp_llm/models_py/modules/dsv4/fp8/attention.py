@@ -2244,6 +2244,7 @@ class AttentionFP8(nn.Module):
             num_heads=self.n_heads,
             topk=self.window_size,
             extra_attn_type=None,
+            extra_index_width=None,
         )
         # opt_flash_mla: pass the per-request SWA effective length so FlashMLA
         # scans only ``min(window, seq_len)`` instead of the full window width.
@@ -2461,6 +2462,7 @@ class AttentionFP8(nn.Module):
             num_heads=self.n_heads,
             topk=win,
             extra_attn_type=cmp_attn_type,
+            extra_index_width=K_cmp,
         )
         # opt_flash_mla: pass per-request effective lengths so FlashMLA scans
         # only the true SWA / compressed widths. ``extra_topk_length`` keyed by
