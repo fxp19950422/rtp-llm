@@ -16,6 +16,8 @@ _PROVIDER_SPEC.loader.exec_module(_PROVIDER_MODULE)
 DefaultDsv4PlatformProvider = _PROVIDER_MODULE.DefaultDsv4PlatformProvider
 Dsv4PlatformProviderRegistry = _PROVIDER_MODULE.Dsv4PlatformProviderRegistry
 Dsv4ProviderCapability = _PROVIDER_MODULE.Dsv4ProviderCapability
+Dsv4AttentionLayout = _PROVIDER_MODULE.Dsv4AttentionLayout
+resolve_dsv4_attention_layout = _PROVIDER_MODULE.resolve_dsv4_attention_layout
 
 
 class _Provider:
@@ -52,6 +54,24 @@ class _BlockOnlyProvider:
 class _InvalidProvider:
     name = "invalid"
     capabilities = frozenset({Dsv4ProviderCapability.TRANSFORMER})
+
+
+class _AttentionProvider(_Provider):
+    capabilities = frozenset(
+        {
+            Dsv4ProviderCapability.BLOCK,
+            Dsv4ProviderCapability.TRANSFORMER,
+            Dsv4ProviderCapability.ATTENTION,
+            Dsv4ProviderCapability.MOE,
+        }
+    )
+    attention_layout = Dsv4AttentionLayout.FLAT
+
+    def build_attention(self, default_factory, *args, **kwargs):
+        return ("attention", default_factory, args, kwargs)
+
+    def build_moe(self, default_factory, *args, **kwargs):
+        return ("moe", default_factory, args, kwargs)
 
 
 class Dsv4PlatformProviderRegistryTest(unittest.TestCase):
@@ -149,6 +169,33 @@ class Dsv4PlatformProviderRegistryTest(unittest.TestCase):
         registry = Dsv4PlatformProviderRegistry()
         with self.assertRaisesRegex(TypeError, "build_transformer"):
             registry.register(_InvalidProvider())
+
+    def test_attention_capability_requires_explicit_layout(self):
+        provider = _AttentionProvider()
+        registry = Dsv4PlatformProviderRegistry()
+        registry.register(provider)
+        self.assertEqual(provider.attention_layout, Dsv4AttentionLayout.FLAT)
+
+        class MissingLayout(_AttentionProvider):
+            attention_layout = None
+
+        with self.assertRaisesRegex(ValueError, "attention_layout"):
+            Dsv4PlatformProviderRegistry().register(MissingLayout())
+
+    def test_non_attention_provider_cannot_override_default_layout(self):
+        class BlockTransformerOnly:
+            capabilities = frozenset(
+                {
+                    Dsv4ProviderCapability.BLOCK,
+                    Dsv4ProviderCapability.TRANSFORMER,
+                }
+            )
+            attention_layout = Dsv4AttentionLayout.PADDED
+
+        self.assertEqual(
+            resolve_dsv4_attention_layout(BlockTransformerOnly()),
+            Dsv4AttentionLayout.FLAT,
+        )
 
 
 class Dsv4PlatformProviderWiringTest(unittest.TestCase):
@@ -257,6 +304,34 @@ class Dsv4PlatformProviderWiringTest(unittest.TestCase):
                 for node in ast.walk(statement)
             )
         )
+
+    def test_dispatchers_accept_explicit_status_and_forward_it(self):
+        transformer_tree = ast.parse(
+            (_DSV4_DIR / "transformer.py").read_text()
+        )
+        for relative, function_name in (
+            ("prefill/forward.py", "forward_prefill"),
+            ("decode/forward.py", "forward_decode"),
+        ):
+            tree = ast.parse((_DSV4_DIR / relative).read_text())
+            function = next(
+                node
+                for node in tree.body
+                if isinstance(node, ast.FunctionDef) and node.name == function_name
+            )
+            self.assertIn(
+                "numerical_status",
+                {arg.arg for arg in function.args.args},
+            )
+            self.assertFalse(
+                any(
+                    isinstance(node, ast.Attribute)
+                    and node.attr == "numerical_status"
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "inputs"
+                    for node in ast.walk(function)
+                )
+            )
 
         build_block = next(
             node
