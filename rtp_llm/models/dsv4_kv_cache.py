@@ -32,6 +32,7 @@ true of ``ModelConfig.kv_cache_spec_descs`` (a ``std::vector<std::vector<...>>``
 mutate the Python list first, then assign it once.
 """
 
+from enum import Enum
 from numbers import Integral
 from typing import Optional, Sequence
 
@@ -66,6 +67,14 @@ DSV4_HCA_STATE_POOL_BLOCKS = 256
 # DSv4's physical KV block is 256 tokens (the CLI default is 64).
 DSV4_TOKENS_PER_BLOCK = 256
 
+# Target-verify writes the whole speculative batch before the compressor reads
+# any historical state.  The speculative geometry therefore uses a double
+# ring for both state-window classes.  C4 is the tighter bound: with 16 entries
+# the current write-all/read-later ordering is collision-free through q_len=9.
+DSV4_SPECULATIVE_C4_STATE_RING_ENTRIES = 16
+DSV4_SPECULATIVE_C128_STATE_RING_ENTRIES = 256
+DSV4_SPECULATIVE_C4_MAX_QUERY_LEN = 9
+
 CSA_LAYER_COMPRESS_RATIO = 4
 HCA_LAYER_COMPRESS_RATIO = 128
 
@@ -89,6 +98,38 @@ DSV4_FIXED_POOL_TAGS: tuple[str, ...] = (
     HCA_STATE_TAG,
     SWA_KV_TAG,
 )
+
+
+class Dsv4StateRingMode(Enum):
+    """State-ring geometry selected explicitly by the runtime caller."""
+
+    NORMAL = "normal"
+    SPECULATIVE_TARGET_VERIFY = "speculative_target_verify"
+
+
+def validate_dsv4_speculative_target_query_len(query_len: int) -> int:
+    """Validate target-verify q_len for the current C4 state-ring ordering.
+
+    State writers currently write all target-verify tokens before compressors
+    read their historical windows.  A 16-entry C4 ring is safe for q_len 1..9;
+    larger batches need a different geometry or write/read ordering.  Keep this
+    helper pure so the T20/T30 runtime wiring can reject unsupported requests
+    without environment-dependent mode inference.
+    """
+    if isinstance(query_len, bool) or not isinstance(query_len, Integral):
+        raise TypeError(
+            "DeepSeek-V4 speculative target query_len must be an integer: "
+            f"value={query_len!r}, type={type(query_len).__name__}"
+        )
+    query_len = int(query_len)
+    if not 1 <= query_len <= DSV4_SPECULATIVE_C4_MAX_QUERY_LEN:
+        raise ValueError(
+            "DeepSeek-V4 speculative target query_len is outside the safe "
+            "C4 state-ring range: "
+            f"query_len={query_len}, supported=1.."
+            f"{DSV4_SPECULATIVE_C4_MAX_QUERY_LEN}"
+        )
+    return query_len
 
 
 def _make_dsv4_desc(
@@ -189,6 +230,27 @@ def _use_host_pinned_memory(desc: KVCacheSpecDesc) -> None:
     desc.capacity = capacity
 
 
+def _apply_dsv4_state_ring_mode(
+    state_ring_mode: Dsv4StateRingMode,
+    indexer_state: KVCacheSpecDesc,
+    csa_state: KVCacheSpecDesc,
+    hca_state: KVCacheSpecDesc,
+    swa_kv: KVCacheSpecDesc,
+) -> None:
+    if state_ring_mode is Dsv4StateRingMode.NORMAL:
+        return
+
+    for desc, entry_count in (
+        (indexer_state, DSV4_SPECULATIVE_C4_STATE_RING_ENTRIES),
+        (csa_state, DSV4_SPECULATIVE_C4_STATE_RING_ENTRIES),
+        (hca_state, DSV4_SPECULATIVE_C128_STATE_RING_ENTRIES),
+        (swa_kv, DSV4_SPECULATIVE_C128_STATE_RING_ENTRIES),
+    ):
+        desc.entry_count_mode = OpaqueBlockEntryCountMode.EXPLICIT
+        desc.explicit_entry_count = entry_count
+        desc.state_ring_include_gen_num_per_cycle = False
+
+
 def apply_dsv4_explicit_pool_blocks(
     layer_descs: Sequence[Sequence[KVCacheSpecDesc]],
     tag: str,
@@ -224,6 +286,7 @@ def build_dsv4_kv_cache_spec_descs(
     head_dim: int,
     indexer_head_dim: int,
     fixed_pool_use_host_memory: bool = False,
+    state_ring_mode: Dsv4StateRingMode = Dsv4StateRingMode.NORMAL,
 ) -> list[list[KVCacheSpecDesc]]:
     """Build the per-layer DSv4 desc lists.
 
@@ -247,7 +310,14 @@ def build_dsv4_kv_cache_spec_descs(
         fixed_pool_use_host_memory: place the four fixed pools
             (``indexer_state`` / ``csa_state`` / ``hca_state`` / ``swa_kv``) in
             pinned host memory and take them off the paged HBM budget.
+        state_ring_mode: explicit normal or speculative target-verify geometry.
+            The default preserves the existing dynamic state-ring ABI.
     """
+    if not isinstance(state_ring_mode, Dsv4StateRingMode):
+        raise TypeError(
+            "DeepSeek-V4 state_ring_mode must be a Dsv4StateRingMode: "
+            f"value={state_ring_mode!r}, type={type(state_ring_mode).__name__}"
+        )
     if layer_num <= 0:
         raise ValueError(f"dsv4 kv cache descs require layer_num > 0, got {layer_num}")
 
@@ -300,6 +370,14 @@ def build_dsv4_kv_cache_spec_descs(
         _SLIDING_WINDOW_KV_KIND,
         kv_entry_elems,
         DataType.TYPE_UINT8,
+    )
+
+    _apply_dsv4_state_ring_mode(
+        state_ring_mode,
+        indexer_state,
+        csa_state,
+        hca_state,
+        swa_kv,
     )
 
     if fixed_pool_use_host_memory:
