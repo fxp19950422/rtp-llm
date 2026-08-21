@@ -23,6 +23,13 @@ inline constexpr uint32_t DSV4_FP8_KV_ENTRY_BYTES            = 584;
 inline constexpr uint32_t DSV4_FP8_INDEXER_ENTRY_BYTES       = 132;
 inline constexpr size_t   DSV4_FP8_MLA_BLOCK_ALIGNMENT_BYTES = 576;
 inline constexpr uint32_t DSV4_SWA_WINDOW_ENTRIES            = 128;
+inline constexpr uint32_t DSV4_SPECULATIVE_C4_STATE_RING_ENTRIES   = 16;
+inline constexpr uint32_t DSV4_SPECULATIVE_C128_STATE_RING_ENTRIES = 256;
+
+enum class Dsv4StateRingMode {
+    NORMAL,
+    SPECULATIVE_TARGET_VERIFY,
+};
 
 inline size_t alignDsv4Fp8KvBlockBytes(size_t natural, size_t extra_multiple = 1) {
     const size_t align = std::lcm(DSV4_FP8_MLA_BLOCK_ALIGNMENT_BYTES, std::max<size_t>(extra_multiple, 1));
@@ -330,7 +337,9 @@ inline void setHybridAttentionKvCacheSpecs(ModelConfig& model_config) {
     }
 }
 
-inline void setDsv4KvCacheSpecs(ModelConfig& model_config, const std::vector<int>& layer_compress_ratios) {
+inline void setDsv4KvCacheSpecs(ModelConfig&             model_config,
+                                const std::vector<int>&  layer_compress_ratios,
+                                Dsv4StateRingMode state_ring_mode = Dsv4StateRingMode::NORMAL) {
     const int layer_num = static_cast<int>(model_config.num_layers);
     model_config.hybrid_attention_config.hybrid_attention_types.assign(static_cast<size_t>(layer_num),
                                                                        HybridAttentionType::NONE);
@@ -350,6 +359,19 @@ inline void setDsv4KvCacheSpecs(ModelConfig& model_config, const std::vector<int
     auto csa_state     = makeDsv4Desc("csa_state", "fixed_state", 4 * head_dim, DataType::TYPE_FP32);
     auto hca_state     = makeDsv4Desc("hca_state", "fixed_state", 2 * head_dim, DataType::TYPE_FP32);
     auto swa_kv        = makeDsv4Desc("swa_kv", "sliding_window_kv", kv_entry_elems, DataType::TYPE_UINT8);
+
+    if (state_ring_mode == Dsv4StateRingMode::SPECULATIVE_TARGET_VERIFY) {
+        for (auto* desc : {&indexer_state, &csa_state}) {
+            desc->entry_count_mode                     = OpaqueBlockEntryCountMode::EXPLICIT;
+            desc->explicit_entry_count                 = DSV4_SPECULATIVE_C4_STATE_RING_ENTRIES;
+            desc->state_ring_include_gen_num_per_cycle = false;
+        }
+        for (auto* desc : {&hca_state, &swa_kv}) {
+            desc->entry_count_mode                     = OpaqueBlockEntryCountMode::EXPLICIT;
+            desc->explicit_entry_count                 = DSV4_SPECULATIVE_C128_STATE_RING_ENTRIES;
+            desc->state_ring_include_gen_num_per_cycle = false;
+        }
+    }
 
     model_config.kv_cache_spec_descs.clear();
     model_config.kv_cache_spec_descs.resize(static_cast<size_t>(layer_num));

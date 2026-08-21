@@ -716,6 +716,77 @@ TEST(HybridPoolConfigCreatorTest, FlashProduction256GeometryUsesSevenExactPoolSt
     EXPECT_EQ(config.specForGroup(gidForTag(config, "swa_kv"))->block_size_bytes(), 74880u);
 }
 
+TEST(HybridPoolConfigCreatorTest, SpeculativeTargetVerifyKeepsExplicitDoubleRingGeometry) {
+    std::vector<int> ratios = {0, 0};
+    for (int layer = 2; layer < 43; ++layer) {
+        ratios.push_back((layer % 2 == 0) ? 4 : 128);
+    }
+
+    for (const int query_len : {1, 2, 3, 5, 9, 10, 32}) {
+        SCOPED_TRACE(query_len);
+        auto normal_mc                               = makeFlashModelConfig();
+        normal_mc.attn_config.kv_cache_dtype         = KvCacheDataType::FP8;
+        normal_mc.attn_config.tokens_per_block        = 256;
+        normal_mc.attn_config.kernel_tokens_per_block = 256;
+        setDsv4KvCacheSpecs(normal_mc, ratios);
+
+        ParallelismConfig pc;
+        auto normal_config = CacheConfigCreator::createBasicConfig(
+            normal_mc, pc, false, /*gen_num_per_cycle=*/query_len - 1);
+        const auto rounded_even = [](uint32_t entries) { return (entries + 1u) & ~1u; };
+        const auto expected_c4  = rounded_even(8u + static_cast<uint32_t>(query_len - 1));
+        const auto expected_c128 = rounded_even(128u + static_cast<uint32_t>(query_len - 1));
+        auto* normal_csa_state = dynamic_cast<const FixedStateCacheSpec*>(
+            normal_config.specForGroup(gidForTag(normal_config, "csa_state")).get());
+        auto* normal_hca_state = dynamic_cast<const FixedStateCacheSpec*>(
+            normal_config.specForGroup(gidForTag(normal_config, "hca_state")).get());
+        ASSERT_NE(normal_csa_state, nullptr);
+        ASSERT_NE(normal_hca_state, nullptr);
+        EXPECT_EQ(opaqueEntriesPerBlock(*normal_csa_state, kDsv4CsaStateEntryBytes), expected_c4);
+        EXPECT_EQ(opaqueEntriesPerBlock(*normal_hca_state, kDsv4HcaStateEntryBytes), expected_c128);
+
+        auto mc                                   = makeFlashModelConfig();
+        mc.attn_config.kv_cache_dtype             = KvCacheDataType::FP8;
+        mc.attn_config.tokens_per_block            = 256;
+        mc.attn_config.kernel_tokens_per_block     = 256;
+        setDsv4KvCacheSpecs(mc, ratios, Dsv4StateRingMode::SPECULATIVE_TARGET_VERIFY);
+
+        auto config = CacheConfigCreator::createBasicConfig(
+            mc, pc, false, /*gen_num_per_cycle=*/query_len - 1);
+
+        auto* indexer_state =
+            dynamic_cast<const FixedStateCacheSpec*>(config.specForGroup(gidForTag(config, "indexer_state")).get());
+        auto* csa_state =
+            dynamic_cast<const FixedStateCacheSpec*>(config.specForGroup(gidForTag(config, "csa_state")).get());
+        auto* hca_state =
+            dynamic_cast<const FixedStateCacheSpec*>(config.specForGroup(gidForTag(config, "hca_state")).get());
+        auto* swa_kv =
+            dynamic_cast<const FixedStateCacheSpec*>(config.specForGroup(gidForTag(config, "swa_kv")).get());
+        ASSERT_NE(indexer_state, nullptr);
+        ASSERT_NE(csa_state, nullptr);
+        ASSERT_NE(hca_state, nullptr);
+        ASSERT_NE(swa_kv, nullptr);
+
+        EXPECT_EQ(opaqueEntriesPerBlock(*indexer_state, kDsv4IndexerStateEntryBytes), 16u);
+        EXPECT_EQ(opaqueEntriesPerBlock(*csa_state, kDsv4CsaStateEntryBytes), 16u);
+        EXPECT_EQ(opaqueEntriesPerBlock(*hca_state, kDsv4HcaStateEntryBytes), 256u);
+        EXPECT_EQ(opaqueEntriesPerBlock(*swa_kv, kDsv4Fp8KvEntryBytes), 256u);
+
+        EXPECT_EQ(indexer_state->block_size_bytes(), 32768u);
+        EXPECT_EQ(csa_state->block_size_bytes(), 131072u);
+        EXPECT_EQ(hca_state->block_size_bytes(), 1048576u);
+        EXPECT_EQ(swa_kv->block_payload_bytes(), 149504u);
+        EXPECT_EQ(swa_kv->block_size_bytes(), 149760u);
+
+        for (const auto& tag : {"indexer_state", "csa_state", "hca_state", "swa_kv"}) {
+            const auto gid = gidForTag(config, tag);
+            EXPECT_EQ(config.kvBlockStrideBytesForGroup(gid), config.specForGroup(gid)->block_size_bytes()) << tag;
+        }
+        EXPECT_EQ(config.kv_block_stride_bytes, 1048576u);
+        EXPECT_EQ(config.blockNumForGroup(gidForTag(config, "hca_state")), 256u);
+    }
+}
+
 TEST(HybridPoolConfigCreatorTest, BasicConfigUsesModelDefaultPhysicalAndKernelBlockSize) {
     ParallelismConfig pc;
     auto              mc     = makeProModelConfig();

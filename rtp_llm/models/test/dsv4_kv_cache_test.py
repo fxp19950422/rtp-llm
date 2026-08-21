@@ -9,8 +9,12 @@ from rtp_llm.models.dsv4_kv_cache import (
     DSV4_FP8_KV_ENTRY_BYTES,
     DSV4_FP8_MLA_BLOCK_ALIGNMENT_BYTES,
     DSV4_HCA_STATE_POOL_BLOCKS,
+    DSV4_SPECULATIVE_C128_STATE_RING_ENTRIES,
+    DSV4_SPECULATIVE_C4_MAX_QUERY_LEN,
+    DSV4_SPECULATIVE_C4_STATE_RING_ENTRIES,
     DSV4_SWA_WINDOW_ENTRIES,
     DSV4_TOKENS_PER_BLOCK,
+    Dsv4StateRingMode,
     HCA_KV_TAG,
     HCA_STATE_TAG,
     INDEXER_KV_TAG,
@@ -18,6 +22,7 @@ from rtp_llm.models.dsv4_kv_cache import (
     SWA_KV_TAG,
     apply_dsv4_explicit_pool_blocks,
     build_dsv4_kv_cache_spec_descs,
+    validate_dsv4_speculative_target_query_len,
 )
 from rtp_llm.ops import (
     CacheEvictPolicy,
@@ -40,7 +45,12 @@ FRAMEWORK_DEFAULT_TOKENS_PER_BLOCK = 64
 
 
 class Dsv4KvCacheSpecTest(TestCase):
-    def _build(self, fp8_kv=True, fixed_pool_use_host_memory=False):
+    def _build(
+        self,
+        fp8_kv=True,
+        fixed_pool_use_host_memory=False,
+        state_ring_mode=Dsv4StateRingMode.NORMAL,
+    ):
         return build_dsv4_kv_cache_spec_descs(
             layer_num=len(LAYER_COMPRESS_RATIOS),
             layer_compress_ratios=LAYER_COMPRESS_RATIOS,
@@ -48,6 +58,7 @@ class Dsv4KvCacheSpecTest(TestCase):
             head_dim=HEAD_DIM,
             indexer_head_dim=INDEXER_HEAD_DIM,
             fixed_pool_use_host_memory=fixed_pool_use_host_memory,
+            state_ring_mode=state_ring_mode,
         )
 
     def _by_tag(self, layer_descs):
@@ -166,6 +177,77 @@ class Dsv4KvCacheSpecTest(TestCase):
             self.assertEqual(by_tag[tag].dtype, DataType.TYPE_FP32, tag)
             self.assertEqual(by_tag[tag].entry_dtype, DataType.TYPE_FP32, tag)
         self.assertEqual(by_tag[SWA_KV_TAG].dtype, DataType.TYPE_UINT8)
+
+    def test_explicit_normal_mode_preserves_default_state_ring_abi(self):
+        default_by_tag = self._by_tag(self._build())
+        normal_by_tag = self._by_tag(
+            self._build(state_ring_mode=Dsv4StateRingMode.NORMAL)
+        )
+        for tag in (INDEXER_STATE_TAG, CSA_STATE_TAG, HCA_STATE_TAG, SWA_KV_TAG):
+            default = default_by_tag[tag]
+            normal = normal_by_tag[tag]
+            self.assertEqual(normal.entry_count_mode, default.entry_count_mode, tag)
+            self.assertEqual(normal.explicit_entry_count, default.explicit_entry_count, tag)
+            self.assertEqual(
+                normal.state_ring_include_gen_num_per_cycle,
+                default.state_ring_include_gen_num_per_cycle,
+                tag,
+            )
+            self.assertEqual(normal.compression_ratio, default.compression_ratio, tag)
+            self.assertEqual(normal.state_ring_overlap, default.state_ring_overlap, tag)
+
+    def test_speculative_target_verify_uses_explicit_double_state_rings(self):
+        by_tag = self._by_tag(
+            self._build(
+                state_ring_mode=Dsv4StateRingMode.SPECULATIVE_TARGET_VERIFY
+            )
+        )
+        expected_entries = {
+            INDEXER_STATE_TAG: DSV4_SPECULATIVE_C4_STATE_RING_ENTRIES,
+            CSA_STATE_TAG: DSV4_SPECULATIVE_C4_STATE_RING_ENTRIES,
+            HCA_STATE_TAG: DSV4_SPECULATIVE_C128_STATE_RING_ENTRIES,
+            SWA_KV_TAG: DSV4_SPECULATIVE_C128_STATE_RING_ENTRIES,
+        }
+        for tag, entries in expected_entries.items():
+            desc = by_tag[tag]
+            self.assertEqual(
+                desc.entry_count_mode, OpaqueBlockEntryCountMode.EXPLICIT, tag
+            )
+            self.assertEqual(desc.explicit_entry_count, entries, tag)
+            self.assertFalse(desc.state_ring_include_gen_num_per_cycle, tag)
+
+        for tag in (CSA_KV_TAG, HCA_KV_TAG, INDEXER_KV_TAG):
+            self.assertEqual(
+                by_tag[tag].entry_count_mode,
+                OpaqueBlockEntryCountMode.KERNEL_BLOCK_COMPRESSED,
+                tag,
+            )
+
+    def test_rejects_implicit_or_invalid_state_ring_mode(self):
+        for mode in ("speculative_target_verify", True, 1, None):
+            with self.subTest(mode=mode), self.assertRaisesRegex(
+                TypeError, "state_ring_mode must be a Dsv4StateRingMode"
+            ):
+                self._build(state_ring_mode=mode)
+
+    def test_speculative_target_query_len_contract(self):
+        for query_len in (1, 2, 3, 5, DSV4_SPECULATIVE_C4_MAX_QUERY_LEN):
+            with self.subTest(query_len=query_len):
+                self.assertEqual(
+                    validate_dsv4_speculative_target_query_len(query_len), query_len
+                )
+
+        for query_len in (0, -1, 10, 32):
+            with self.subTest(query_len=query_len), self.assertRaisesRegex(
+                ValueError, "outside the safe C4 state-ring range"
+            ):
+                validate_dsv4_speculative_target_query_len(query_len)
+
+        for query_len in (True, 3.0, "3", None):
+            with self.subTest(query_len=query_len), self.assertRaisesRegex(
+                TypeError, "query_len must be an integer"
+            ):
+                validate_dsv4_speculative_target_query_len(query_len)
 
     def test_fp8_entry_elems(self):
         by_tag = self._by_tag(self._build(fp8_kv=True))
