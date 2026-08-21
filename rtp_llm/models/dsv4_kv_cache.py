@@ -56,6 +56,10 @@ from rtp_llm.ops import (
 # declared as UINT8 so ``entry_elems`` is a byte count.
 DSV4_FP8_KV_ENTRY_BYTES = 584
 DSV4_FP8_INDEXER_ENTRY_BYTES = 132
+# The FP4 indexer stores 128 E2M1 values as 64 packed bytes plus four raw
+# UE8M0 scale bytes per compressed token.  The scale bytes are part of the
+# same opaque entry and do not form a sidecar cache.
+DSV4_FP4_INDEXER_ENTRY_BYTES = 68
 # FlashMLA requires the FP8 KV block stride to be a multiple of 576 bytes.
 DSV4_FP8_MLA_BLOCK_ALIGNMENT_BYTES = 576
 # Sliding window length in entries; doubles as the HCA compression unit and as
@@ -105,6 +109,14 @@ class Dsv4StateRingMode(Enum):
 
     NORMAL = "normal"
     SPECULATIVE_TARGET_VERIFY = "speculative_target_verify"
+
+
+class Dsv4IndexerCacheMode(Enum):
+    """Indexer-cache representation selected explicitly by the caller."""
+
+    FOLLOW_KV = "follow_kv"
+    FP8 = "fp8"
+    FP4 = "fp4"
 
 
 def validate_dsv4_speculative_target_query_len(query_len: int) -> int:
@@ -287,6 +299,7 @@ def build_dsv4_kv_cache_spec_descs(
     indexer_head_dim: int,
     fixed_pool_use_host_memory: bool = False,
     state_ring_mode: Dsv4StateRingMode = Dsv4StateRingMode.NORMAL,
+    indexer_cache_mode: Dsv4IndexerCacheMode = Dsv4IndexerCacheMode.FOLLOW_KV,
 ) -> list[list[KVCacheSpecDesc]]:
     """Build the per-layer DSv4 desc lists.
 
@@ -312,19 +325,36 @@ def build_dsv4_kv_cache_spec_descs(
             pinned host memory and take them off the paged HBM budget.
         state_ring_mode: explicit normal or speculative target-verify geometry.
             The default preserves the existing dynamic state-ring ABI.
+        indexer_cache_mode: ``FOLLOW_KV`` preserves the legacy public default
+            (FP8=132 bytes; non-FP8=``indexer_head_dim * 2``).  New runtime
+            wiring must select explicit FP8 or FP4 geometry, which is
+            independent of ``fp8_kv``.  No platform, environment, or
+            checkpoint inference is performed here.
     """
     if not isinstance(state_ring_mode, Dsv4StateRingMode):
         raise TypeError(
             "DeepSeek-V4 state_ring_mode must be a Dsv4StateRingMode: "
             f"value={state_ring_mode!r}, type={type(state_ring_mode).__name__}"
         )
+    if not isinstance(indexer_cache_mode, Dsv4IndexerCacheMode):
+        raise TypeError(
+            "DeepSeek-V4 indexer_cache_mode must be a Dsv4IndexerCacheMode: "
+            f"value={indexer_cache_mode!r}, "
+            f"type={type(indexer_cache_mode).__name__}"
+        )
     if layer_num <= 0:
         raise ValueError(f"dsv4 kv cache descs require layer_num > 0, got {layer_num}")
 
     kv_entry_elems = DSV4_FP8_KV_ENTRY_BYTES if fp8_kv else head_dim * 2
-    indexer_entry_elems = (
-        DSV4_FP8_INDEXER_ENTRY_BYTES if fp8_kv else indexer_head_dim * 2
-    )
+    if indexer_cache_mode is Dsv4IndexerCacheMode.FOLLOW_KV:
+        indexer_entry_elems = (
+            DSV4_FP8_INDEXER_ENTRY_BYTES if fp8_kv else indexer_head_dim * 2
+        )
+    else:
+        indexer_entry_elems = {
+            Dsv4IndexerCacheMode.FP8: DSV4_FP8_INDEXER_ENTRY_BYTES,
+            Dsv4IndexerCacheMode.FP4: DSV4_FP4_INDEXER_ENTRY_BYTES,
+        }[indexer_cache_mode]
 
     csa_kv = _make_dsv4_desc(
         CSA_KV_TAG,
