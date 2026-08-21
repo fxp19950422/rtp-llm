@@ -67,6 +67,7 @@ _DSV4_FP8_CPU_TESTS = [
     "test_compressor_start_finish_prefill",
     "test_decode_topk_length",
     "test_indexer_forward_with_pending_nested",
+    "test_pool_slot_mapping_contract",
     "test_prefill_mixed_layer_cache_store",
 ]
 
@@ -90,6 +91,23 @@ py_test(
     name = "test_pool_slot_mapping_split",
     srcs = ["test_pool_slot_mapping_split.py"],
     deps = _DSV4_FP8_TEST_DEPS,
+    target_compatible_with = _DSV4_CUDA13_ONLY,
+)
+
+py_test(
+    name = "test_model1_layout_contract",
+    srcs = ["test_model1_layout_contract.py"],
+    data = ["testdata/dsv4_model1_golden_v1.json"],
+    deps = _DSV4_FP8_TEST_DEPS,
+    target_compatible_with = _DSV4_CUDA13_ONLY,
+)
+
+py_test(
+    name = "test_fused_pool_slot_mapping_contract",
+    srcs = ["test_fused_pool_slot_mapping_contract.py"],
+    deps = _DSV4_FP8_TEST_DEPS,
+    tags = ["H20"],
+    exec_properties = {"gpu": "H20"},
     target_compatible_with = _DSV4_CUDA13_ONLY,
 )
 

@@ -685,6 +685,37 @@ TEST(HybridPoolConfigCreatorTest, Fp8BlockSizeBytesUsePaddedPhysicalStride) {
               config.specForGroup(gidForTag(config, "swa_kv"))->block_size_bytes());
 }
 
+TEST(HybridPoolConfigCreatorTest, FlashProduction256GeometryUsesSevenExactPoolStrides) {
+    auto mc                                    = makeFlashModelConfig();
+    mc.attn_config.kv_cache_dtype              = KvCacheDataType::FP8;
+    mc.attn_config.tokens_per_block             = 256;
+    mc.attn_config.kernel_tokens_per_block      = 256;
+    std::vector<int> layer_and_mtp_ratios       = {0, 0};
+    for (int layer = 2; layer < 43; ++layer) {
+        layer_and_mtp_ratios.push_back((layer % 2 == 0) ? 4 : 128);
+    }
+    layer_and_mtp_ratios.push_back(0);
+    setDsv4KvCacheSpecs(mc, layer_and_mtp_ratios);
+
+    ParallelismConfig pc;
+    auto config = CacheConfigCreator::createBasicConfig(mc, pc, false, 0);
+
+    EXPECT_EQ(config.seq_size_per_block, 256u);
+    EXPECT_EQ(config.kernel_seq_size_per_block, 256u);
+    EXPECT_EQ(config.groupTagsSnapshot(), kDsv4FlashFirstSeenTags);
+    EXPECT_EQ(config.layerIdsForGroup(gidForTag(config, "csa_kv")).size(), 21u);
+    EXPECT_EQ(config.layerIdsForGroup(gidForTag(config, "hca_kv")).size(), 20u);
+    EXPECT_EQ(config.layerIdsForGroup(gidForTag(config, "swa_kv")).size(), 43u);
+
+    EXPECT_EQ(config.specForGroup(gidForTag(config, "csa_kv"))->block_size_bytes(), 37440u);
+    EXPECT_EQ(config.specForGroup(gidForTag(config, "hca_kv"))->block_size_bytes(), 1728u);
+    EXPECT_EQ(config.specForGroup(gidForTag(config, "indexer_kv"))->block_size_bytes(), 64u * 132u);
+    EXPECT_EQ(config.specForGroup(gidForTag(config, "indexer_state"))->block_size_bytes(), 8u * 512u * 4u);
+    EXPECT_EQ(config.specForGroup(gidForTag(config, "csa_state"))->block_size_bytes(), 8u * 2048u * 4u);
+    EXPECT_EQ(config.specForGroup(gidForTag(config, "hca_state"))->block_size_bytes(), 128u * 1024u * 4u);
+    EXPECT_EQ(config.specForGroup(gidForTag(config, "swa_kv"))->block_size_bytes(), 74880u);
+}
+
 TEST(HybridPoolConfigCreatorTest, BasicConfigUsesModelDefaultPhysicalAndKernelBlockSize) {
     ParallelismConfig pc;
     auto              mc     = makeProModelConfig();

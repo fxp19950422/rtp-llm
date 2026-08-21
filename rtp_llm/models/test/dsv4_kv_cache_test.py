@@ -89,6 +89,57 @@ class Dsv4KvCacheSpecTest(TestCase):
         self.assertEqual([desc.tag for desc in layer_descs[-1]], [SWA_KV_TAG])
         self.assertEqual([desc.tag for desc in layer_descs[-2]], [SWA_KV_TAG])
 
+    def test_real_checkpoint_schedule_ignores_zero_mtp_tail(self):
+        ratios = [0, 0] + [4 if layer % 2 == 0 else 128 for layer in range(2, 43)]
+        ratios.append(0)
+        layer_descs = build_dsv4_kv_cache_spec_descs(
+            layer_num=43,
+            layer_compress_ratios=ratios,
+            fp8_kv=True,
+            head_dim=HEAD_DIM,
+            indexer_head_dim=INDEXER_HEAD_DIM,
+        )
+
+        self.assertEqual(len(layer_descs), 43)
+        self.assertEqual([desc.tag for desc in layer_descs[0]], [SWA_KV_TAG])
+        self.assertEqual([desc.tag for desc in layer_descs[1]], [SWA_KV_TAG])
+        self.assertEqual(layer_descs[2][0].tag, CSA_KV_TAG)
+        self.assertEqual(layer_descs[3][0].tag, HCA_KV_TAG)
+        self.assertEqual(layer_descs[42][0].tag, CSA_KV_TAG)
+
+    def test_rejects_non_integer_ratio_types(self):
+        for ratio in (4.5, True, "4"):
+            with self.subTest(ratio=ratio), self.assertRaisesRegex(
+                TypeError, "must be integers"
+            ):
+                build_dsv4_kv_cache_spec_descs(
+                    layer_num=1,
+                    layer_compress_ratios=[ratio],
+                    fp8_kv=True,
+                    head_dim=HEAD_DIM,
+                    indexer_head_dim=INDEXER_HEAD_DIM,
+                )
+
+    def test_rejects_unknown_main_ratio(self):
+        with self.assertRaisesRegex(ValueError, "main-layer compression ratio"):
+            build_dsv4_kv_cache_spec_descs(
+                layer_num=1,
+                layer_compress_ratios=[8],
+                fp8_kv=True,
+                head_dim=HEAD_DIM,
+                indexer_head_dim=INDEXER_HEAD_DIM,
+            )
+
+    def test_rejects_nonzero_mtp_tail(self):
+        with self.assertRaisesRegex(ValueError, "trailing MTP/draft"):
+            build_dsv4_kv_cache_spec_descs(
+                layer_num=1,
+                layer_compress_ratios=[4, 128],
+                fp8_kv=True,
+                head_dim=HEAD_DIM,
+                indexer_head_dim=INDEXER_HEAD_DIM,
+            )
+
     def test_cache_types_and_state_flags(self):
         by_tag = self._by_tag(self._build())
         for tag in (CSA_KV_TAG, HCA_KV_TAG, INDEXER_KV_TAG):
