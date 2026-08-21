@@ -32,6 +32,7 @@ true of ``ModelConfig.kv_cache_spec_descs`` (a ``std::vector<std::vector<...>>``
 mutate the Python list first, then assign it once.
 """
 
+from numbers import Integral
 from typing import Optional, Sequence
 
 from rtp_llm.ops import (
@@ -227,7 +228,10 @@ def build_dsv4_kv_cache_spec_descs(
     """Build the per-layer DSv4 desc lists.
 
     Python twin of ``rtp_llm::test::setDsv4KvCacheSpecs``.  Layers past the end
-    of ``layer_compress_ratios`` are treated as ratio 0 (SWA only).
+    of ``layer_compress_ratios`` are treated as ratio 0 (SWA only).  Checkpoint
+    configs may append MTP/draft ratios after the target-model layers; those
+    trailing entries are accepted only when they are ratio 0 and are not used
+    to build target-layer cache descriptors.
 
     One desc object per tag is shared across the layers that use it, exactly as
     the C++ helper does.  This is safe: ``kv_cache_spec_descs`` is a
@@ -302,7 +306,33 @@ def build_dsv4_kv_cache_spec_descs(
         for desc in (indexer_state, csa_state, hca_state, swa_kv):
             _use_host_pinned_memory(desc)
 
-    ratios = list(layer_compress_ratios)
+    ratios: list[int] = []
+    for ratio_id, ratio in enumerate(layer_compress_ratios):
+        if isinstance(ratio, bool) or not isinstance(ratio, Integral):
+            raise TypeError(
+                "DeepSeek-V4 compression ratios must be integers: "
+                f"index={ratio_id}, value={ratio!r}, type={type(ratio).__name__}"
+            )
+        ratios.append(int(ratio))
+    supported_ratios = {
+        0,
+        CSA_LAYER_COMPRESS_RATIO,
+        HCA_LAYER_COMPRESS_RATIO,
+    }
+    for layer_id, ratio in enumerate(ratios[:layer_num]):
+        if ratio not in supported_ratios:
+            raise ValueError(
+                "unsupported DeepSeek-V4 main-layer compression ratio: "
+                f"layer={layer_id}, ratio={ratio}, "
+                f"supported={sorted(supported_ratios)}"
+            )
+    for trailing_id, ratio in enumerate(ratios[layer_num:], start=layer_num):
+        if ratio != 0:
+            raise ValueError(
+                "DeepSeek-V4 trailing MTP/draft compression ratios must be 0: "
+                f"index={trailing_id}, ratio={ratio}"
+            )
+
     layer_descs: list[list[KVCacheSpecDesc]] = []
     for layer_id in range(layer_num):
         ratio = ratios[layer_id] if layer_id < len(ratios) else 0
