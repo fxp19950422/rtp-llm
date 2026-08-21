@@ -32,7 +32,6 @@ from rtp_llm.models_py.modules.dsv4.fp8.decode.decode_attn_metadata import (
     RICH_CSA_PAGE,
     RICH_HCA_INDEX_WIDTH,
     RICH_HCA_PAGE,
-    RICH_MODEL1_STRIDE,
     RICH_SWA_INDEX_WIDTH,
     RICH_SWA_PAGE,
 )

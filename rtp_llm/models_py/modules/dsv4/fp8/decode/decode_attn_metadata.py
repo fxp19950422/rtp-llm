@@ -57,9 +57,6 @@ RICH_HCA_PAGE = 2
 RICH_SWA_INDEX_WIDTH = 128
 RICH_CSA_INDEX_WIDTH = 512
 RICH_HCA_INDEX_WIDTH = 64
-RICH_MODEL1_STRIDE = 584
-
-
 @dataclass
 class DSv4DecodeAttnMetadataFP8:
     """Metadata produced once per decode step, consumed by every layer.
