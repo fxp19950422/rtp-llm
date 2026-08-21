@@ -1,0 +1,288 @@
+import ast
+import importlib.util
+import sys
+import unittest
+from pathlib import Path
+
+_DSV4_DIR = Path(__file__).resolve().parents[1]
+_PROVIDER_SPEC = importlib.util.spec_from_file_location(
+    "dsv4_platform_provider_under_test", _DSV4_DIR / "platform_provider.py"
+)
+assert _PROVIDER_SPEC is not None and _PROVIDER_SPEC.loader is not None
+_PROVIDER_MODULE = importlib.util.module_from_spec(_PROVIDER_SPEC)
+sys.modules[_PROVIDER_SPEC.name] = _PROVIDER_MODULE
+_PROVIDER_SPEC.loader.exec_module(_PROVIDER_MODULE)
+
+DefaultDsv4PlatformProvider = _PROVIDER_MODULE.DefaultDsv4PlatformProvider
+Dsv4PlatformProviderRegistry = _PROVIDER_MODULE.Dsv4PlatformProviderRegistry
+Dsv4ProviderCapability = _PROVIDER_MODULE.Dsv4ProviderCapability
+
+
+class _Provider:
+    name = "test-provider"
+    capabilities = frozenset(
+        {
+            Dsv4ProviderCapability.BLOCK,
+            Dsv4ProviderCapability.TRANSFORMER,
+        }
+    )
+
+    def build_block(self, default_factory, *args, **kwargs):
+        return ("block", default_factory, args, kwargs)
+
+    def build_transformer(self, default_factory, *args, **kwargs):
+        return ("transformer", default_factory, args, kwargs)
+
+
+class _FalseyProvider(_Provider):
+    name = "falsey-provider"
+
+    def __bool__(self):
+        return False
+
+
+class _BlockOnlyProvider:
+    name = "block-only"
+    capabilities = frozenset({Dsv4ProviderCapability.BLOCK})
+
+    def build_block(self, default_factory, *args, **kwargs):
+        return default_factory(*args, **kwargs)
+
+
+class _InvalidProvider:
+    name = "invalid"
+    capabilities = frozenset({Dsv4ProviderCapability.TRANSFORMER})
+
+
+class Dsv4PlatformProviderRegistryTest(unittest.TestCase):
+    def test_default_provider_delegates_arguments_and_exceptions_exactly(self):
+        provider = DefaultDsv4PlatformProvider()
+        sentinel = object()
+
+        def factory(*args, **kwargs):
+            self.assertEqual(args, ("positional",))
+            self.assertEqual(kwargs, {"sentinel": sentinel, "count": 3})
+            return sentinel
+
+        self.assertIs(
+            provider.build_block(
+                factory, "positional", sentinel=sentinel, count=3
+            ),
+            sentinel,
+        )
+        self.assertIs(
+            provider.build_transformer(
+                factory, "positional", sentinel=sentinel, count=3
+            ),
+            sentinel,
+        )
+
+        failure = ValueError("factory failure")
+
+        def failing_factory(*args, **kwargs):
+            raise failure
+
+        with self.assertRaises(ValueError) as caught:
+            provider.build_block(failing_factory)
+        self.assertIs(caught.exception, failure)
+
+    def test_capability_query_does_not_freeze_registration(self):
+        registry = Dsv4PlatformProviderRegistry()
+        self.assertEqual(
+            registry.capabilities(),
+            frozenset(
+                {
+                    Dsv4ProviderCapability.BLOCK,
+                    Dsv4ProviderCapability.TRANSFORMER,
+                }
+            ),
+        )
+        provider = _Provider()
+        registry.register(provider)
+        self.assertIs(
+            registry.resolve(
+                {
+                    Dsv4ProviderCapability.BLOCK,
+                    Dsv4ProviderCapability.TRANSFORMER,
+                }
+            ),
+            provider,
+        )
+
+    def test_falsey_provider_identity_is_preserved(self):
+        default_provider = _FalseyProvider()
+        default_registry = Dsv4PlatformProviderRegistry(default_provider)
+        self.assertIs(
+            default_registry.resolve({Dsv4ProviderCapability.BLOCK}),
+            default_provider,
+        )
+
+        registered_provider = _FalseyProvider()
+        registered_registry = Dsv4PlatformProviderRegistry()
+        registered_registry.register(registered_provider)
+        self.assertIs(
+            registered_registry.resolve({Dsv4ProviderCapability.TRANSFORMER}),
+            registered_provider,
+        )
+
+    def test_second_registration_is_rejected(self):
+        registry = Dsv4PlatformProviderRegistry()
+        registry.register(_Provider())
+        with self.assertRaisesRegex(RuntimeError, "already registered"):
+            registry.register(_Provider())
+
+    def test_registration_after_construction_resolution_is_rejected(self):
+        registry = Dsv4PlatformProviderRegistry()
+        registry.resolve({Dsv4ProviderCapability.BLOCK})
+        with self.assertRaisesRegex(RuntimeError, "construction started"):
+            registry.register(_Provider())
+
+    def test_missing_capability_fails_before_construction(self):
+        registry = Dsv4PlatformProviderRegistry()
+        registry.register(_BlockOnlyProvider())
+        with self.assertRaisesRegex(RuntimeError, "transformer"):
+            registry.validate_capabilities({Dsv4ProviderCapability.TRANSFORMER})
+        with self.assertRaisesRegex(RuntimeError, "transformer"):
+            registry.resolve({Dsv4ProviderCapability.TRANSFORMER})
+
+    def test_declared_capability_requires_a_factory(self):
+        registry = Dsv4PlatformProviderRegistry()
+        with self.assertRaisesRegex(TypeError, "build_transformer"):
+            registry.register(_InvalidProvider())
+
+
+class Dsv4PlatformProviderWiringTest(unittest.TestCase):
+    def test_model_and_transformer_use_the_provider_seam(self):
+        dsv4_dir = _DSV4_DIR
+        transformer_source = (dsv4_dir / "transformer.py").read_text()
+        model_source = (
+            dsv4_dir.parent.parent / "model_desc" / "deepseek_v4_model.py"
+        ).read_text()
+
+        transformer_tree = ast.parse(transformer_source)
+        model_tree = ast.parse(model_source)
+
+        model_class = next(
+            node
+            for node in model_tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "DeepSeekV4Model"
+        )
+        model_init = next(
+            node
+            for node in model_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+        )
+        model_resolves = [
+            node
+            for node in ast.walk(model_init)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "resolve_dsv4_platform_provider"
+        ]
+        self.assertEqual(len(model_resolves), 1)
+        self.assertTrue(
+            any(
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "self"
+                    and target.attr == "_platform_provider"
+                    for target in node.targets
+                )
+                and node.value is model_resolves[0]
+                for node in model_init.body
+            )
+        )
+
+        initialize_impl = next(
+            node
+            for node in model_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_initialize_impl"
+        )
+        transformer_builds = [
+            node
+            for node in ast.walk(initialize_impl)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "build_transformer"
+            and isinstance(node.func.value, ast.Attribute)
+            and node.func.value.attr == "_platform_provider"
+        ]
+        self.assertEqual(len(transformer_builds), 1)
+        injected_keyword = next(
+            keyword
+            for keyword in transformer_builds[0].keywords
+            if keyword.arg == "platform_provider"
+        )
+        self.assertIsInstance(injected_keyword.value, ast.Attribute)
+        self.assertEqual(injected_keyword.value.attr, "_platform_provider")
+
+        transformer_class = next(
+            node
+            for node in transformer_tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "V4Transformer"
+        )
+        transformer_init = next(
+            node
+            for node in transformer_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+        )
+        provider_guard = next(
+            node
+            for node in transformer_init.body
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "platform_provider"
+        )
+        self.assertIsInstance(provider_guard.test.ops[0], ast.Is)
+        self.assertIsInstance(provider_guard.test.comparators[0], ast.Constant)
+        self.assertIsNone(provider_guard.test.comparators[0].value)
+        self.assertEqual(
+            sum(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "resolve_dsv4_platform_provider"
+                for node in ast.walk(provider_guard)
+            ),
+            1,
+        )
+        self.assertFalse(
+            any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "resolve_dsv4_platform_provider"
+                for statement in provider_guard.orelse
+                for node in ast.walk(statement)
+            )
+        )
+
+        build_block = next(
+            node
+            for node in transformer_tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_build_block"
+        )
+        block_provider_guard = next(
+            node
+            for node in build_block.body
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "platform_provider"
+        )
+        self.assertIsInstance(block_provider_guard.test.ops[0], ast.Is)
+        self.assertIsNone(block_provider_guard.test.comparators[0].value)
+        self.assertFalse(
+            any(
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == "resolve_dsv4_platform_provider"
+                for statement in block_provider_guard.orelse
+                for node in ast.walk(statement)
+            )
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

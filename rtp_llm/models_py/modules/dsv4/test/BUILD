@@ -13,6 +13,15 @@ _DSV4_TEST_DEPS = [
 ]
 
 py_test(
+    name = "test_platform_provider",
+    srcs = ["test_platform_provider.py"],
+    deps = [
+        "//rtp_llm/models_py:models",
+        "//rtp_llm/models_py:modules",
+    ],
+)
+
+py_test(
     name = "test_cp_context_build",
     srcs = ["test_cp_context_build.py"],
     deps = _DSV4_TEST_DEPS,
