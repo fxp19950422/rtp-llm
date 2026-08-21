@@ -67,6 +67,12 @@ py_test(
 )
 
 py_test(
+    name = "test_t23_cp_contract_round",
+    srcs = ["test_t23_cp_contract_round.py"],
+    deps = _DSV4_TEST_DEPS,
+)
+
+py_test(
     name = "test_cp_slot_mapping",
     srcs = ["test_cp_slot_mapping.py"],
     deps = _DSV4_TEST_DEPS,
