@@ -99,8 +99,7 @@ class LocalLoopStrategy(RoutedExpertsStrategy):
     # apply each weight after W2, and MoE applies route_scale to the routed sum.
     route_weight_contract = "post_w2_normalized_then_scale_v1"
 
-    # T15 is TP-neutral.  T21 may set/wire a value >1 once it owns the routed
-    # weight sharding; MoE then reduces the routed result before shared add.
+    # Updated from the actual bound weight shape in setup_weights.
     routed_tp_size = 1
 
     @classmethod
@@ -145,15 +144,17 @@ class LocalLoopStrategy(RoutedExpertsStrategy):
         self._W2_s = stacked_routed["w2_s"]
         self._W3_w = stacked_routed["w3_w"]
         self._W3_s = stacked_routed["w3_s"]
+        inter_local = int(self._W1_w.shape[1])
         self._W1_s_gemm = prepare_fp4_weight_scale_for_deepgemm(
-            self._W1_s, cfg.moe_inter_dim, cfg.dim, self._W1_s.shape[0]
+            self._W1_s, inter_local, cfg.dim, self._W1_s.shape[0]
         )
         self._W2_s_gemm = prepare_fp4_weight_scale_for_deepgemm(
-            self._W2_s, cfg.dim, cfg.moe_inter_dim, self._W2_s.shape[0]
+            self._W2_s, cfg.dim, inter_local, self._W2_s.shape[0]
         )
         self._W3_s_gemm = prepare_fp4_weight_scale_for_deepgemm(
-            self._W3_s, cfg.moe_inter_dim, cfg.dim, self._W3_s.shape[0]
+            self._W3_s, inter_local, cfg.dim, self._W3_s.shape[0]
         )
+        self.routed_tp_size = cfg.tp_size if inter_local != cfg.moe_inter_dim else 1
         # Per-expert DeepGEMM scales are MN-major: a direct
         # self._W*_s_gemm[i] view has stride (1, mn).  torch.index_select on
         # the grouped tensor returns a row-major copy, which fails
@@ -180,7 +181,7 @@ class LocalLoopStrategy(RoutedExpertsStrategy):
             }
             return Expert(
                 cfg.dim,
-                cfg.moe_inter_dim,
+                inter_local,
                 swiglu_limit=cfg.swiglu_limit,
                 storage="fp4",
                 expert_weights=ew,

@@ -374,6 +374,7 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
                     stack_,
                     config=moe_cfg,
                     data_type=torch.int8,
+                    enable_pure_tp_preshard=True,
                 )
             )
             out.append(
@@ -388,6 +389,7 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
                     stack_,
                     config=moe_cfg,
                     data_type=torch.float8_e8m0fnu,
+                    enable_pure_tp_preshard=True,
                 )
             )
         return out

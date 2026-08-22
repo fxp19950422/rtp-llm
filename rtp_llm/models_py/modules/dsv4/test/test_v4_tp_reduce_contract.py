@@ -324,7 +324,12 @@ class MoEFinishOrderingContractTest(unittest.TestCase):
             _resolve_forced=mock.Mock(return_value=(None, False)),
             select_strategy=select_spy,
         ), mock.patch.object(
-            LocalLoopStrategy, "setup_weights", autospec=True
+            LocalLoopStrategy,
+            "setup_weights",
+            autospec=True,
+            side_effect=lambda strategy, _weights: setattr(
+                strategy, "routed_tp_size", strategy.cfg.tp_size
+            ),
         ) as setup_spy:
             moe = MoE(
                 layer_id=3,
@@ -339,6 +344,7 @@ class MoEFinishOrderingContractTest(unittest.TestCase):
                 n_hash_layers=0,
                 vocab_size=0,
                 layer_weights=layer_weights,
+                tp_size=2,
                 max_tokens_per_rank=2,
                 strategy="local_loop",
             )
@@ -348,7 +354,8 @@ class MoEFinishOrderingContractTest(unittest.TestCase):
         self.assertIsInstance(moe._strategy, LocalLoopStrategy)
         self.assertIs(executor.prepared, moe.shared_experts)
         self.assertTrue(moe._post_w2_route_weight_contract)
-        self.assertEqual(moe._routed_tp_size, 1)
+        self.assertEqual(moe._strategy.cfg.tp_size, 2)
+        self.assertEqual(moe._routed_tp_size, 2)
         self.assertEqual(
             vars(LocalLoopStrategy)["route_weight_contract"],
             "post_w2_normalized_then_scale_v1",

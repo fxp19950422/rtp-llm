@@ -178,6 +178,7 @@ class MoE(nn.Module):
         n_hash_layers: int,
         vocab_size: int,
         layer_weights: Optional[Dict] = None,
+        tp_size: int = 1,
         ep_size: int = 1,
         ep_rank: int = 0,
         max_tokens_per_rank: int = 8192,
@@ -242,6 +243,7 @@ class MoE(nn.Module):
             local_expert_start=self.local_expert_start,
             local_expert_end=self.local_expert_end,
             max_tokens_per_rank=max_tokens_per_rank,
+            tp_size=tp_size,
         )
         forced, strict = _resolve_forced(strategy)
         strategy_cls = select_strategy(cfg, forced=forced, strict=strict)
@@ -293,19 +295,6 @@ class MoE(nn.Module):
         # (e.g. LocalLoopStrategy.experts ModuleList) propagate through
         # ``MoE.to(device)``.
         self._strategy = strategy_cls(cfg)
-        if self._post_w2_route_weight_contract:
-            # This is deliberately a required part of the declared contract,
-            # not a best-effort attribute fallback. T21 owns wiring values >1
-            # when routed W2 is actually TP-sharded.
-            self._routed_tp_size = int(self._strategy.routed_tp_size)
-            if self._routed_tp_size < 1:
-                raise ValueError(
-                    f"routed_tp_size must be positive, got {self._routed_tp_size}"
-                )
-            if self._routed_includes_shared:
-                raise RuntimeError(
-                    "post-W2 route weighting requires standalone shared expert"
-                )
         self._gate_pack_static = os.environ.get(
             "MOEDBG", "0"
         ) == "0" and self._strategy.can_use_gate_pack_static(self.gate)
@@ -316,6 +305,19 @@ class MoE(nn.Module):
         self._strategy._gate_pack_warmup_enabled = self._gate_pack_static
         self._strategy._gate_pack_route_scale = float(self.gate.route_scale)
         self._strategy.setup_weights(layer_weights)
+        if self._post_w2_route_weight_contract:
+            # setup_weights derives this from the bound tensor geometry, so a
+            # full expert remains TP-neutral while a presharded intermediate
+            # is reduced before the replicated shared-expert add.
+            self._routed_tp_size = int(self._strategy.routed_tp_size)
+            if self._routed_tp_size < 1:
+                raise ValueError(
+                    f"routed_tp_size must be positive, got {self._routed_tp_size}"
+                )
+            if self._routed_includes_shared:
+                raise RuntimeError(
+                    "post-W2 route weighting requires standalone shared expert"
+                )
 
     def _route(self, x: torch.Tensor, input_ids: torch.Tensor):
         """Run Gate under the selected strategy's explicit weight contract."""

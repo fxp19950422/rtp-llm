@@ -140,6 +140,7 @@ class Block(nn.Module):
             n_hash_layers=n_hash_layers,
             vocab_size=vocab_size,
             layer_weights=layer_weights,
+            tp_size=tp_size,
             ep_size=ep_size,
             ep_rank=ep_rank,
             max_tokens_per_rank=max_tokens_per_rank,

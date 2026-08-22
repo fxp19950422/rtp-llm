@@ -56,6 +56,7 @@ class MoeCfg:
     local_expert_start: int
     local_expert_end: int
     max_tokens_per_rank: int
+    tp_size: int = 1
 
 
 class RoutedExpertsStrategy(nn.Module):
