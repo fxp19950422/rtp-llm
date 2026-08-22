@@ -22,6 +22,7 @@ class Dsv4ProviderCapability(str, Enum):
     ATTENTION = "attention"
     MOE = "moe"
     FP8_LINEAR = "fp8_linear"
+    FP4_LINEAR = "fp4_linear"
 
 
 class Dsv4AttentionLayout(str, Enum):
@@ -52,6 +53,14 @@ class Dsv4PlatformProvider(Protocol):
     ) -> Any: ...
 
     def build_fp8_linear(
+        self, default_factory: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any: ...
+
+    def prepare_fp4_weight_scale(
+        self, default_factory: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any: ...
+
+    def build_fp4_linear(
         self, default_factory: Callable[..., Any], *args: Any, **kwargs: Any
     ) -> Any: ...
 
@@ -112,6 +121,7 @@ def _validate_provider(provider: Dsv4PlatformProvider) -> None:
         Dsv4ProviderCapability.ATTENTION: "build_attention",
         Dsv4ProviderCapability.MOE: "build_moe",
         Dsv4ProviderCapability.FP8_LINEAR: "build_fp8_linear",
+        Dsv4ProviderCapability.FP4_LINEAR: "build_fp4_linear",
     }
     for capability in capabilities:
         method_name = methods[capability]
@@ -120,6 +130,13 @@ def _validate_provider(provider: Dsv4PlatformProvider) -> None:
                 f"DSV4 provider {name!r} declares {capability.value!r} "
                 f"but has no callable {method_name}"
             )
+    if Dsv4ProviderCapability.FP4_LINEAR in capabilities and not callable(
+        getattr(provider, "prepare_fp4_weight_scale", None)
+    ):
+        raise TypeError(
+            f"DSV4 provider {name!r} declares 'fp4_linear' but has no callable "
+            "prepare_fp4_weight_scale"
+        )
     if Dsv4ProviderCapability.ATTENTION in capabilities:
         try:
             Dsv4AttentionLayout(getattr(provider, "attention_layout"))
@@ -251,15 +268,47 @@ def build_dsv4_fp8_linear(
     return provider.build_fp8_linear(default_factory, *args, **kwargs)
 
 
+def prepare_dsv4_fp4_weight_scale(
+    default_factory: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Any:
+    """Prepare routed FP4 scales in the active platform's native layout."""
+
+    provider = _PROVIDER_REGISTRY.resolve(())
+    capabilities = _normalize_capabilities(provider.capabilities)
+    if Dsv4ProviderCapability.FP4_LINEAR not in capabilities:
+        return default_factory(*args, **kwargs)
+    prepare = getattr(provider, "prepare_fp4_weight_scale", None)
+    if not callable(prepare):
+        raise TypeError(
+            f"DSV4 provider {provider.name!r} declares 'fp4_linear' but has no "
+            "callable prepare_fp4_weight_scale"
+        )
+    return prepare(default_factory, *args, **kwargs)
+
+
+def build_dsv4_fp4_linear(
+    default_factory: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Any:
+    """Build one routed FP4 linear through the active platform provider."""
+
+    provider = _PROVIDER_REGISTRY.resolve(())
+    capabilities = _normalize_capabilities(provider.capabilities)
+    if Dsv4ProviderCapability.FP4_LINEAR not in capabilities:
+        return default_factory(*args, **kwargs)
+    return provider.build_fp4_linear(default_factory, *args, **kwargs)
+
+
 __all__ = [
     "Dsv4AttentionLayout",
     "DefaultDsv4PlatformProvider",
     "Dsv4PlatformProvider",
     "Dsv4PlatformProviderRegistry",
     "Dsv4ProviderCapability",
+    "build_dsv4_fp4_linear",
     "build_dsv4_fp8_linear",
     "get_dsv4_platform_provider_capabilities",
     "register_dsv4_platform_provider",
+    "prepare_dsv4_fp4_weight_scale",
     "resolve_dsv4_attention_layout",
     "resolve_dsv4_platform_provider",
     "validate_dsv4_platform_provider_capabilities",

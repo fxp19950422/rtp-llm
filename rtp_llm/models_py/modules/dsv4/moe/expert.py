@@ -35,6 +35,19 @@ def require_silu_mul_split():
 from rtp_llm.models_py.modules.dsv4.qlinear import QuantizedLinear
 
 
+def _default_fp4_linear(
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    *,
+    scale_gemm: Optional[torch.Tensor],
+    in_features: int,
+    out_features: int,
+) -> nn.Module:
+    linear = QuantizedLinear(in_features, out_features, storage="fp4")
+    linear.bind_fp4_weight(weight, scale, scale_gemm)
+    return linear
+
+
 class Expert(nn.Module):
     """SwiGLU MLP with optional clamping.
 
@@ -81,23 +94,33 @@ class Expert(nn.Module):
             # Legacy storage="fp4" — bind weight + scale directly from
             # the framework tensors; forward still dequants on the fly
             # (until S4 swaps to grouped GEMM).
-            self.w1 = QuantizedLinear(dim, inter_dim, storage=storage)  # gate
-            self.w2 = QuantizedLinear(inter_dim, dim, storage=storage)  # down
-            self.w3 = QuantizedLinear(dim, inter_dim, storage=storage)  # up
-            self.w1.bind_fp4_weight(
+            from rtp_llm.models_py.modules.dsv4.platform_provider import (
+                build_dsv4_fp4_linear,
+            )
+
+            self.w1 = build_dsv4_fp4_linear(
+                _default_fp4_linear,
                 expert_weights["w1_w"],
                 expert_weights["w1_s"],
-                expert_weights.get("w1_s_gemm"),
+                scale_gemm=expert_weights.get("w1_s_gemm"),
+                in_features=dim,
+                out_features=inter_dim,
             )
-            self.w2.bind_fp4_weight(
+            self.w2 = build_dsv4_fp4_linear(
+                _default_fp4_linear,
                 expert_weights["w2_w"],
                 expert_weights["w2_s"],
-                expert_weights.get("w2_s_gemm"),
+                scale_gemm=expert_weights.get("w2_s_gemm"),
+                in_features=inter_dim,
+                out_features=dim,
             )
-            self.w3.bind_fp4_weight(
+            self.w3 = build_dsv4_fp4_linear(
+                _default_fp4_linear,
                 expert_weights["w3_w"],
                 expert_weights["w3_s"],
-                expert_weights.get("w3_s_gemm"),
+                scale_gemm=expert_weights.get("w3_s_gemm"),
+                in_features=dim,
+                out_features=inter_dim,
             )
         self.swiglu_limit = swiglu_limit
 

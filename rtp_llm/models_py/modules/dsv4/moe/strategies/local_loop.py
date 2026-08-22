@@ -270,6 +270,7 @@ class LocalLoopStrategy(RoutedExpertsStrategy):
             topk_max_n = _topk_dispatch_max_n()
             if (_bs1_fast_enabled()
                 and self._routed_storage == "fp4"
+                and self._W1_s_gemm.dtype == torch.int32
                 and self.cfg.ep_size == 1
                 and topk_max_n > 0
                 and T <= topk_max_n):
