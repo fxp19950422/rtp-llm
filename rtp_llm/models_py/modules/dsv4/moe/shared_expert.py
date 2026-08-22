@@ -186,10 +186,22 @@ class FusedSharedExpertFastPath:
         return weight, scale
 
     @staticmethod
+    def _has_linear_parts(linear: nn.Module) -> bool:
+        return isinstance(getattr(linear, "weight", None), torch.Tensor) and isinstance(
+            getattr(linear, "weight_scales", None), torch.Tensor
+        )
+
+    @staticmethod
     def can_run(shared_experts: nn.Module, x: torch.Tensor) -> bool:
         if not (x.is_cuda and x.dtype == torch.bfloat16 and x.dim() == 2):
             return False
-        return all(hasattr(shared_experts, name) for name in ("w13", "w2"))
+        return all(
+            hasattr(shared_experts, name)
+            and FusedSharedExpertFastPath._has_linear_parts(
+                getattr(shared_experts, name)
+            )
+            for name in ("w13", "w2")
+        )
 
     @classmethod
     def has_merged_w13(cls, shared_experts: nn.Module) -> bool:
@@ -235,6 +247,16 @@ class FusedSharedExpertFastPath:
         """Validate the loader-prepared merged w13; no runtime concatenation."""
         if not hasattr(shared_experts, "w13"):
             raise RuntimeError("DSV4 shared expert requires loader-prepared w13")
+        # Platform linears such as M890P PpuFp8Linear own their quantization
+        # and GEMM ABI and expose ``weight_scale`` rather than the CUDA
+        # factory's packed ``weight_scales``.  They must use Expert.forward,
+        # not this CUDA/Triton fused workspace path.
+        if not all(
+            hasattr(shared_experts, name)
+            and self._has_linear_parts(getattr(shared_experts, name))
+            for name in ("w13", "w2")
+        ):
+            return
         w13_w, w13_s = self._linear_parts(shared_experts.w13)
         if w13_w.dim() != 2:
             raise RuntimeError(f"shared w13 weight must be 2D, got {w13_w.dim()}D")
