@@ -303,6 +303,19 @@ class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
         self.assertEqual(result["values"], [list(range(1, 5))] * 8)
         self.assertEqual(result["addresses"], [result["addresses"][0]] * 8)
 
+    def test_dropped_lease_auto_fences_aux_stream_before_slot_reuse(self) -> None:
+        model = OriginRowStatusModel()
+        result = run_numerical_status_scenario(
+            model,
+            [4] * 8,
+            consume_on_aux_stream=True,
+            omit_mark_consumed=True,
+        )
+
+        self.assertEqual(result["epochs"], list(range(1, 9)))
+        self.assertEqual(result["values"], [list(range(1, 5))] * 8)
+        self.assertEqual(result["addresses"], [result["addresses"][0]] * 8)
+
     def test_exception_records_source_fence_before_cross_stream_retry(self) -> None:
         model = ThrowingOriginRowStatusModel()
         result = run_numerical_status_scenario(

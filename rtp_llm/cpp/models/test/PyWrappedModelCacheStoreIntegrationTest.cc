@@ -595,6 +595,7 @@ py::dict runPyWrappedModelNumericalStatusScenario(py::object                 py_
                                                   const std::vector<int32_t>& live_rows,
                                                   bool                       hold_leases,
                                                   bool                       consume_on_aux_stream,
+                                                  bool                       omit_mark_consumed,
                                                   int64_t                    expected_throw_index,
                                                   bool                       read_values) {
     ensureRuntimeInitialized();
@@ -673,7 +674,9 @@ py::dict runPyWrappedModelNumericalStatusScenario(py::object                 py_
                 status.waitReady(consumer_stream);
                 cuda_graph::GraphStreamGuard consumer_guard(consumer_stream);
                 observed_values.push_back(status.values.clone());
-                status.markConsumed(consumer_stream);
+                if (!omit_mark_consumed) {
+                    status.markConsumed(consumer_stream);
+                }
             } else {
                 const auto producer_stream = producer_streams[index % producer_streams.size()];
                 status.waitReady(producer_stream);
@@ -727,6 +730,7 @@ PYBIND11_MODULE(libth_pywrapped_model_cache_store_integration_test, m) {
           py::arg("live_rows"),
           py::arg("hold_leases")          = false,
           py::arg("consume_on_aux_stream") = false,
+          py::arg("omit_mark_consumed")    = false,
           py::arg("expected_throw_index")  = -1,
           py::arg("read_values")           = true);
 }
