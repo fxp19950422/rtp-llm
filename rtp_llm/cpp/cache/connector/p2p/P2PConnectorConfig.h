@@ -3,7 +3,10 @@
 #include "rtp_llm/cpp/cache/connector/p2p/transfer/TransferBackendConfig.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include <cstdint>
+#include <functional>
+#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace rtp_llm {
@@ -46,10 +49,22 @@ struct P2PConnectorWorkerConfig {
     int  cp_size          = 1;
     bool kv_cache_sharded = false;
 
+    static void validateDescriptorHandshake(bool                                     require_descriptor_handshake,
+                                            const std::function<bool(std::string&)>& descriptor_wire_provider) {
+        if (require_descriptor_handshake != static_cast<bool>(descriptor_wire_provider)) {
+            throw std::invalid_argument(
+                "descriptor handshake opt-in and provider must be configured together");
+        }
+    }
+
     static P2PConnectorWorkerConfig create(const CacheStoreConfig&  cache_store_config,
                                            const PDSepConfig&       pd_sep_config,
                                            const ParallelismConfig& parallelism_config,
-                                           uint32_t                 layer_all_num) {
+                                           uint32_t                 layer_all_num,
+                                           bool                     require_descriptor_handshake = false,
+                                           std::function<bool(std::string&)>
+                                               descriptor_wire_provider = {}) {
+        validateDescriptorHandshake(require_descriptor_handshake, descriptor_wire_provider);
         P2PConnectorWorkerConfig config;
         config.transfer_backend_config.cache_store_rdma_mode         = cache_store_config.cache_store_rdma_mode;
         config.transfer_backend_config.rdma_transfer_wait_timeout_ms = cache_store_config.rdma_transfer_wait_timeout_ms;
@@ -68,6 +83,8 @@ struct P2PConnectorWorkerConfig {
         config.tp_size                                 = parallelism_config.tp_size;
         config.tp_rank                                 = parallelism_config.tp_rank;
         config.layer_all_num                           = layer_all_num;
+        config.transfer_backend_config.require_descriptor_handshake = require_descriptor_handshake;
+        config.transfer_backend_config.descriptor_wire_provider     = std::move(descriptor_wire_provider);
         config.kv_cache_sharded                        = parallelism_config.prefill_cp_config.kv_cache_sharded;
         if (config.kv_cache_sharded && parallelism_config.tp_size > 1) {
             config.cp_size = static_cast<int>(parallelism_config.tp_size);
@@ -88,14 +105,22 @@ struct P2PConnectorConfig {
                                      const CacheStoreConfig&  cache_store_config,
                                      const ParallelismConfig& parallelism_config,
                                      const PDSepConfig&       pd_sep_config,
-                                     uint32_t                 layer_all_num) {
+                                     uint32_t                 layer_all_num,
+                                     bool                     require_descriptor_handshake = false,
+                                     std::function<bool(std::string&)>
+                                         descriptor_wire_provider = {}) {
         P2PConnectorConfig config;
         config.role_type = pd_sep_config.role_type;
         config.tp_rank   = parallelism_config.tp_rank;
         config.scheduler_config =
             P2PConnectorSchedulerConfig::create(runtime_config, cache_store_config, pd_sep_config);
         config.worker_config =
-            P2PConnectorWorkerConfig::create(cache_store_config, pd_sep_config, parallelism_config, layer_all_num);
+            P2PConnectorWorkerConfig::create(cache_store_config,
+                                             pd_sep_config,
+                                             parallelism_config,
+                                             layer_all_num,
+                                             require_descriptor_handshake,
+                                             std::move(descriptor_wire_provider));
         return config;
     }
 };
