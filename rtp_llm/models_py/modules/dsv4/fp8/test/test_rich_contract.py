@@ -1,9 +1,10 @@
 """Source-only contract checks for the fixed sparse-attention geometry."""
 
-import unittest
+import ast
 import importlib.util
 import sys
 import types
+import unittest
 from pathlib import Path
 
 
@@ -73,6 +74,38 @@ class RichContractTest(unittest.TestCase):
         self.assertIn("_validate_model1_cache_tensor", source)
         self.assertIn("length.dtype != torch.int32", source)
         self.assertIn("length.device != q.device", source)
+
+    def test_flash_mla_wrapper_keyword_mapping(self):
+        path = _ROOT / "decode" / "fp8_sparse_attn_decode_op.py"
+        tree = ast.parse(path.read_text())
+        calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "flash_mla_with_kvcache"
+        ]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            [keyword.arg for keyword in calls[0].keywords],
+            [
+                "q",
+                "k_cache",
+                "block_table",
+                "head_dim_v",
+                "cache_seqlens",
+                "tile_scheduler_metadata",
+                "num_splits",
+                "is_fp8_kvcache",
+                "indices",
+                "softmax_scale",
+                "topk_length",
+                "attn_sink",
+                "extra_k_cache",
+                "extra_indices_in_kvcache",
+                "extra_topk_length",
+            ],
+        )
 
 
 if __name__ == "__main__":

@@ -41,6 +41,16 @@ filegroup(
 )
 
 filegroup(
+    name = "dsv4_rich_attention_contract_sources",
+    srcs = [
+        "modules/dsv4/fp8/decode/attention_kernels.py",
+        "modules/dsv4/fp8/decode/decode_attn_metadata.py",
+        "modules/dsv4/fp8/decode/fp8_sparse_attn_decode_op.py",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
     name = "rocm_fp8_ptpc_hipb_solutions",
     srcs = [
         "modules/factory/linear/impl/rocm/data/fp8_ptpc_hipb_solutions.json",

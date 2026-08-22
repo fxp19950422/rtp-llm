@@ -89,6 +89,13 @@ py_test(
 )
 
 py_test(
+    name = "test_rich_contract_source_only",
+    srcs = ["test_rich_contract.py"],
+    data = ["//rtp_llm/models_py:dsv4_rich_attention_contract_sources"],
+    main = "test_rich_contract.py",
+)
+
+py_test(
     name = "test_pool_slot_mapping_split",
     srcs = ["test_pool_slot_mapping_split.py"],
     deps = _DSV4_FP8_TEST_DEPS,
