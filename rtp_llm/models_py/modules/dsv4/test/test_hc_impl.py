@@ -42,6 +42,40 @@ def _weights(hc: int, dim: int, device: str = "cpu"):
 
 
 class TestHCImpl(unittest.TestCase):
+    def test_fallback_tp_replicated_hidden_matches_single_rank(self) -> None:
+        hc, dim = 4, 8
+        fn, base, scale = _weights(hc, dim)
+        residual = torch.randn(3, hc, dim, dtype=torch.bfloat16)
+        reference = FallbackHCUnit(
+            fn,
+            base,
+            scale,
+            dim=dim,
+            hc_mult=hc,
+            hc_sinkhorn_iters=3,
+            norm_eps=1e-6,
+            hc_eps=1e-6,
+        )
+        replicated = FallbackHCUnit(
+            fn,
+            base,
+            scale,
+            dim=dim,
+            hc_mult=hc,
+            hc_sinkhorn_iters=3,
+            norm_eps=1e-6,
+            hc_eps=1e-6,
+        )
+        replicated.tp_size = 2
+        replicated.tp_rank = 1
+        target = "rtp_llm.models_py.distributed.collective_torch.all_reduce"
+        expected = reference.pre(residual)
+        with mock.patch(target) as all_reduce:
+            actual = replicated.pre(residual)
+        for actual_tensor, expected_tensor in zip(actual, expected):
+            torch.testing.assert_close(actual_tensor, expected_tensor)
+        all_reduce.assert_not_called()
+
     def test_fallback_tp_hidden_shard_matches_global_pre_and_head(self) -> None:
         hc, global_dim, tp_size, tp_rank = 4, 8, 2, 1
         local_dim = global_dim // tp_size
