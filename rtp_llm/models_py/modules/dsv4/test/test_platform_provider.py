@@ -19,6 +19,8 @@ Dsv4ProviderCapability = _PROVIDER_MODULE.Dsv4ProviderCapability
 Dsv4AttentionLayout = _PROVIDER_MODULE.Dsv4AttentionLayout
 resolve_dsv4_attention_layout = _PROVIDER_MODULE.resolve_dsv4_attention_layout
 build_dsv4_fp8_linear = _PROVIDER_MODULE.build_dsv4_fp8_linear
+build_dsv4_fp4_linear = _PROVIDER_MODULE.build_dsv4_fp4_linear
+prepare_dsv4_fp4_weight_scale = _PROVIDER_MODULE.prepare_dsv4_fp4_weight_scale
 
 
 class _Provider:
@@ -84,7 +86,49 @@ class _Fp8Provider(_Provider):
         return ("provider-fp8", default_factory, args, kwargs)
 
 
+class _Fp4Provider(_Provider):
+    capabilities = _Provider.capabilities | {
+        Dsv4ProviderCapability.FP4_LINEAR,
+    }
+
+    def prepare_fp4_weight_scale(self, default_factory, *args, **kwargs):
+        return ("provider-fp4-scale", default_factory, args, kwargs)
+
+    def build_fp4_linear(self, default_factory, *args, **kwargs):
+        return ("provider-fp4-linear", default_factory, args, kwargs)
+
+
 class Dsv4PlatformProviderRegistryTest(unittest.TestCase):
+    def test_fp4_scale_and_linear_dispatch_are_owned_together(self):
+        original_registry = _PROVIDER_MODULE._PROVIDER_REGISTRY
+        try:
+            _PROVIDER_MODULE._PROVIDER_REGISTRY = Dsv4PlatformProviderRegistry()
+            sentinel = object()
+            self.assertIs(
+                prepare_dsv4_fp4_weight_scale(lambda value: value, sentinel),
+                sentinel,
+            )
+            self.assertIs(
+                build_dsv4_fp4_linear(lambda value: value, sentinel), sentinel
+            )
+
+            registry = Dsv4PlatformProviderRegistry()
+            registry.register(_Fp4Provider())
+            _PROVIDER_MODULE._PROVIDER_REGISTRY = registry
+            prepared = prepare_dsv4_fp4_weight_scale(
+                lambda value: value, sentinel, groups=2
+            )
+            linear = build_dsv4_fp4_linear(
+                lambda value: value, sentinel, out_features=128
+            )
+            self.assertEqual(prepared[0], "provider-fp4-scale")
+            self.assertEqual(linear[0], "provider-fp4-linear")
+            self.assertIs(prepared[2][0], sentinel)
+            self.assertEqual(prepared[3]["groups"], 2)
+            self.assertEqual(linear[3]["out_features"], 128)
+        finally:
+            _PROVIDER_MODULE._PROVIDER_REGISTRY = original_registry
+
     def test_fp8_linear_dispatch_is_explicit_and_preserves_default(self):
         original_registry = _PROVIDER_MODULE._PROVIDER_REGISTRY
         try:
