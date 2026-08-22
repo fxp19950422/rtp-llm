@@ -18,6 +18,7 @@ Dsv4PlatformProviderRegistry = _PROVIDER_MODULE.Dsv4PlatformProviderRegistry
 Dsv4ProviderCapability = _PROVIDER_MODULE.Dsv4ProviderCapability
 Dsv4AttentionLayout = _PROVIDER_MODULE.Dsv4AttentionLayout
 resolve_dsv4_attention_layout = _PROVIDER_MODULE.resolve_dsv4_attention_layout
+build_dsv4_fp8_linear = _PROVIDER_MODULE.build_dsv4_fp8_linear
 
 
 class _Provider:
@@ -74,7 +75,36 @@ class _AttentionProvider(_Provider):
         return ("moe", default_factory, args, kwargs)
 
 
+class _Fp8Provider(_Provider):
+    capabilities = _Provider.capabilities | {
+        Dsv4ProviderCapability.FP8_LINEAR,
+    }
+
+    def build_fp8_linear(self, default_factory, *args, **kwargs):
+        return ("provider-fp8", default_factory, args, kwargs)
+
+
 class Dsv4PlatformProviderRegistryTest(unittest.TestCase):
+    def test_fp8_linear_dispatch_is_explicit_and_preserves_default(self):
+        original_registry = _PROVIDER_MODULE._PROVIDER_REGISTRY
+        try:
+            _PROVIDER_MODULE._PROVIDER_REGISTRY = Dsv4PlatformProviderRegistry()
+            sentinel = object()
+            self.assertIs(
+                build_dsv4_fp8_linear(lambda value: value, sentinel), sentinel
+            )
+
+            registry = Dsv4PlatformProviderRegistry()
+            provider = _Fp8Provider()
+            registry.register(provider)
+            _PROVIDER_MODULE._PROVIDER_REGISTRY = registry
+            result = build_dsv4_fp8_linear(lambda value: value, sentinel, flag=True)
+            self.assertEqual(result[0], "provider-fp8")
+            self.assertIs(result[2][0], sentinel)
+            self.assertTrue(result[3]["flag"])
+        finally:
+            _PROVIDER_MODULE._PROVIDER_REGISTRY = original_registry
+
     def test_default_provider_delegates_arguments_and_exceptions_exactly(self):
         provider = DefaultDsv4PlatformProvider()
         sentinel = object()

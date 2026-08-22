@@ -21,6 +21,7 @@ class Dsv4ProviderCapability(str, Enum):
     TRANSFORMER = "transformer"
     ATTENTION = "attention"
     MOE = "moe"
+    FP8_LINEAR = "fp8_linear"
 
 
 class Dsv4AttentionLayout(str, Enum):
@@ -47,6 +48,10 @@ class Dsv4PlatformProvider(Protocol):
     ) -> Any: ...
 
     def build_moe(
+        self, default_factory: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any: ...
+
+    def build_fp8_linear(
         self, default_factory: Callable[..., Any], *args: Any, **kwargs: Any
     ) -> Any: ...
 
@@ -106,6 +111,7 @@ def _validate_provider(provider: Dsv4PlatformProvider) -> None:
         Dsv4ProviderCapability.TRANSFORMER: "build_transformer",
         Dsv4ProviderCapability.ATTENTION: "build_attention",
         Dsv4ProviderCapability.MOE: "build_moe",
+        Dsv4ProviderCapability.FP8_LINEAR: "build_fp8_linear",
     }
     for capability in capabilities:
         method_name = methods[capability]
@@ -228,12 +234,30 @@ def resolve_dsv4_platform_provider(
     return _PROVIDER_REGISTRY.resolve(required)
 
 
+def build_dsv4_fp8_linear(
+    default_factory: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Any:
+    """Let an active platform provider own DSV4 FP8 storage and launch.
+
+    Providers that do not explicitly claim ``FP8_LINEAR`` preserve the
+    existing public ``LinearFactory`` path.  Resolution is construction-time
+    immutable, matching the block/attention/MoE provider boundary.
+    """
+
+    provider = _PROVIDER_REGISTRY.resolve(())
+    capabilities = _normalize_capabilities(provider.capabilities)
+    if Dsv4ProviderCapability.FP8_LINEAR not in capabilities:
+        return default_factory(*args, **kwargs)
+    return provider.build_fp8_linear(default_factory, *args, **kwargs)
+
+
 __all__ = [
     "Dsv4AttentionLayout",
     "DefaultDsv4PlatformProvider",
     "Dsv4PlatformProvider",
     "Dsv4PlatformProviderRegistry",
     "Dsv4ProviderCapability",
+    "build_dsv4_fp8_linear",
     "get_dsv4_platform_provider_capabilities",
     "register_dsv4_platform_provider",
     "resolve_dsv4_attention_layout",

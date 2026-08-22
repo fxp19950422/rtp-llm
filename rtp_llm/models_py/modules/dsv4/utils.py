@@ -31,16 +31,23 @@ def _repack_v4_fp8_scale_to_int32(scale: torch.Tensor) -> torch.Tensor:
 
 def _v4_fp8_linear(w: torch.Tensor, s: torch.Tensor):
     """Build a CudaFp8DeepGEMMLinear from raw V4 FP8 weight + scale tensors."""
-    assert s is not None, "expected non-null FP8 scale"
-    if s.dtype == torch.float8_e8m0fnu:
-        s = _repack_v4_fp8_scale_to_int32(s)
-    local = {"_w": w, "_s": s}
-    return LinearFactory.create_linear_from_weights(
-        local,
-        "_w",
-        "_s",
-        quant_config=_V4_FP8_BLOCK_CFG,
+    from rtp_llm.models_py.modules.dsv4.platform_provider import (
+        build_dsv4_fp8_linear,
     )
+
+    def _default_factory(weight: torch.Tensor, scale: torch.Tensor):
+        if scale.dtype == torch.float8_e8m0fnu:
+            scale = _repack_v4_fp8_scale_to_int32(scale)
+        local = {"_w": weight, "_s": scale}
+        return LinearFactory.create_linear_from_weights(
+            local,
+            "_w",
+            "_s",
+            quant_config=_V4_FP8_BLOCK_CFG,
+        )
+
+    assert s is not None, "expected non-null FP8 scale"
+    return build_dsv4_fp8_linear(_default_factory, w, s)
 
 
 def _v4_fp8_linear_from_dict(weights: dict, weight_key: str, scale_key: str):

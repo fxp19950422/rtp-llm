@@ -394,19 +394,26 @@ def _v4_fp8_linear(w: torch.Tensor, s: torch.Tensor):
     Repacks the UE8M0 ``float8_e8m0fnu`` scale into DeepGEMM's int32
     TMA-aligned packed layout when needed. Framework descriptor path may
     deliver the scale already packed (dtype int32) — we no-op then."""
-    assert s is not None, "expected non-null FP8 scale"
-    if s.dtype == torch.float8_e8m0fnu:
-        s = _repack_v4_fp8_scale_to_int32(s)
-    # LinearFactory.create_linear_from_weights consumes a (weights_dict,
-    # weight_key, scale_key) triple — feed it a one-shot dict so the
-    # factory plumbing is unchanged.
-    local = {"_w": w, "_s": s}
-    return LinearFactory.create_linear_from_weights(
-        local,
-        "_w",
-        "_s",
-        quant_config=_V4_FP8_BLOCK_CFG,
+    from rtp_llm.models_py.modules.dsv4.platform_provider import (
+        build_dsv4_fp8_linear,
     )
+
+    def _default_factory(weight: torch.Tensor, scale: torch.Tensor):
+        if scale.dtype == torch.float8_e8m0fnu:
+            scale = _repack_v4_fp8_scale_to_int32(scale)
+        # LinearFactory.create_linear_from_weights consumes a (weights_dict,
+        # weight_key, scale_key) triple — feed it a one-shot dict so the
+        # factory plumbing is unchanged.
+        local = {"_w": weight, "_s": scale}
+        return LinearFactory.create_linear_from_weights(
+            local,
+            "_w",
+            "_s",
+            quant_config=_V4_FP8_BLOCK_CFG,
+        )
+
+    assert s is not None, "expected non-null FP8 scale"
+    return build_dsv4_fp8_linear(_default_factory, w, s)
 
 
 def _v4_fp8_linear_from_dict(weights: dict, weight_key: str, scale_key: str):
