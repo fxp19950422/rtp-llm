@@ -3118,10 +3118,16 @@ void KVCacheMemoryConnector::referencePrefixCacheBacking(const PrefixTreeMemoryB
 
 std::shared_ptr<BlockPool> KVCacheMemoryConnector::memoryPoolFor(CacheBlockKind kind) const {
     if (kind == CacheBlockKind::COMPRESSED_KV) {
-        return compressed_pool_;
+        if (compressed_pool_) {
+            return compressed_pool_;
+        }
+        return isDualPool() ? complete_pool_ : block_pool_;
     }
     if (kind == CacheBlockKind::STATE_SWA_KV) {
-        return state_swa_pool_;
+        if (state_swa_pool_) {
+            return state_swa_pool_;
+        }
+        return isDualPool() ? incomplete_pool_ : block_pool_;
     }
     if (!isDualPool()) {
         return block_pool_;
