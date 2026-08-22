@@ -33,6 +33,18 @@ cc_library(
 )
 
 cc_test(
+    name = "p2p_connector_config_test",
+    srcs = [
+        "P2PConnectorConfigTest.cc",
+    ],
+    deps = [
+        "//rtp_llm/cpp/cache/connector/p2p:p2p_connector_config",
+        "@com_google_googletest//:gtest_main",
+    ],
+    copts = test_copts,
+)
+
+cc_test(
     name = "components_test",
     srcs = [
         "main.cc",
