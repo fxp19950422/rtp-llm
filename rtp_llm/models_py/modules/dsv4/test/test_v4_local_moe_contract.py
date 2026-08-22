@@ -64,6 +64,8 @@ sys.modules.setdefault("rtp_llm.models_py.modules.dsv4.qlinear", _qlinear)
 
 from rtp_llm.models_py.modules.dsv4.moe import expert as expert_module
 from rtp_llm.models_py.modules.dsv4.moe.expert import Expert
+from rtp_llm.models_py.modules.dsv4.moe.strategies import local_loop as local_loop_module
+from rtp_llm.models_py.modules.dsv4.moe.strategies.base import MoeCfg
 from rtp_llm.models_py.modules.dsv4.moe.strategies.local_loop import (
     LocalLoopStrategy,
 )
@@ -227,6 +229,54 @@ class LocalLoopE8Top2OccupancyTest(unittest.TestCase):
         for name, (indices, weights) in cases.items():
             with self.subTest(name=name):
                 self._check(indices, weights)
+
+
+class LocalLoopRoutedStorageTest(unittest.TestCase):
+    def test_fp8_geometry_uses_platform_linears_without_fp4_scale_packing(self):
+        from rtp_llm.utils.model_weight import W
+
+        cfg = MoeCfg(
+            layer_id=0,
+            dim=8,
+            moe_inter_dim=8,
+            n_routed_experts=2,
+            n_activated_experts=1,
+            swiglu_limit=10.0,
+            ep_size=1,
+            ep_rank=0,
+            n_local_experts=2,
+            local_expert_start=0,
+            local_expert_end=2,
+            max_tokens_per_rank=1,
+            tp_size=2,
+        )
+        weights = {
+            W.v4_routed_w1_w: torch.zeros((2, 4, 8), dtype=torch.uint8),
+            W.v4_routed_w1_s: torch.ones((2, 1, 1), dtype=torch.float32),
+            W.v4_routed_w2_w: torch.zeros((2, 8, 4), dtype=torch.uint8),
+            W.v4_routed_w2_s: torch.ones((2, 1, 1), dtype=torch.float32),
+            W.v4_routed_w3_w: torch.zeros((2, 4, 8), dtype=torch.uint8),
+            W.v4_routed_w3_s: torch.ones((2, 1, 1), dtype=torch.float32),
+        }
+        seen_storage: list[str] = []
+
+        class _FakeExpert(nn.Module):
+            def __init__(self, *_args, storage: str, **_kwargs):
+                super().__init__()
+                seen_storage.append(storage)
+
+        strategy = LocalLoopStrategy(cfg)
+        with mock.patch.object(local_loop_module, "Expert", _FakeExpert), mock.patch.object(
+            local_loop_module,
+            "prepare_fp4_weight_scale_for_deepgemm",
+            side_effect=AssertionError("FP8 weights must not enter FP4 scale packing"),
+        ):
+            strategy.setup_weights(weights)
+
+        self.assertEqual(strategy._routed_storage, "fp8")
+        self.assertEqual(seen_storage, ["fp8", "fp8"])
+        self.assertIsNone(strategy._W1_s_gemm)
+        self.assertEqual(strategy.routed_tp_size, 2)
 
 
 class LocalLoopFastPathQuantizationSpyTest(unittest.TestCase):
