@@ -183,17 +183,11 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm(layer_weights[W.v4_attn_norm], norm_eps)
         self.ffn_norm = RMSNorm(layer_weights[W.v4_ffn_norm], norm_eps)
 
-        if dim % self.tp_size:
-            raise ValueError(
-                f"DSV4 hidden size={dim} is not divisible by tp_size={self.tp_size}"
-            )
-        hc_dim = dim // self.tp_size
-
         self.attn_hc = build_hc_unit(
             layer_weights[W.v4_hc_attn_fn],
             layer_weights[W.v4_hc_attn_base],
             layer_weights[W.v4_hc_attn_scale],
-            dim=hc_dim,
+            dim=dim,
             hc_mult=hc_mult,
             hc_sinkhorn_iters=hc_sinkhorn_iters,
             norm_eps=norm_eps,
@@ -207,7 +201,7 @@ class Block(nn.Module):
             layer_weights[W.v4_hc_ffn_fn],
             layer_weights[W.v4_hc_ffn_base],
             layer_weights[W.v4_hc_ffn_scale],
-            dim=hc_dim,
+            dim=dim,
             hc_mult=hc_mult,
             hc_sinkhorn_iters=hc_sinkhorn_iters,
             norm_eps=norm_eps,

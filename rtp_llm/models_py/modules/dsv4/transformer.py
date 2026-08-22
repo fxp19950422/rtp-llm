@@ -249,7 +249,7 @@ class V4Transformer(nn.Module):
             gw[W.v4_hc_head_fn],
             gw[W.v4_hc_head_base],
             gw[W.v4_hc_head_scale],
-            dim=args.dim // args.tp_size,
+            dim=args.dim,
             hc_mult=args.hc_mult,
             norm_eps=args.norm_eps,
             hc_eps=args.hc_eps,
@@ -468,6 +468,19 @@ class V4Transformer(nn.Module):
         """Reduce the hc axis for ``[B, S, hc, d]`` or flat ``[T, hc, d]``."""
         return self.head_hc.head(x)
 
+    def _embed(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Embed tokens and restore the replicated global hidden dimension."""
+
+        hidden = self.embed(input_ids)
+        if self.args.tp_size > 1 and hidden.shape[-1] != self.args.dim:
+            hidden = tp_gather_hidden(hidden, tp_size=self.args.tp_size)
+        if hidden.shape[-1] != self.args.dim:
+            raise ValueError(
+                f"DSV4 embedding hidden size must be {self.args.dim}, "
+                f"got {hidden.shape[-1]}"
+            )
+        return hidden
+
     def _norm(self, x: torch.Tensor) -> torch.Tensor:
         """Apply final global RMSNorm and restore the full hidden dimension."""
 
@@ -477,7 +490,7 @@ class V4Transformer(nn.Module):
             tp_size=self.args.tp_size,
             tp_rank=self.args.tp_rank,
         )
-        if self.args.tp_size == 1:
+        if normalized.shape[-1] == self.args.dim:
             return normalized
         return tp_gather_hidden(normalized, tp_size=self.args.tp_size)
 
@@ -500,7 +513,7 @@ class V4Transformer(nn.Module):
             input_ids_2d = input_ids.view(B, q_len)
         else:
             input_ids_2d = input_ids
-        h = self.embed(input_ids_2d)  # [B, q_len, dim]
+        h = self._embed(input_ids_2d)  # [B, q_len, dim]
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)  # [B, q_len, hc, dim]
         for layer in self.layers:
             h = layer.forward_decode(
@@ -596,7 +609,7 @@ class V4Transformer(nn.Module):
             # begin() may suppress this forward (MOEDBG_MAX_SEQ); honour it.
             if _rt._get_buf() is None:
                 _rt_on = False
-        h = self.embed(input_ids)  # [B, S, d]
+        h = self._embed(input_ids)  # [B, S, d]
         if _rt_on:
             _rt.record("embed_out", h)
         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)  # [B, S, hc, d]

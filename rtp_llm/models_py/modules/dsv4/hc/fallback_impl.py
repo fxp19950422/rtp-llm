@@ -22,15 +22,15 @@ def _tp_linear_mixes(
     global_k = int(weight.shape[-1])
     tp_size = int(getattr(module, "tp_size", 1))
     tp_rank = int(getattr(module, "tp_rank", 0))
-    if tp_size == 1:
-        if local_k != global_k:
-            raise ValueError(
-                f"mHC input K={local_k} disagrees with weight K={global_k}"
-            )
+    if local_k == global_k:
+        # Standard tensor parallelism keeps the residual hidden dimension
+        # replicated after the embedding gather and output all-reduce.
         rsqrt = torch.rsqrt(
             x_flat.float().square().mean(-1, keepdim=True) + module.norm_eps
         ).to(x_flat.dtype)
         return (F.linear(linear_input, weight) * rsqrt).float()
+    if tp_size == 1:
+        raise ValueError(f"mHC input K={local_k} disagrees with weight K={global_k}")
     if tp_size <= 0 or not 0 <= tp_rank < tp_size:
         raise ValueError(f"invalid mHC TP geometry: size={tp_size}, rank={tp_rank}")
     if global_k != local_k * tp_size:

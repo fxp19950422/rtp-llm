@@ -17,24 +17,23 @@ def tp_rms_norm(
 
     tp_size = int(tp_size)
     tp_rank = int(tp_rank)
-    if tp_size == 1:
+    local_dim = int(x.shape[-1])
+    weight = norm.weight.data
+    if tp_size == 1 or int(weight.numel()) == local_dim:
+        # The regular TP layout keeps hidden states replicated; both the
+        # activation and the affine weight therefore have the global width.
         return norm(x)
     if tp_size <= 0 or not 0 <= tp_rank < tp_size:
         raise ValueError(f"invalid RMSNorm TP geometry: size={tp_size}, rank={tp_rank}")
 
-    local_dim = int(x.shape[-1])
     global_dim = local_dim * tp_size
-    weight = norm.weight.data
     if int(weight.numel()) == global_dim:
         start = tp_rank * local_dim
         weight_shard = weight[start : start + local_dim]
-    elif int(weight.numel()) == local_dim:
-        # Also accept loaders that already shard the affine weight.
-        weight_shard = weight
     else:
         raise ValueError(
-            f"RMSNorm weight size={weight.numel()} does not match local hidden "
-            f"size={local_dim} or global hidden size={global_dim}"
+            f"RMSNorm weight size={weight.numel()} does not match global hidden "
+            f"size={global_dim} for local hidden size={local_dim}"
         )
 
     square_sum = x.float().square().sum(-1, keepdim=True)
