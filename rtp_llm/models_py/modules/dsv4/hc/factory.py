@@ -31,13 +31,15 @@ def build_hc_unit(
     hc_eps: float,
     layer_id: int = -1,
     name: str = "",
+    tp_size: int = 1,
+    tp_rank: int = 0,
 ) -> HCUnitBase:
     mode = _mode_from_env()
     scale = maybe_squeeze_hc_1d(scale)
     if mode is HCMode.TILELANG:
         from rtp_llm.models_py.modules.dsv4.hc.tilelang_impl import TileLangHCUnit
 
-        return TileLangHCUnit(
+        unit = TileLangHCUnit(
             fn,
             base,
             scale,
@@ -49,20 +51,24 @@ def build_hc_unit(
             layer_id=layer_id,
             name=name,
         )
-    from rtp_llm.models_py.modules.dsv4.hc.fallback_impl import FallbackHCUnit
+    else:
+        from rtp_llm.models_py.modules.dsv4.hc.fallback_impl import FallbackHCUnit
 
-    return FallbackHCUnit(
-        fn,
-        base,
-        scale,
-        dim=dim,
-        hc_mult=hc_mult,
-        hc_sinkhorn_iters=hc_sinkhorn_iters,
-        norm_eps=norm_eps,
-        hc_eps=hc_eps,
-        layer_id=layer_id,
-        name=name,
-    )
+        unit = FallbackHCUnit(
+            fn,
+            base,
+            scale,
+            dim=dim,
+            hc_mult=hc_mult,
+            hc_sinkhorn_iters=hc_sinkhorn_iters,
+            norm_eps=norm_eps,
+            hc_eps=hc_eps,
+            layer_id=layer_id,
+            name=name,
+        )
+    unit.tp_size = int(tp_size)
+    unit.tp_rank = int(tp_rank)
+    return unit
 
 
 def build_hc_head(
@@ -74,13 +80,15 @@ def build_hc_head(
     hc_mult: int,
     norm_eps: float,
     hc_eps: float,
+    tp_size: int = 1,
+    tp_rank: int = 0,
 ) -> HCHeadBase:
     mode = _mode_from_env()
     scale = maybe_squeeze_hc_1d(scale)
     if mode is HCMode.TILELANG:
         from rtp_llm.models_py.modules.dsv4.hc.tilelang_impl import TileLangHCHead
 
-        return TileLangHCHead(
+        head = TileLangHCHead(
             fn,
             base,
             scale,
@@ -89,14 +97,18 @@ def build_hc_head(
             norm_eps=norm_eps,
             hc_eps=hc_eps,
         )
-    from rtp_llm.models_py.modules.dsv4.hc.fallback_impl import FallbackHCHead
+    else:
+        from rtp_llm.models_py.modules.dsv4.hc.fallback_impl import FallbackHCHead
 
-    return FallbackHCHead(
-        fn,
-        base,
-        scale,
-        dim=dim,
-        hc_mult=hc_mult,
-        norm_eps=norm_eps,
-        hc_eps=hc_eps,
-    )
+        head = FallbackHCHead(
+            fn,
+            base,
+            scale,
+            dim=dim,
+            hc_mult=hc_mult,
+            norm_eps=norm_eps,
+            hc_eps=hc_eps,
+        )
+    head.tp_size = int(tp_size)
+    head.tp_rank = int(tp_rank)
+    return head

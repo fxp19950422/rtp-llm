@@ -174,6 +174,8 @@ class Block(nn.Module):
             hc_eps=hc_eps,
             layer_id=layer_id,
             name="attn",
+            tp_size=tp_size,
+            tp_rank=tp_rank,
         )
         self.ffn_hc = build_hc_unit(
             layer_weights[W.v4_hc_ffn_fn],
@@ -186,6 +188,8 @@ class Block(nn.Module):
             hc_eps=hc_eps,
             layer_id=layer_id,
             name="ffn",
+            tp_size=tp_size,
+            tp_rank=tp_rank,
         )
         self._prefill_fast_hc_impls_cached = self._resolve_prefill_fast_hc_impls()
 

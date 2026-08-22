@@ -252,6 +252,8 @@ class V4Transformer(nn.Module):
             hc_mult=args.hc_mult,
             norm_eps=args.norm_eps,
             hc_eps=args.hc_eps,
+            tp_size=args.tp_size,
+            tp_rank=args.tp_rank,
         )
 
         self._dbg_step = 0

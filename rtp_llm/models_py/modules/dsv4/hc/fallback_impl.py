@@ -11,6 +11,58 @@ import torch.nn.functional as F
 from rtp_llm.models_py.modules.dsv4.hc.base import HCHeadBase, HCUnitBase
 
 
+def _tp_linear_mixes(
+    module, x_flat: torch.Tensor, *, use_fp32: bool = False
+) -> torch.Tensor:
+    """Compute global mHC mixes from one hidden-dimension TP shard."""
+
+    weight = module.fn if use_fp32 else module._fn_bf16()
+    linear_input = x_flat.float() if use_fp32 else x_flat
+    local_k = int(x_flat.shape[-1])
+    global_k = int(weight.shape[-1])
+    tp_size = int(getattr(module, "tp_size", 1))
+    tp_rank = int(getattr(module, "tp_rank", 0))
+    if tp_size == 1:
+        if local_k != global_k:
+            raise ValueError(
+                f"mHC input K={local_k} disagrees with weight K={global_k}"
+            )
+        rsqrt = torch.rsqrt(
+            x_flat.float().square().mean(-1, keepdim=True) + module.norm_eps
+        ).to(x_flat.dtype)
+        return (F.linear(linear_input, weight) * rsqrt).float()
+    if tp_size <= 0 or not 0 <= tp_rank < tp_size:
+        raise ValueError(f"invalid mHC TP geometry: size={tp_size}, rank={tp_rank}")
+    if global_k != local_k * tp_size:
+        raise ValueError(
+            f"mHC TP input K={local_k} x tp_size={tp_size} does not match "
+            f"weight K={global_k}"
+        )
+
+    hc_mult = int(module.hc_mult)
+    local_dim = local_k // hc_mult
+    global_dim = global_k // hc_mult
+    if local_k % hc_mult or global_k % hc_mult:
+        raise ValueError(
+            f"mHC flattened K must be divisible by hc_mult={hc_mult}: "
+            f"local={local_k}, global={global_k}"
+        )
+    start = tp_rank * local_dim
+    weight_shard = (
+        weight.view(weight.shape[0], hc_mult, global_dim)
+        [:, :, start : start + local_dim]
+        .reshape(weight.shape[0], local_k)
+    )
+    local_square_sum = x_flat.float().square().sum(-1, keepdim=True)
+    local_mixes = F.linear(linear_input, weight_shard).float()
+    combined = torch.cat((local_square_sum, local_mixes), dim=-1)
+    from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
+
+    combined = all_reduce(combined, Group.TP)
+    rsqrt = torch.rsqrt(combined[..., :1] / global_k + module.norm_eps)
+    return combined[..., 1:] * rsqrt
+
+
 def _hc_fallback_chunk_tokens() -> int:
     raw = os.environ.get("DSV4_HC_FALLBACK_CHUNK_TOKENS", "16384")
     try:
@@ -65,8 +117,8 @@ class FallbackHCUnit(HCUnitBase):
             self.fn_bf16 = self.fn.to(torch.bfloat16)
         return self.fn_bf16
 
-    def _linear_mixes(self, x_flat: torch.Tensor, rsqrt: torch.Tensor) -> torch.Tensor:
-        return (F.linear(x_flat, self._fn_bf16()) * rsqrt).float()
+    def _linear_mixes(self, x_flat: torch.Tensor) -> torch.Tensor:
+        return _tp_linear_mixes(self, x_flat)
 
     def _pre_impl(self, x: torch.Tensor, dbg_tag=None):
         shape, dtype = x.size(), x.dtype
@@ -79,22 +131,14 @@ class FallbackHCUnit(HCUnitBase):
         chunk = _hc_fallback_chunk_tokens()
 
         if x_flat.dim() == 2 and T > chunk:
-            rsqrt = torch.empty((T, 1), dtype=dtype, device=x_flat.device)
             mixes_list = []
             for s in range(0, T, chunk):
                 e = min(s + chunk, T)
-                rsqrt[s:e] = torch.rsqrt(
-                    x_flat[s:e].float().square().mean(-1, keepdim=True) + self.norm_eps
-                ).to(dtype)
-                mixes_list.append(self._linear_mixes(x_flat[s:e], rsqrt[s:e]))
+                mixes_list.append(self._linear_mixes(x_flat[s:e]))
             mixes = torch.cat(mixes_list, dim=0).contiguous()
             del mixes_list
         else:
-            x_flat_f32 = x_flat.float()
-            rsqrt = torch.rsqrt(
-                x_flat_f32.square().mean(-1, keepdim=True) + self.norm_eps
-            ).to(dtype)
-            mixes = self._linear_mixes(x_flat, rsqrt).contiguous()
+            mixes = self._linear_mixes(x_flat).contiguous()
 
         pre, post, comb = _hc_split_sinkhorn(
             mixes,
@@ -165,6 +209,11 @@ class FallbackHCHead(HCHeadBase):
         super().__init__(*args, **kwargs)
         self.fn_bf16 = self.fn.to(torch.bfloat16)
 
+    def _fn_bf16(self) -> torch.Tensor:
+        if self.fn_bf16.shape != self.fn.shape or self.fn_bf16.device != self.fn.device:
+            self.fn_bf16 = self.fn.to(torch.bfloat16)
+        return self.fn_bf16
+
     def _head_impl(self, x: torch.Tensor) -> torch.Tensor:
         shape, dtype = x.size(), x.dtype
         # ``x_flat.float()`` materialises a full fp32 copy ``[T, hc*dim]`` —
@@ -175,13 +224,10 @@ class FallbackHCHead(HCHeadBase):
         chunk = _hc_fallback_chunk_tokens()
 
         def _head_chunk(_x):
-            _x_flat = _x.flatten(-2).float()
-            _rsqrt = torch.rsqrt(
-                _x_flat.square().mean(-1, keepdim=True) + self.norm_eps
-            )
-            _mixes = F.linear(_x_flat, self.fn) * _rsqrt
+            _x_flat = _x.flatten(-2)
+            _mixes = _tp_linear_mixes(self, _x_flat, use_fp32=True)
             _pre = torch.sigmoid(_mixes * self.scale + self.base) + self.hc_eps
-            return torch.sum(_pre.unsqueeze(-1) * _x_flat.view(_x.shape), dim=-2)
+            return torch.sum(_pre.unsqueeze(-1) * _x.float(), dim=-2)
 
         if x.dim() == 3 and T > chunk:
             y = torch.empty((T, shape[-1]), dtype=torch.float32, device=x.device)
