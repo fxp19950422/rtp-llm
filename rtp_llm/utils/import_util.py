@@ -4,7 +4,7 @@ import logging
 import os
 import threading
 from functools import lru_cache
-from typing import Dict, Iterable, Optional, Set, Union
+from typing import Any, Dict, Iterable, Optional, Set, Union
 
 
 def load_module(module_path: str):
@@ -43,6 +43,37 @@ def import_optional_internal_source_entrypoint(relative_module: str) -> bool:
         if e.name == module_name:
             return False
         raise
+
+
+def call_optional_internal_source_entrypoint(
+    relative_module: str, function_name: str, *args: Any, **kwargs: Any
+) -> bool:
+    """Call an internal extension hook when its module is installed.
+
+    The module name is the public compatibility boundary. A present module
+    must expose the requested callable; exceptions from the hook are allowed
+    to propagate so platform gates remain fail-closed.
+    """
+    if not has_internal_source():
+        return False
+
+    module_name = f"internal_source.rtp_llm.{relative_module}"
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError as e:
+        if e.name is not None and module_name.startswith(f"{e.name}."):
+            return False
+        if e.name == module_name:
+            return False
+        raise
+
+    callback = getattr(module, function_name)
+    if not callable(callback):
+        raise TypeError(
+            f"internal entrypoint {module_name}.{function_name} is not callable"
+        )
+    callback(*args, **kwargs)
+    return True
 
 
 class LazyModuleRegistry:

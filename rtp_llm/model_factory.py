@@ -29,6 +29,7 @@ from rtp_llm.ops import (
     TaskType,
     VitSeparation,
 )
+from rtp_llm.utils.import_util import call_optional_internal_source_entrypoint
 from rtp_llm.utils.util import check_with_info
 from rtp_llm.utils.warmup import configure_warmup
 
@@ -85,6 +86,14 @@ class ModelFactory:
         )
         model_type = model_config.model_type
         model_cls = ModelFactory.get_model_cls(model_type)
+
+        call_optional_internal_source_entrypoint(
+            "models.runtime_init",
+            "before_model_construction",
+            model_type=model_type,
+            local_rank=engine_config.parallelism_config.local_rank,
+            ep_size=engine_config.parallelism_config.ep_size,
+        )
 
         # Get model_name from model_config (default to model class name if not set)
         model_name = model_config.model_name or model_cls.__name__
