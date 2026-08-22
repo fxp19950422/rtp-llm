@@ -14,6 +14,7 @@
 #include <cstring>
 #include <iostream>
 #include <numeric>
+#include <optional>
 #include "rtp_llm/cpp/utils/DevicePerfWrapper.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include <algorithm>
@@ -116,6 +117,7 @@ private:
         bool                               ready_recorded{false};
         bool                               consumed_recorded{false};
         bool                               leased{false};
+        std::optional<c10::Stream>          waited_stream;
     };
 
     class Lease: public NumericalStatusLease {
@@ -198,6 +200,7 @@ public:
         slot->ready_event->record(current_stream);
         slot->ready_recorded    = true;
         slot->consumed_recorded = false;
+        slot->waited_stream.reset();
 #endif
         slot->leased = true;
         ++slot->generation;
@@ -235,13 +238,18 @@ private:
                                 "numerical status lease is no longer current");
         RTP_LLM_CHECK_WITH_INFO(slot->ready_recorded && slot->ready_event,
                                 "numerical status snapshot has no ready event");
+        RTP_LLM_CHECK_WITH_INFO(!slot->waited_stream || *slot->waited_stream == stream,
+                                "numerical status lease supports exactly one consumer stream");
         slot->ready_event->block(stream);
+        slot->waited_stream = stream;
     }
 
     void markConsumed(const std::shared_ptr<Slot>& slot, uint64_t generation, const c10::Stream& stream) {
         std::lock_guard<std::mutex> lock(mutex_);
         RTP_LLM_CHECK_WITH_INFO(slot->leased && slot->generation == generation,
                                 "numerical status lease is no longer current");
+        RTP_LLM_CHECK_WITH_INFO(slot->waited_stream && *slot->waited_stream == stream,
+                                "numerical status completion requires the stream passed to waitReady");
 #if USING_CUDA || USING_ROCM
         if (!slot->consumed_event) {
             slot->consumed_event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
@@ -254,10 +262,30 @@ private:
 #endif
     }
 
-    void release(const std::shared_ptr<Slot>& slot, uint64_t generation) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (slot->generation == generation) {
+    void release(const std::shared_ptr<Slot>& slot, uint64_t generation) noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (slot->generation != generation) {
+                return;
+            }
+#if USING_CUDA || USING_ROCM
+            // Preserve reads already enqueued after waitReady() even when a
+            // consumer accidentally omits the explicit completion marker.
+            if (slot->waited_stream && !slot->consumed_recorded) {
+                if (!slot->consumed_event) {
+                    slot->consumed_event = std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+                }
+                slot->consumed_event->record(*slot->waited_stream);
+                slot->consumed_recorded = true;
+            }
+#endif
             slot->leased = false;
+        } catch (const std::exception& e) {
+            // Destructors cannot propagate. Keep the slot leased forever so a
+            // failed fallback fence degrades to safe ring growth.
+            RTP_LLM_LOG_ERROR("failed to fence a dropped numerical status lease: %s", e.what());
+        } catch (...) {
+            RTP_LLM_LOG_ERROR("failed to fence a dropped numerical status lease: unknown exception");
         }
     }
 

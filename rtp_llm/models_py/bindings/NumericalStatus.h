@@ -17,9 +17,10 @@ class NumericalStatusLease {
 public:
     virtual ~NumericalStatusLease() = default;
 
-    // A device consumer on any stream waits before reading the snapshot and
-    // records completion after its final read. Dropping a lease is safe only
-    // when no device read was enqueued. Neither operation waits on the host.
+    // The single device consumer waits before reading the snapshot and should
+    // record completion after its final read. If it omits markConsumed(), lease
+    // destruction records a fence on the stream passed to waitReady(). Neither
+    // operation waits on the host.
     virtual void waitReady(const c10::Stream& stream)    = 0;
     virtual void markConsumed(const c10::Stream& stream) = 0;
 };
