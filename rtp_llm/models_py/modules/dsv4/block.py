@@ -27,6 +27,15 @@ from rtp_llm.models_py.modules.dsv4.tp_norm import tp_rms_norm
 _PrefillFastHCImpls = Tuple[Callable, Callable, Callable, Callable]
 
 
+def _supports_numerical_status(fn: Callable) -> bool:
+    """Return whether a callable explicitly opts into the status ABI."""
+
+    if bool(getattr(fn, "supports_numerical_status", False)):
+        return True
+    owner = getattr(fn, "__self__", None)
+    return bool(getattr(owner, "supports_numerical_status", False))
+
+
 def _prefill_fast_norm(
     norm: nn.Module,
     x: torch.Tensor,
@@ -211,21 +220,12 @@ class Block(nn.Module):
         self._prefill_fast_hc_impls_cached = self._resolve_prefill_fast_hc_impls()
 
     def _call_attention(self, fn, *args, numerical_status=None, **kwargs):
-        if (
-            numerical_status is not None
-            and self._platform_provider is not None
-            and Dsv4ProviderCapability.ATTENTION
-            in self._platform_provider.capabilities
-        ):
+        if numerical_status is not None and _supports_numerical_status(fn):
             kwargs["numerical_status"] = numerical_status
         return fn(*args, **kwargs)
 
     def _call_moe(self, *args, numerical_status=None, **kwargs):
-        if (
-            numerical_status is not None
-            and self._platform_provider is not None
-            and Dsv4ProviderCapability.MOE in self._platform_provider.capabilities
-        ):
+        if numerical_status is not None and _supports_numerical_status(self.ffn):
             kwargs["numerical_status"] = numerical_status
         return self.ffn(*args, **kwargs)
 
