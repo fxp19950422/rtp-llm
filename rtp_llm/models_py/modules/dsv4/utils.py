@@ -1,7 +1,11 @@
 """Shared DSV4 utility functions used across BF16 and FP8 paths."""
 
 import torch
-from deep_gemm.utils.layout import get_mn_major_tma_aligned_packed_ue8m0_tensor
+
+try:
+    from deep_gemm.utils.layout import get_mn_major_tma_aligned_packed_ue8m0_tensor
+except ImportError:  # PPU DeepGEMM has utils.py, not the SM100 layout package.
+    get_mn_major_tma_aligned_packed_ue8m0_tensor = None
 
 from rtp_llm.config.quant_config import Fp8BlockWiseQuantConfig
 from rtp_llm.models_py.modules.factory.linear import LinearFactory
@@ -13,6 +17,10 @@ def _repack_v4_fp8_scale_to_int32(scale: torch.Tensor) -> torch.Tensor:
     """V4 ckpt UE8M0 ``[N/128, K/128]`` to DeepGEMM int32-packed scale."""
     assert scale.dtype == torch.float8_e8m0fnu, f"unexpected scale dtype {scale.dtype}"
     assert scale.dim() == 2, f"unexpected scale dim {scale.dim()}"
+
+    if get_mn_major_tma_aligned_packed_ue8m0_tensor is None:
+        # PPU fp8_gemm_nt consumes the checkpoint's plain FP32 block grid.
+        return scale.float()
 
     n_blk, _ = scale.shape
     n = n_blk * 128

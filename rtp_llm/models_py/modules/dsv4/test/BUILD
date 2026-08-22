@@ -22,6 +22,19 @@ py_test(
 )
 
 py_test(
+    name = "test_ppu_deep_gemm_layout_compat",
+    srcs = ["test_ppu_deep_gemm_layout_compat.py"],
+    deps = [
+        "//rtp_llm/models_py:modules",
+        "//rtp_llm:testlib",
+    ],
+    target_compatible_with = select({
+        "@//:using_ppu": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)
+
+py_test(
     name = "test_t24_dp_contract",
     srcs = ["test_t24_dp_contract.py"],
     deps = [

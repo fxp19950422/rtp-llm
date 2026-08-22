@@ -29,9 +29,13 @@ import deep_gemm  # noqa: E402
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from deep_gemm.utils.layout import (  # noqa: E402
-    get_mn_major_tma_aligned_packed_ue8m0_tensor,
-)
+
+try:
+    from deep_gemm.utils.layout import (  # noqa: E402
+        get_mn_major_tma_aligned_packed_ue8m0_tensor,
+    )
+except ImportError:  # PPU DeepGEMM has utils.py, not the SM100 layout package.
+    get_mn_major_tma_aligned_packed_ue8m0_tensor = None
 
 from rtp_llm.config.quant_config import Fp8BlockWiseQuantConfig
 from rtp_llm.models_py.modules.dsv4._fused_inv_rope_fp8_quant_triton import (
@@ -341,7 +345,9 @@ def _repack_v4_fp8_scale_to_int32(scale: torch.Tensor) -> torch.Tensor:
     int32-packed).  Must be called on-device (DeepGEMM helper is CUDA)."""
     assert scale.dtype == torch.float8_e8m0fnu, f"unexpected scale dtype {scale.dtype}"
     assert scale.dim() == 2, f"unexpected scale dim {scale.dim()}"
-    from deep_gemm.utils.layout import get_mn_major_tma_aligned_packed_ue8m0_tensor
+    if get_mn_major_tma_aligned_packed_ue8m0_tensor is None:
+        # PPU fp8_gemm_nt consumes the checkpoint's plain FP32 block grid.
+        return scale.float()
 
     N_blk, _ = scale.shape
     N = N_blk * 128
@@ -372,6 +378,10 @@ def _prepare_wo_a_stacked(
     ``deep_gemm.fp8_einsum(..., recipe=(1, 1, 128))`` expectations."""
     w_stk = weight_fp8.view(G, R, K).contiguous()
     scale_fp32 = scale_raw.float().view(G, R // 128, K // 128)
+    if get_mn_major_tma_aligned_packed_ue8m0_tensor is None:
+        # PPU fp8_einsum consumes one FP32 scale per 128x128 block.  It does
+        # not use the SM100 row-expanded, int32-packed TMA representation.
+        return w_stk, scale_fp32.contiguous()
     idx = torch.arange(R, device=scale_raw.device) // 128
     scale_rep = scale_fp32.index_select(-2, idx).contiguous()  # [G, R, K/128]
     s_stk = get_mn_major_tma_aligned_packed_ue8m0_tensor(scale_rep)
