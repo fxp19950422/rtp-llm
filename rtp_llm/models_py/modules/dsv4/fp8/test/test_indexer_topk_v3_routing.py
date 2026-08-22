@@ -1,11 +1,76 @@
+import ast
 import os
 import unittest
-from types import SimpleNamespace
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from typing import Dict
 from unittest import mock
 
 import torch
 
-from rtp_llm.models_py.modules.dsv4.fp8 import indexer
+
+def _source_path() -> Path:
+    relative = "rtp_llm/models_py/modules/dsv4/fp8/indexer.py"
+    runfiles = os.environ.get("RUNFILES_DIR")
+    if runfiles:
+        root = Path(runfiles)
+        candidates = [root / relative]
+        workspace = os.environ.get("TEST_WORKSPACE")
+        if workspace:
+            candidates.append(root / workspace / relative)
+        candidates.extend(root.glob(f"*/{relative}"))
+        matches = list(dict.fromkeys(path for path in candidates if path.exists()))
+        if len(matches) != 1:
+            raise RuntimeError(f"expected one indexer runfile, found {matches}")
+        return matches[0]
+    return Path(__file__).parents[1] / "indexer.py"
+
+
+def _load_source_only_indexer() -> ModuleType:
+    tree = ast.parse(_source_path().read_text())
+    assignment_names = {
+        "_DECODE_TOPK_CANDIDATES",
+        "_MISSING_DECODE_TOPK_CANDIDATE",
+        "_DECODE_TOPK_WORKSPACE_SIZE",
+        "_decode_topk_workspace_cache",
+    }
+    function_names = {
+        "_topk_v3_enabled",
+        "_decode_topk_capture_active",
+        "_get_decode_topk_workspace",
+        "_run_decode_topk",
+    }
+    selected = []
+    for node in tree.body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            names = {target.id for target in targets if isinstance(target, ast.Name)}
+            if names & assignment_names:
+                selected.append(node)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name in function_names:
+                selected.append(node)
+    module = ModuleType("dsv4_indexer_topk_source_only")
+    module.__dict__.update(
+        Dict=Dict,
+        os=os,
+        rtp_llm_ops=SimpleNamespace(),
+        torch=torch,
+    )
+    code = compile(
+        ast.Module(body=selected, type_ignores=[]), str(_source_path()), "exec"
+    )
+    exec(code, module.__dict__)
+    missing = (assignment_names | function_names) - set(module.__dict__)
+    if missing:
+        raise RuntimeError(f"missing extracted indexer symbols: {sorted(missing)}")
+    return module
+
+
+if os.environ.get("DSV4_INDEXER_TOPK_SOURCE_ONLY") == "1":
+    indexer = _load_source_only_indexer()
+else:
+    from rtp_llm.models_py.modules.dsv4.fp8 import indexer
 
 
 def _canonicalize_ties(logits: torch.Tensor) -> torch.Tensor:

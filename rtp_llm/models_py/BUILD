@@ -51,6 +51,12 @@ filegroup(
 )
 
 filegroup(
+    name = "dsv4_indexer_source",
+    srcs = ["modules/dsv4/fp8/indexer.py"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
     name = "rocm_fp8_ptpc_hipb_solutions",
     srcs = [
         "modules/factory/linear/impl/rocm/data/fp8_ptpc_hipb_solutions.json",

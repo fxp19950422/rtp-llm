@@ -96,6 +96,19 @@ py_test(
 )
 
 py_test(
+    name = "test_indexer_topk_routing_ppu_cpu",
+    srcs = ["test_indexer_topk_v3_routing.py"],
+    data = ["//rtp_llm/models_py:dsv4_indexer_source"],
+    deps = ["@pip_ppu_torch//torch"],
+    env = {
+        "CUDA_VISIBLE_DEVICES": "",
+        "DSV4_INDEXER_TOPK_SOURCE_ONLY": "1",
+    },
+    main = "test_indexer_topk_v3_routing.py",
+    tags = ["ppu"],
+)
+
+py_test(
     name = "test_pool_slot_mapping_split",
     srcs = ["test_pool_slot_mapping_split.py"],
     deps = _DSV4_FP8_TEST_DEPS,
