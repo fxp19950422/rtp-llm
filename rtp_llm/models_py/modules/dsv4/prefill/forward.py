@@ -590,7 +590,7 @@ def forward_layers(
         h = v4._hc_head_reduce(h)  # [T, dim]
         if _rt_on:
             _rt.record("prefill_hc_reduced", h)
-        h = v4.norm(h)  # [T, dim]
+        h = v4._norm(h)  # [T, dim]
     if _rt_on:
         _rt.record("prefill_final_norm", h)
         if cp_ctx is None:

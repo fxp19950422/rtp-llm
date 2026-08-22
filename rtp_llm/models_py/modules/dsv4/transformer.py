@@ -20,6 +20,7 @@ from rtp_llm.models_py.modules.dsv4 import _record_tensor as _rt
 from rtp_llm.models_py.modules.dsv4.block import Block
 from rtp_llm.models_py.modules.dsv4.cp import CPContext, build_cp_context
 from rtp_llm.models_py.modules.dsv4.hc import build_hc_head
+from rtp_llm.models_py.modules.dsv4.tp_norm import tp_gather_hidden, tp_rms_norm
 from rtp_llm.models_py.modules.dsv4.platform_provider import (
     Dsv4PlatformProvider,
     Dsv4ProviderCapability,
@@ -248,7 +249,7 @@ class V4Transformer(nn.Module):
             gw[W.v4_hc_head_fn],
             gw[W.v4_hc_head_base],
             gw[W.v4_hc_head_scale],
-            dim=args.dim,
+            dim=args.dim // args.tp_size,
             hc_mult=args.hc_mult,
             norm_eps=args.norm_eps,
             hc_eps=args.hc_eps,
@@ -467,6 +468,19 @@ class V4Transformer(nn.Module):
         """Reduce the hc axis for ``[B, S, hc, d]`` or flat ``[T, hc, d]``."""
         return self.head_hc.head(x)
 
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply final global RMSNorm and restore the full hidden dimension."""
+
+        normalized = tp_rms_norm(
+            self.norm,
+            x,
+            tp_size=self.args.tp_size,
+            tp_rank=self.args.tp_rank,
+        )
+        if self.args.tp_size == 1:
+            return normalized
+        return tp_gather_hidden(normalized, tp_size=self.args.tp_size)
+
     @torch.inference_mode()
     def forward_decode(
         self,
@@ -499,7 +513,7 @@ class V4Transformer(nn.Module):
         h = self._hc_head_reduce(h)  # [B, q_len, dim]
         # Framework RMSNorm wants 2D — flatten to [T_total, dim] and
         # return that directly (the next reshape would no-op anyway).
-        return self.norm(h.reshape(B * q_len, self.args.dim))
+        return self._norm(h.reshape(B * q_len, h.shape[-1]))
 
     @torch.inference_mode()
     def forward(
@@ -629,7 +643,7 @@ class V4Transformer(nn.Module):
             _rt.record("hc_reduced", h)
         # Framework RMSNorm wants 2D; collapse [B, S, d] → [B*S, d] and view back.
         bsz, seq, dim_ = h.shape
-        h = self.norm(h.reshape(bsz * seq, dim_)).view(bsz, seq, dim_)
+        h = self._norm(h.reshape(bsz * seq, dim_)).view(bsz, seq, -1)
         if _rt_on:
             _rt.record("final_norm", h)
 

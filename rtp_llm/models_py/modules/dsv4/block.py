@@ -22,11 +22,20 @@ from rtp_llm.models_py.modules.dsv4.platform_provider import (
     Dsv4ProviderCapability,
     resolve_dsv4_attention_layout,
 )
+from rtp_llm.models_py.modules.dsv4.tp_norm import tp_rms_norm
 
 _PrefillFastHCImpls = Tuple[Callable, Callable, Callable, Callable]
 
 
-def _prefill_fast_norm(norm: nn.Module, x: torch.Tensor) -> torch.Tensor:
+def _prefill_fast_norm(
+    norm: nn.Module,
+    x: torch.Tensor,
+    *,
+    tp_size: int = 1,
+    tp_rank: int = 0,
+) -> torch.Tensor:
+    if tp_size > 1:
+        return tp_rms_norm(norm, x, tp_size=tp_size, tp_rank=tp_rank)
     if (
         isinstance(norm, RMSNorm)
         and norm.__class__.__module__ == "rtp_llm.models_py.modules.base.cuda.norm"
@@ -84,6 +93,8 @@ class Block(nn.Module):
     ):
         super().__init__()
         self.layer_id = layer_id
+        self.tp_size = int(tp_size)
+        self.tp_rank = int(tp_rank)
         self.fp8_kv_cache = fp8_kv_cache
         self._platform_provider = platform_provider
         self._attention_layout = resolve_dsv4_attention_layout(
@@ -163,11 +174,17 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm(layer_weights[W.v4_attn_norm], norm_eps)
         self.ffn_norm = RMSNorm(layer_weights[W.v4_ffn_norm], norm_eps)
 
+        if dim % self.tp_size:
+            raise ValueError(
+                f"DSV4 hidden size={dim} is not divisible by tp_size={self.tp_size}"
+            )
+        hc_dim = dim // self.tp_size
+
         self.attn_hc = build_hc_unit(
             layer_weights[W.v4_hc_attn_fn],
             layer_weights[W.v4_hc_attn_base],
             layer_weights[W.v4_hc_attn_scale],
-            dim=dim,
+            dim=hc_dim,
             hc_mult=hc_mult,
             hc_sinkhorn_iters=hc_sinkhorn_iters,
             norm_eps=norm_eps,
@@ -181,7 +198,7 @@ class Block(nn.Module):
             layer_weights[W.v4_hc_ffn_fn],
             layer_weights[W.v4_hc_ffn_base],
             layer_weights[W.v4_hc_ffn_scale],
-            dim=dim,
+            dim=hc_dim,
             hc_mult=hc_mult,
             hc_sinkhorn_iters=hc_sinkhorn_iters,
             norm_eps=norm_eps,
@@ -278,7 +295,12 @@ class Block(nn.Module):
         attn_hc_pre, _, _, _ = self._prefill_fast_hc_impls()
         residual = x
         x_pre, post, comb = attn_hc_pre(x)
-        x_pre = _prefill_fast_norm(self.attn_norm, x_pre)
+        x_pre = _prefill_fast_norm(
+            self.attn_norm,
+            x_pre,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+        )
         return residual, x_pre, post, comb
 
     def prefill_fast_attn_body(
@@ -312,7 +334,12 @@ class Block(nn.Module):
         _, ffn_hc_pre, _, _ = self._prefill_fast_hc_impls()
         residual = x
         x_pre, post, comb = ffn_hc_pre(x)
-        x_pre = _prefill_fast_norm(self.ffn_norm, x_pre)
+        x_pre = _prefill_fast_norm(
+            self.ffn_norm,
+            x_pre,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+        )
         return residual, x_pre, post, comb
 
     def prefill_fast_ffn_body(
@@ -360,7 +387,12 @@ class Block(nn.Module):
         # Framework RMSNorm wants 2D — collapse [B, q_len, dim] → [B*q_len, dim]
         # and view back; attention.forward_decode wants the original 3D shape.
         bsz, q_len, dim_ = x_pre.shape
-        x_pre = self.attn_norm(x_pre.reshape(bsz * q_len, dim_)).view(bsz, q_len, dim_)
+        x_pre = tp_rms_norm(
+            self.attn_norm,
+            x_pre.reshape(bsz * q_len, dim_),
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+        ).view(bsz, q_len, dim_)
         if _dbg_layer:
             _rt.record_if_level(2, f"L{self.layer_id:02d}_decode_attn_in", x_pre)
         if attn_fn is not None:
@@ -386,7 +418,12 @@ class Block(nn.Module):
             dbg_tag=f"L{self.layer_id:02d}_decode_ffn_hc_pre" if _dbg_layer else None,
         )
         bsz, q_len, dim_ = x_pre.shape
-        x_pre = self.ffn_norm(x_pre.reshape(bsz * q_len, dim_)).view(bsz, q_len, dim_)
+        x_pre = tp_rms_norm(
+            self.ffn_norm,
+            x_pre.reshape(bsz * q_len, dim_),
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+        ).view(bsz, q_len, dim_)
         if _dbg_layer:
             _rt.record_if_level(2, f"L{self.layer_id:02d}_decode_ffn_in", x_pre)
         ffn_out = self._call_moe(
@@ -465,7 +502,7 @@ class Block(nn.Module):
 
         residual = x
         x_pre, post, comb = attn_hc_pre(x)
-        if self.attn.can_fuse_prefill_attn_norm_input_quant(
+        if self.tp_size == 1 and self.attn.can_fuse_prefill_attn_norm_input_quant(
             x_pre, self.attn_norm.weight.data
         ):
             x_pre, shared_input_quant = self.attn.prefill_fused_attn_norm_input_quant(
@@ -483,7 +520,12 @@ class Block(nn.Module):
                 numerical_status=numerical_status,
             )
         else:
-            x_pre = _prefill_fast_norm(self.attn_norm, x_pre)
+            x_pre = _prefill_fast_norm(
+                self.attn_norm,
+                x_pre,
+                tp_size=self.tp_size,
+                tp_rank=self.tp_rank,
+            )
             attn_out = self._call_attention(
                 self.attn,
                 x_pre,
@@ -497,7 +539,12 @@ class Block(nn.Module):
 
         residual = x
         x_pre, post, comb = ffn_hc_pre(x)
-        x_pre = _prefill_fast_norm(self.ffn_norm, x_pre)
+        x_pre = _prefill_fast_norm(
+            self.ffn_norm,
+            x_pre,
+            tp_size=self.tp_size,
+            tp_rank=self.tp_rank,
+        )
         ffn_out = self._call_moe(
             x_pre, input_ids, numerical_status=numerical_status
         )
@@ -551,7 +598,9 @@ class Block(nn.Module):
             x,
             dbg_tag=f"L{self.layer_id:02d}_attn_hc_pre" if _dbg_layer else None,
         )  # [T, dim], [T, hc, 1], [T, hc, hc]
-        x_pre = self.attn_norm(x_pre)  # [T, dim]
+        x_pre = tp_rms_norm(
+            self.attn_norm, x_pre, tp_size=self.tp_size, tp_rank=self.tp_rank
+        )  # [T, dim]
         if _dbg_layer:
             _rt.record_if_level(2, f"L{self.layer_id:02d}_attn_in", x_pre)
             if dbg_pos_mask is not None:
@@ -653,7 +702,9 @@ class Block(nn.Module):
             x,
             dbg_tag=f"L{self.layer_id:02d}_ffn_hc_pre" if _dbg_layer else None,
         )  # [T, dim], ...
-        x_pre = self.ffn_norm(x_pre)  # [T, dim]
+        x_pre = tp_rms_norm(
+            self.ffn_norm, x_pre, tp_size=self.tp_size, tp_rank=self.tp_rank
+        )  # [T, dim]
         if _dbg_layer:
             _rt.record_if_level(2, f"L{self.layer_id:02d}_ffn_in", x_pre)
             if dbg_pos_mask is not None:
