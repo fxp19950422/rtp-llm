@@ -830,6 +830,11 @@ TEST(HybridPoolConfigCreatorTest, SpeculativeTargetVerifyKeepsExplicitDoubleRing
         auto config = CacheConfigCreator::createBasicConfig(
             mc, pc, false, /*gen_num_per_cycle=*/query_len - 1);
 
+        const auto hca_state_gid = gidForTag(config, "hca_state");
+        EXPECT_EQ(config.policyForGroup(hca_state_gid).explicit_block_num, 256u);
+        RuntimeConfig runtime_config;
+        config.finalizeBlockNums(100, runtime_config);
+
         auto* indexer_state =
             dynamic_cast<const FixedStateCacheSpec*>(config.specForGroup(gidForTag(config, "indexer_state")).get());
         auto* csa_state =
@@ -859,7 +864,7 @@ TEST(HybridPoolConfigCreatorTest, SpeculativeTargetVerifyKeepsExplicitDoubleRing
             EXPECT_EQ(config.kvBlockStrideBytesForGroup(gid), config.specForGroup(gid)->block_size_bytes()) << tag;
         }
         EXPECT_EQ(config.kv_block_stride_bytes, 1048576u);
-        EXPECT_EQ(config.blockNumForGroup(gidForTag(config, "hca_state")), 256u);
+        EXPECT_EQ(config.blockNumForGroup(hca_state_gid), 256u);
     }
 }
 
