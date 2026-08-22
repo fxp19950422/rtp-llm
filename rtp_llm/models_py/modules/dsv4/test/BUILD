@@ -40,6 +40,14 @@ py_test(
 )
 
 py_test(
+    name = "test_t24_dp_contract_native_independent",
+    srcs = ["test_t24_dp_contract_native_independent.py"],
+    # The loader executes checked-in production Python directly and supplies
+    # only stdlib shells for unavailable torch/native/unrelated imports.
+    data = ["//rtp_llm/models_py:modules"],
+)
+
+py_test(
     name = "test_cp_context_build",
     srcs = ["test_cp_context_build.py"],
     deps = _DSV4_TEST_DEPS,
