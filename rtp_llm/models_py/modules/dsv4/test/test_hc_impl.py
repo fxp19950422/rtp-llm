@@ -1,6 +1,7 @@
 import os
 import unittest
 from contextlib import contextmanager
+from unittest import mock
 
 import torch
 
@@ -41,6 +42,100 @@ def _weights(hc: int, dim: int, device: str = "cpu"):
 
 
 class TestHCImpl(unittest.TestCase):
+    def test_fallback_tp_hidden_shard_matches_global_pre_and_head(self) -> None:
+        hc, global_dim, tp_size, tp_rank = 4, 8, 2, 1
+        local_dim = global_dim // tp_size
+        fn, base, scale = _weights(hc, global_dim)
+        residual = torch.randn(3, hc, global_dim, dtype=torch.bfloat16)
+        local = residual[..., tp_rank * local_dim : (tp_rank + 1) * local_dim]
+
+        with _env("DSV4_HC_IMPL", "fallback"):
+            global_unit = build_hc_unit(
+                fn,
+                base,
+                scale,
+                dim=global_dim,
+                hc_mult=hc,
+                hc_sinkhorn_iters=3,
+                norm_eps=1e-6,
+                hc_eps=1e-6,
+            )
+            local_unit = build_hc_unit(
+                fn,
+                base,
+                scale,
+                dim=local_dim,
+                hc_mult=hc,
+                hc_sinkhorn_iters=3,
+                norm_eps=1e-6,
+                hc_eps=1e-6,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+            )
+            global_head = build_hc_head(
+                fn[:hc],
+                base[:hc],
+                scale[:1],
+                dim=global_dim,
+                hc_mult=hc,
+                norm_eps=1e-6,
+                hc_eps=1e-6,
+            )
+            local_head = build_hc_head(
+                fn[:hc],
+                base[:hc],
+                scale[:1],
+                dim=local_dim,
+                hc_mult=hc,
+                norm_eps=1e-6,
+                hc_eps=1e-6,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+            )
+
+        expected_y, expected_post, expected_comb = global_unit.pre(residual)
+        expected_head = global_head.head(residual)
+
+        rank0 = residual[..., :local_dim].flatten(-2)
+
+        def rank0_contribution(combined, *, use_fp32):
+            output_count = combined.shape[-1] - 1
+            weight = fn[:output_count].to(
+                torch.float32 if use_fp32 else torch.bfloat16
+            ).view(
+                output_count, hc, global_dim
+            )[..., :local_dim].reshape(output_count, hc * local_dim)
+            rank0_input = rank0.float() if use_fp32 else rank0
+            rank0_part = torch.cat(
+                (
+                    rank0.float().square().sum(-1, keepdim=True),
+                    torch.nn.functional.linear(rank0_input, weight).float(),
+                ),
+                dim=-1,
+            )
+            return combined + rank0_part
+
+        def all_reduce_unit(combined, _group):
+            return rank0_contribution(combined, use_fp32=False)
+
+        def all_reduce_head(combined, _group):
+            return rank0_contribution(combined, use_fp32=True)
+
+        target = "rtp_llm.models_py.distributed.collective_torch.all_reduce"
+        with mock.patch(target, side_effect=all_reduce_unit):
+            actual_y, actual_post, actual_comb = local_unit.pre(local)
+        with mock.patch(target, side_effect=all_reduce_head):
+            actual_head = local_head.head(local)
+
+        torch.testing.assert_close(
+            actual_y, expected_y[..., local_dim:], atol=2e-2, rtol=2e-2
+        )
+        torch.testing.assert_close(actual_post, expected_post, atol=5e-4, rtol=5e-4)
+        torch.testing.assert_close(actual_comb, expected_comb, atol=5e-4, rtol=5e-4)
+        torch.testing.assert_close(
+            actual_head, expected_head[..., local_dim:], atol=2e-2, rtol=2e-2
+        )
+
     def test_factory_fallback_cpu_shapes(self) -> None:
         hc, dim = 4, 16
         fn, base, scale = _weights(hc, dim)
