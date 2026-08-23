@@ -869,8 +869,17 @@ absl::Status MtpExecutor::prefillStep(const std::list<GenerateStreamPtr>& stream
     // Only rank 0 restores; non-root ranks get the restored view from the
     // second tpSync, so skip the snapshot copies there.
     if (cp_enabled && isTpRank0()) {
-        saved_combo_tokens  = toCudaWithHostHold(model_input.combo_tokens, buffer_holder_);
-        saved_input_lengths = toCudaWithHostHold(model_input.input_lengths, buffer_holder_);
+        // handleInputs mutates pinned input_lengths in place.  A non-blocking
+        // H2D copy from that same storage is not a snapshot: the CP rewrite can
+        // race the DMA and publish rank-local lengths as the later "global"
+        // restore.  Clone first so the held H2D sources are immutable for the
+        // lifetime of this prefill step.  combo_tokens currently gets replaced
+        // rather than edited, but clone it too to keep the paired snapshot
+        // atomic against future CP remap changes.
+        auto combo_tokens_snapshot  = model_input.combo_tokens.clone();
+        auto input_lengths_snapshot = model_input.input_lengths.clone();
+        saved_combo_tokens          = toCudaWithHostHold(combo_tokens_snapshot, buffer_holder_);
+        saved_input_lengths         = toCudaWithHostHold(input_lengths_snapshot, buffer_holder_);
     }
 
     // target model prefill
