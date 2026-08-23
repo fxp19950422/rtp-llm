@@ -23,6 +23,7 @@ class Dsv4ProviderCapability(str, Enum):
     MOE = "moe"
     FP8_LINEAR = "fp8_linear"
     WO_A_FP8_LINEAR = "wo_a_fp8_linear"
+    BF16_FP32_LINEAR = "bf16_fp32_linear"
     FP4_LINEAR = "fp4_linear"
 
 
@@ -58,6 +59,10 @@ class Dsv4PlatformProvider(Protocol):
     ) -> Any: ...
 
     def build_wo_a_fp8_linear(
+        self, default_factory: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any: ...
+
+    def run_bf16_fp32_linear(
         self, default_factory: Callable[..., Any], *args: Any, **kwargs: Any
     ) -> Any: ...
 
@@ -127,6 +132,7 @@ def _validate_provider(provider: Dsv4PlatformProvider) -> None:
         Dsv4ProviderCapability.MOE: "build_moe",
         Dsv4ProviderCapability.FP8_LINEAR: "build_fp8_linear",
         Dsv4ProviderCapability.WO_A_FP8_LINEAR: "build_wo_a_fp8_linear",
+        Dsv4ProviderCapability.BF16_FP32_LINEAR: "run_bf16_fp32_linear",
         Dsv4ProviderCapability.FP4_LINEAR: "build_fp4_linear",
     }
     for capability in capabilities:
@@ -286,6 +292,18 @@ def build_dsv4_wo_a_fp8_linear(
     return provider.build_wo_a_fp8_linear(default_factory, *args, **kwargs)
 
 
+def run_dsv4_bf16_fp32_linear(
+    default_factory: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Any:
+    """Dispatch a BF16-input/weight linear with FP32 accumulation and output."""
+
+    provider = _PROVIDER_REGISTRY.resolve(())
+    capabilities = _normalize_capabilities(provider.capabilities)
+    if Dsv4ProviderCapability.BF16_FP32_LINEAR not in capabilities:
+        return default_factory(*args, **kwargs)
+    return provider.run_bf16_fp32_linear(default_factory, *args, **kwargs)
+
+
 def prepare_dsv4_fp4_weight_scale(
     default_factory: Callable[..., Any], *args: Any, **kwargs: Any
 ) -> Any:
@@ -330,5 +348,6 @@ __all__ = [
     "prepare_dsv4_fp4_weight_scale",
     "resolve_dsv4_attention_layout",
     "resolve_dsv4_platform_provider",
+    "run_dsv4_bf16_fp32_linear",
     "validate_dsv4_platform_provider_capabilities",
 ]

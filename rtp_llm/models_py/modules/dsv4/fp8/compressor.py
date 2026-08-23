@@ -53,12 +53,28 @@ def _linear_bf16_bf16_fp32(x: torch.Tensor, weight: torch.Tensor) -> torch.Tenso
     assert weight.dtype == torch.bfloat16, f"expected BF16 weight, got {weight.dtype}"
     assert x.is_contiguous(), "expected contiguous input"
     assert weight.is_contiguous(), "expected contiguous weight"
-    assert (
-        _CUBLAS_GEMM_BF16_BF16_FP32 is not None
-    ), "cublas_gemm_bf16_bf16_fp32 op is not built"
     leading_shape = x.shape[:-1]
     x_2d = x.reshape(-1, x.shape[-1])
-    out_2d = _CUBLAS_GEMM_BF16_BF16_FP32(x_2d, weight)
+    from rtp_llm.models_py.modules.dsv4.platform_provider import (
+        run_dsv4_bf16_fp32_linear,
+    )
+
+    def _default_factory(
+        activation: torch.Tensor, linear_weight: torch.Tensor
+    ) -> torch.Tensor:
+        assert (
+            _CUBLAS_GEMM_BF16_BF16_FP32 is not None
+        ), "cublas_gemm_bf16_bf16_fp32 op is not built"
+        return _CUBLAS_GEMM_BF16_BF16_FP32(activation, linear_weight)
+
+    out_2d = run_dsv4_bf16_fp32_linear(_default_factory, x_2d, weight)
+    expected_shape = (int(x_2d.shape[0]), int(weight.shape[0]))
+    if out_2d.dtype != torch.float32 or tuple(out_2d.shape) != expected_shape:
+        raise RuntimeError(
+            "BF16-to-FP32 linear returned an invalid output contract: "
+            f"dtype={out_2d.dtype}, shape={tuple(out_2d.shape)}, "
+            f"expected=torch.float32/{expected_shape}"
+        )
     return out_2d.reshape(*leading_shape, weight.shape[0])
 
 
