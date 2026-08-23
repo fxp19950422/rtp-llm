@@ -21,6 +21,7 @@ class Dsv4ProviderCapability(str, Enum):
     TRANSFORMER = "transformer"
     ATTENTION = "attention"
     MOE = "moe"
+    DEEPEP_MOE = "deepep_moe"
     FP8_LINEAR = "fp8_linear"
     WO_A_FP8_LINEAR = "wo_a_fp8_linear"
     BF16_FP32_LINEAR = "bf16_fp32_linear"
@@ -135,6 +136,7 @@ def _validate_provider(provider: Dsv4PlatformProvider) -> None:
         Dsv4ProviderCapability.TRANSFORMER: "build_transformer",
         Dsv4ProviderCapability.ATTENTION: "build_attention",
         Dsv4ProviderCapability.MOE: "build_moe",
+        Dsv4ProviderCapability.DEEPEP_MOE: "build_moe",
         Dsv4ProviderCapability.FP8_LINEAR: "build_fp8_linear",
         Dsv4ProviderCapability.WO_A_FP8_LINEAR: "build_wo_a_fp8_linear",
         Dsv4ProviderCapability.BF16_FP32_LINEAR: "run_bf16_fp32_linear",
