@@ -238,6 +238,28 @@ class GenerateConfigTest(TestCase):
             RoleType.DECODE,
         )
 
+    def test_engine_config_disables_graph_only_on_cp_sharded_prefill(self):
+        prefill = PyEnvConfigs()
+        prefill.role_config.role_type = RoleType.PREFILL
+        prefill.parallelism_config.prefill_cp_config.kv_cache_sharded = True
+        prefill.parallelism_config.prefill_cp_config.prefill_cp_size = 8
+        prefill.parallelism_config.tp_size = 8
+        prefill.py_hw_kernel_config.enable_cuda_graph = True
+
+        with self.assertLogs(level="WARNING") as logs:
+            prefill_engine = EngineConfig.create(prefill)
+        self.assertFalse(prefill_engine.hw_kernel_config.enable_cuda_graph)
+        self.assertIn("page-sharded PREFILL", "\n".join(logs.output))
+
+        decode = PyEnvConfigs()
+        decode.role_config.role_type = RoleType.DECODE
+        decode.parallelism_config.prefill_cp_config.kv_cache_sharded = True
+        decode.parallelism_config.prefill_cp_config.prefill_cp_size = 8
+        decode.py_hw_kernel_config.enable_cuda_graph = True
+
+        decode_engine = EngineConfig.create(decode)
+        self.assertTrue(decode_engine.hw_kernel_config.enable_cuda_graph)
+
     def test_engine_config_minimal_dataclass_construction_from_py_env_configs(self):
         py_env_configs = PyEnvConfigs()
 

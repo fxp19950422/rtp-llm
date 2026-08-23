@@ -234,6 +234,24 @@ class EngineConfig:
                     "explicit prefill_cp_size > 1"
                 )
 
+            # A page-sharded PREFILL worker owns physically sliced SWA/STATE
+            # pages.  The generic CUDA-graph startup path also warms decode
+            # shapes, whose kernels require the full (unsharded) page.  DSV4
+            # prompt prefill itself is eager today, so graph capture has no
+            # useful PREFILL work to retain; leave graph enabled on DECODE,
+            # where capture/replay is supported and the cache layout is full.
+            if (
+                role_type == RoleType.PREFILL
+                and hw_kernel_config.enable_cuda_graph
+            ):
+                logging.warning(
+                    "Disabling CUDA graph on page-sharded PREFILL worker: "
+                    "its physical SWA/STATE pages are CP-sliced and cannot "
+                    "run generic decode graph warmup. Enable CUDA graph on "
+                    "the DECODE worker instead."
+                )
+                hw_kernel_config.enable_cuda_graph = False
+
         if nccl_comm_config is None:
             nccl_comm_config = NcclCommConfig(
                 nccl_ip="",
