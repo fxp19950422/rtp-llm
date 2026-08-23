@@ -68,6 +68,49 @@ struct CacheStoreBlockPair {
     int offset_index;
 };
 
+// Map a slot in a compact CP block table back into the full canonical key
+// namespace. Fixed STATE/SWA tables only retain tail slots, so slot zero is
+// not necessarily compact block zero for a long request.
+inline bool compactCpTailSlotKeyIndex(size_t slot_index,
+                                      size_t slot_count,
+                                      size_t cache_key_count,
+                                      int    cp_size,
+                                      size_t& cache_key_index) {
+    if (cache_key_count == 0 || slot_count == 0 || cp_size <= 0 || slot_index >= slot_count) {
+        return false;
+    }
+    const size_t cp_size_t          = static_cast<size_t>(cp_size);
+    const size_t compact_key_count  = (cache_key_count + cp_size_t - 1) / cp_size_t;
+    const size_t first_compact_slot = compact_key_count > slot_count ? compact_key_count - slot_count : 0;
+    const size_t compact_index      = first_compact_slot + slot_index;
+    if (compact_index >= compact_key_count) {
+        return false;
+    }
+    cache_key_index = std::min((compact_index + 1) * cp_size_t - 1, cache_key_count - 1);
+    return true;
+}
+
+// Decode keeps compact CP groups in a base-block table whose usable entries
+// are the last block of each CP-width span (for CP8: 7, 15, ...). Convert that
+// physical position to the compact slot ordinal before resolving the global
+// canonical tail key.
+inline bool compactCpPhysicalBlockKeyIndex(size_t block_pos,
+                                           size_t block_count,
+                                           size_t cache_key_count,
+                                           int    cp_size,
+                                           size_t& cache_key_index) {
+    if (cp_size <= 0 || block_count == 0) {
+        return false;
+    }
+    const size_t cp_size_t = static_cast<size_t>(cp_size);
+    if (block_pos >= block_count || block_pos % cp_size_t != cp_size_t - 1) {
+        return false;
+    }
+    const size_t slot_index = block_pos / cp_size_t;
+    const size_t slot_count = (block_count + cp_size_t - 1) / cp_size_t;
+    return compactCpTailSlotKeyIndex(slot_index, slot_count, cache_key_count, cp_size, cache_key_index);
+}
+
 // Keep cache-store projection header-only so bindings that consume ExecOps.cc
 // as a source file do not need to link the full CPSlotMapper implementation.
 inline std::vector<CacheStoreBlockPair> buildCacheStorePlan(const CacheGroupPolicy& policy,
@@ -93,7 +136,12 @@ inline std::vector<CacheStoreBlockPair> buildCacheStorePlan(const CacheGroupPoli
                                           std::min(reuse_block_size, canonical_blocks);
         plan.reserve(canonical_blocks - start);
         for (size_t compact_idx = start; compact_idx < canonical_blocks; ++compact_idx) {
-            const size_t key_index = std::min((compact_idx + 1) * cp_size_t - 1, total_logical_blocks - 1);
+            size_t key_index = 0;
+            const bool mapped = compactCpTailSlotKeyIndex(
+                compact_idx, canonical_blocks, total_logical_blocks, cp_size, key_index);
+            if (!mapped) {
+                continue;
+            }
             plan.push_back({static_cast<int>(key_index), static_cast<int>(compact_idx)});
         }
         return plan;

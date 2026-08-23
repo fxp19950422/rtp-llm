@@ -868,11 +868,12 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
         return cpMapperForGroup(cfg, gid).sliceBlockForPeer(cfg, gid, std::move(parts), static_cast<size_t>(peer_idx));
     };
     auto isCompactFixedBlockTable = [&](const CacheConfig& cfg, size_t gid) {
-        if (!is_page_level_rr || !groupUsesCpSlice(cfg, gid) || load_context.prefill_cp_size <= 1) {
+        if (!is_page_level_rr || load_context.prefill_cp_size <= 1) {
             return false;
         }
         const auto group_tokens = cfg.seqSizePerBlockForGroup(gid);
-        return group_tokens > 0
+        const auto policy       = cfg.policyForGroup(gid);
+        return policy.cp_mapping == CpBlockMappingMode::COMPACT_LAST_RANK && group_tokens > 0
                && group_tokens == cfg.seq_size_per_block * static_cast<size_t>(load_context.prefill_cp_size);
     };
     auto blockPositionsForLoad =
@@ -915,14 +916,19 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
             return block_pos_list;
         };
     auto cacheKeyIndexForBlock =
-        [&](const CacheConfig& cfg, size_t gid, size_t block_pos, size_t cache_key_count, size_t& cache_key_index) {
+        [&](const CacheConfig& cfg,
+            size_t             gid,
+            size_t             block_pos,
+            size_t             block_num,
+            size_t             cache_key_count,
+            size_t&            cache_key_index) {
             if (cache_key_count == 0) {
                 return false;
             }
             cache_key_index = block_pos;
             if (isCompactFixedBlockTable(cfg, gid)) {
-                cache_key_index = std::min((block_pos + 1) * static_cast<size_t>(load_context.prefill_cp_size) - 1,
-                                           cache_key_count - 1);
+                return compactCpPhysicalBlockKeyIndex(
+                    block_pos, block_num, cache_key_count, load_context.prefill_cp_size, cache_key_index);
             }
             return cache_key_index < cache_key_count;
         };
@@ -970,7 +976,7 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
                     }
                     size_t cache_key_index = 0;
                     if (!cacheKeyIndexForBlock(
-                            cache_config, gid, block_pos, load_context.cache_keys.size(), cache_key_index)) {
+                            cache_config, gid, block_pos, block_num, load_context.cache_keys.size(), cache_key_index)) {
                         continue;
                     }
                     auto cache_key =
@@ -1107,6 +1113,7 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
                                 if (!cacheKeyIndexForBlock(mtp_cache_cfg,
                                                            gid,
                                                            block_pos,
+                                                           block_num,
                                                            load_context.cache_keys.size(),
                                                            cache_key_index)) {
                                     continue;

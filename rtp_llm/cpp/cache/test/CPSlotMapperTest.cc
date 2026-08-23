@@ -146,6 +146,49 @@ TEST_F(CPSlotMapperTest, BuildStorePlanUsesPolicyActiveTailBlocks) {
     EXPECT_EQ(custom_swa[0].offset_index, 2);
 }
 
+TEST_F(CPSlotMapperTest, CompactCpTailSlotsUseGlobalTailKeysForLongRequests) {
+    constexpr size_t cache_key_count = 69;
+    constexpr size_t slot_count      = 2;
+    constexpr int    cp_size         = 8;
+
+    size_t key_index = 0;
+    ASSERT_TRUE(compactCpTailSlotKeyIndex(0, slot_count, cache_key_count, cp_size, key_index));
+    EXPECT_EQ(key_index, 63u);
+    ASSERT_TRUE(compactCpTailSlotKeyIndex(1, slot_count, cache_key_count, cp_size, key_index));
+    EXPECT_EQ(key_index, 68u);
+
+    CacheGroupPolicy policy = defaultCacheGroupPolicy(CacheGroupType::SWA);
+    CPSlotMapper     mapper(/*cp_rank=*/0, cp_size, /*block_size=*/64);
+    const auto       store_plan = mapper.buildStorePlan(
+        policy, cache_key_count, /*reuse_block_size=*/0, /*use_hybrid=*/true);
+    ASSERT_EQ(store_plan.size(), slot_count);
+    EXPECT_EQ(store_plan[0].key_index, 63);
+    EXPECT_EQ(store_plan[0].offset_index, 7);
+    EXPECT_EQ(store_plan[1].key_index, 68);
+    EXPECT_EQ(store_plan[1].offset_index, 8);
+
+    // A one-block request still resolves to its only key, preserving the
+    // short-request path that previously hid the missing tail offset.
+    ASSERT_TRUE(compactCpTailSlotKeyIndex(0, slot_count, /*cache_key_count=*/1, cp_size, key_index));
+    EXPECT_EQ(key_index, 0u);
+    EXPECT_FALSE(compactCpTailSlotKeyIndex(1, slot_count, /*cache_key_count=*/1, cp_size, key_index));
+}
+
+TEST_F(CPSlotMapperTest, CompactCpDecodePhysicalBlocksUseGlobalTailKeysForLongRequests) {
+    constexpr size_t cache_key_count = 69;
+    constexpr size_t block_count     = 16;
+    constexpr int    cp_size         = 8;
+
+    size_t key_index = 0;
+    ASSERT_TRUE(compactCpPhysicalBlockKeyIndex(7, block_count, cache_key_count, cp_size, key_index));
+    EXPECT_EQ(key_index, 63u);
+    ASSERT_TRUE(compactCpPhysicalBlockKeyIndex(15, block_count, cache_key_count, cp_size, key_index));
+    EXPECT_EQ(key_index, 68u);
+
+    EXPECT_FALSE(compactCpPhysicalBlockKeyIndex(6, block_count, cache_key_count, cp_size, key_index));
+    EXPECT_FALSE(compactCpPhysicalBlockKeyIndex(16, block_count, cache_key_count, cp_size, key_index));
+}
+
 TEST_F(CPSlotMapperTest, FullGroupIgnoresByteSlicePolicy) {
     CacheConfig config;
     config.seq_size_per_block = 8;
