@@ -835,6 +835,7 @@ class PrefillOutputProjectionContractTest(unittest.TestCase):
         layer.dim = 6
         layer.n_groups = 1
         layer.rope_head_dim = 2
+        layer.wo_a = None
 
         device = torch.device("cpu")
         seqlen = 3

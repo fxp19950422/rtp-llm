@@ -1223,6 +1223,11 @@ void CudaGraphRunner::captureOneGraphInstance(int key, const char* key_type) {
     RTP_LLM_LOG_INFO("WarmUp for %s %d start.", key_type, key);
     auto attn_pyobj = graph_instances_[key].mem_hold_.attn_pyobj_;
     try {
+        // Distributed model implementations (notably DeepEP normal mode)
+        // rendezvous during these eager forwards.  Keep the same scoped
+        // warmup contract used by initCapture(); the real capture below must
+        // remain free of host-side barriers.
+        ScopedEnvFlag cuda_graph_warmup("RTP_LLM_CUDA_GRAPH_WARMUP_FORWARD", "1");
         const auto status_identity = captureNumericalStatusIdentity(inputs.numerical_status);
         if (inputs.numerical_status.defined()) {
             inputs.numerical_status.values.zero_();

@@ -16,6 +16,10 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
+from ..warmup_sync import (
+    cuda_graph_warmup_forward_enabled,
+    sync_cuda_graph_warmup_ranks,
+)
 from .base import MoeCfg, RoutedExpertsStrategy, register_strategy
 from .local_loop import LocalLoopStrategy
 
@@ -110,6 +114,13 @@ class DeepEPStrategy(RoutedExpertsStrategy):
         buf = wrapper.buffer
         cfg = self.cfg
 
+        capturing = (
+            torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        )
+        graph_warmup = cuda_graph_warmup_forward_enabled()
+        if graph_warmup:
+            sync_cuda_graph_warmup_ranks("deepep_before_dispatch", x.device)
+
         # Pad topk to nearest supported value (V4's 6 → 8).
         indices_p, weights_p = self._pad_topk_for_deepep(indices, weights)
 
@@ -140,6 +151,14 @@ class DeepEPStrategy(RoutedExpertsStrategy):
             indices_p,
             weights_p,
             expert_alignment=1,
+            # DeepEP's normal dispatch otherwise synchronizes the dynamic
+            # receive count through the CPU.  Fixed worst-case capacity keeps
+            # warmup and capture shapes identical and uses the graph-safe
+            # no-CPU-sync kernel path.  One source rank can contribute at
+            # most every local input row to this rank.
+            num_worst_tokens=(int(x.size(0)) * cfg.ep_size)
+            if (graph_warmup or capturing)
+            else 0,
         )
 
         # 3. Local per-expert compute. ACCL-EP's dispatch returns
@@ -180,4 +199,6 @@ class DeepEPStrategy(RoutedExpertsStrategy):
             y_local.to(x.dtype),
             handle,
         )
+        if graph_warmup:
+            sync_cuda_graph_warmup_ranks("deepep_after_combine", x.device)
         return y_combined.float()

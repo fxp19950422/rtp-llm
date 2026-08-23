@@ -142,6 +142,11 @@ def _load_modules():
         "rtp_llm.models_py.modules.dsv4.moe.mega_buf",
         _mega_moe_disabled_or_unavailable_reason=lambda: "test shell: Mega absent",
     )
+    _module(
+        "rtp_llm.models_py.modules.dsv4.platform_provider",
+        Dsv4ProviderCapability=types.SimpleNamespace(DEEPEP_MOE=object()),
+        get_dsv4_platform_provider_capabilities=lambda: frozenset(),
+    )
     base = _load(
         "t24_production_base",
         ROOT / "moe" / "strategies" / "base.py",
