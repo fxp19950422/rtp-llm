@@ -21,6 +21,7 @@ resolve_dsv4_attention_layout = _PROVIDER_MODULE.resolve_dsv4_attention_layout
 build_dsv4_fp8_linear = _PROVIDER_MODULE.build_dsv4_fp8_linear
 build_dsv4_wo_a_fp8_linear = _PROVIDER_MODULE.build_dsv4_wo_a_fp8_linear
 run_dsv4_bf16_fp32_linear = _PROVIDER_MODULE.run_dsv4_bf16_fp32_linear
+run_dsv4_fp8_mqa_logits = _PROVIDER_MODULE.run_dsv4_fp8_mqa_logits
 build_dsv4_fp4_linear = _PROVIDER_MODULE.build_dsv4_fp4_linear
 prepare_dsv4_fp4_weight_scale = _PROVIDER_MODULE.prepare_dsv4_fp4_weight_scale
 
@@ -104,6 +105,15 @@ class _Bf16Fp32Provider(_Provider):
 
     def run_bf16_fp32_linear(self, default_factory, *args, **kwargs):
         return ("provider-bf16-fp32", default_factory, args, kwargs)
+
+
+class _Fp8MqaLogitsProvider(_Provider):
+    capabilities = _Provider.capabilities | {
+        Dsv4ProviderCapability.FP8_MQA_LOGITS,
+    }
+
+    def run_fp8_mqa_logits(self, default_factory, *args, **kwargs):
+        return ("provider-fp8-mqa-logits", default_factory, args, kwargs)
 
 
 class _Fp4Provider(_Provider):
@@ -214,6 +224,32 @@ class Dsv4PlatformProviderRegistryTest(unittest.TestCase):
             self.assertEqual(result[0], "provider-bf16-fp32")
             self.assertIs(result[2][0], sentinel)
             self.assertEqual(result[3]["weight"], "weight")
+        finally:
+            _PROVIDER_MODULE._PROVIDER_REGISTRY = original_registry
+
+    def test_fp8_mqa_logits_dispatch_is_separate_and_explicit(self):
+        original_registry = _PROVIDER_MODULE._PROVIDER_REGISTRY
+        try:
+            _PROVIDER_MODULE._PROVIDER_REGISTRY = Dsv4PlatformProviderRegistry()
+            sentinel = object()
+            self.assertIs(
+                run_dsv4_fp8_mqa_logits(lambda value, **_: value, sentinel),
+                sentinel,
+            )
+
+            registry = Dsv4PlatformProviderRegistry()
+            registry.register(_Fp8MqaLogitsProvider())
+            _PROVIDER_MODULE._PROVIDER_REGISTRY = registry
+            result = run_dsv4_fp8_mqa_logits(
+                lambda *_args, **_kwargs: self.fail("default factory used"),
+                sentinel,
+                clean_logits=False,
+                max_seqlen_k=1024,
+            )
+            self.assertEqual(result[0], "provider-fp8-mqa-logits")
+            self.assertIs(result[2][0], sentinel)
+            self.assertFalse(result[3]["clean_logits"])
+            self.assertEqual(result[3]["max_seqlen_k"], 1024)
         finally:
             _PROVIDER_MODULE._PROVIDER_REGISTRY = original_registry
 
