@@ -304,6 +304,24 @@ class TestContextParallelProcessor(unittest.TestCase):
         self.assertEqual(shuffle_indices.cpu().tolist(), [0, 1, 6, 7])
         self.assertEqual(position_ids.tolist(), [4, 5, 10, 0])
 
+    @unittest.skipUnless(torch.cuda.is_available(), "requires accelerator")
+    def test_prefix_reuse_accepts_device_metadata_for_mtp_verify(self):
+        _, _, _, position_ids, shuffle_indices = cp_test.remap_multimodal_inputs(
+            torch.arange(8, dtype=torch.int32),
+            torch.empty(0, dtype=torch.int32),
+            [],
+            [],
+            torch.empty(0, dtype=torch.int32),
+            0,
+            2,
+            torch.tensor([8], dtype=torch.int32),
+            torch.empty(0, dtype=torch.int32),
+            torch.tensor([4], dtype=torch.int32, device="cuda"),
+        )
+
+        self.assertEqual(shuffle_indices.cpu().tolist(), [0, 1, 6, 7])
+        self.assertEqual(position_ids.tolist(), [4, 5, 10, 11])
+
     def test_rank_chunk_fully_inside_image_slices_feature_and_deepstack(self):
         combo_tokens = torch.arange(14, dtype=torch.int32)
         feature = torch.arange(20, dtype=torch.float32).reshape(10, 2)

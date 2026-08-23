@@ -269,12 +269,18 @@ void IContextParallelProcessor::handleInputs(GptModelInputs&                    
     size_t num_prefill_stream = input_lengths.size(0) - num_decode_stream;
 
     const bool has_prefix_lengths = model_input.prefix_lengths.defined() && model_input.prefix_lengths.numel() > 0;
-    RTP_LLM_CHECK_WITH_INFO(!has_prefix_lengths || !model_input.prefix_lengths.is_cuda(),
-                            "CP prefix_lengths must be a host tensor");
+    // Device-first MTP target verification deliberately keeps metadata on the
+    // accelerator until forward.  CP planning is still CPU-vector based, so
+    // take a blocking host snapshot here without changing the model input's
+    // ownership: downstream PyWrappedModel continues to receive the device
+    // tensor while this planner reads a stable host view.
+    auto prefix_lengths = has_prefix_lengths && model_input.prefix_lengths.is_cuda() ?
+                              model_input.prefix_lengths.cpu().pin_memory() :
+                              model_input.prefix_lengths;
     RTP_LLM_CHECK_WITH_INFO(!has_prefix_lengths
-                                || model_input.prefix_lengths.numel() == static_cast<int64_t>(num_prefill_stream),
+                                || prefix_lengths.numel() == static_cast<int64_t>(num_prefill_stream),
                             "CP prefix_lengths must match the prefill stream count");
-    const int32_t* prefix_lengths_ptr = has_prefix_lengths ? model_input.prefix_lengths.data_ptr<int32_t>() : nullptr;
+    const int32_t* prefix_lengths_ptr = has_prefix_lengths ? prefix_lengths.data_ptr<int32_t>() : nullptr;
     bool           has_prefix_reuse   = false;
     for (size_t p = 0; p < num_prefill_stream && has_prefix_lengths; ++p) {
         RTP_LLM_CHECK_WITH_INFO(prefix_lengths_ptr[p] >= 0, "CP prefix_lengths must be non-negative");
