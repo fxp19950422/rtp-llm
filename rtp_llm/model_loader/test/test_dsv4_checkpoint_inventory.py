@@ -9,6 +9,7 @@ from pathlib import Path
 from rtp_llm.config.quant_config import Fp8BlockWiseQuantConfig
 from rtp_llm.model_loader.load_config import LoadConfig
 from rtp_llm.models.deepseek_v4 import DeepSeekV4MtpWeight, DeepSeekV4Weight
+from rtp_llm.utils.model_weight import W
 from rtp_llm.model_loader.test.dsv4_checkpoint_inventory import (
     _validate_routed_fp4,
     current_rss_bytes,
@@ -84,13 +85,15 @@ class TestDsv4CheckpointInventory(unittest.TestCase):
                 Fp8BlockWiseQuantConfig(is_quanted=True)
             )
 
-        def sources(weight_info):
+        def sources(weight_info, non_owned_globals=()):
             counts = Counter()
             for layer_id, weights in enumerate(weight_info.layer_weights):
                 for weight in weights:
                     for component in weight.get_components():
                         counts.update(component.get_tensor_names(layer_id, load_config))
             for weight in weight_info.weights:
+                if weight.name in non_owned_globals:
+                    continue
                 counts.update(weight.get_tensor_names(None, load_config))
             return counts
 
@@ -101,7 +104,12 @@ class TestDsv4CheckpointInventory(unittest.TestCase):
             3,
         )
         mtp_info = descriptor(DeepSeekV4MtpWeight, 1, [0], 0)
-        actual = sources(main_info) + sources(mtp_info)
+        # Production aliases the draft vocabulary tensors onto the target
+        # owner, so the draft loader does not materialize those checkpoint
+        # sources a second time.
+        actual = sources(main_info) + sources(
+            mtp_info, non_owned_globals=(W.embedding, W.lm_head)
+        )
         self.assertEqual(set(actual), set(expected))
         self.assertEqual(
             [name for name, count in actual.items() if count != 1],

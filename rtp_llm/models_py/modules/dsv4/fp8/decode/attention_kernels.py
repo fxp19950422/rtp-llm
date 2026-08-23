@@ -47,14 +47,21 @@ _TOPK_DEBUG = os.environ.get("DSV4_TOPK_DEBUG", "0") not in ("0", "", "false", "
 def _validate_rich_pool(
     *, q: torch.Tensor, pool: torch.Tensor, indices: torch.Tensor,
     sink: torch.Tensor, page: int, index_width: int, name: str,
-    allowed_widths=None, multiple_of=None,
+    allowed_widths=None, multiple_of=None, allow_ring_extension=False,
 ) -> None:
     """Fail closed on the installed rich ABI's fixed geometry."""
     if q.ndim != 4 or int(q.shape[1]) < 1 or int(q.shape[-1]) != 512:
         raise ValueError(f"{name}: q must be [B, q_len, H, D], q_len must be positive")
     if pool.device != q.device:
         raise ValueError(f"{name}: pool must share q device")
-    _validate_model1_cache_tensor(pool, block_size=page)
+    actual_page = int(pool.shape[1]) if pool.ndim >= 2 else 0
+    _validate_rich_pool_page(
+        actual_page=actual_page,
+        expected_page=page,
+        allow_ring_extension=allow_ring_extension,
+        name=name,
+    )
+    _validate_model1_cache_tensor(pool, block_size=actual_page)
     if int(pool.stride(0)) % 576:
         raise ValueError(f"{name}: physical block stride must be 576-byte aligned")
     if indices.device != q.device:
@@ -80,6 +87,34 @@ def _validate_rich_pool(
         raise ValueError(f"{name}: attn_sink must be [num_heads]")
     if sink.dtype not in (torch.float32, torch.bfloat16):
         raise TypeError(f"{name}: attn_sink must be FP32 or BF16")
+
+
+def _validate_rich_pool_page(
+    *, actual_page: int, expected_page: int, allow_ring_extension: bool, name: str
+) -> None:
+    """Validate a rich-pool page while preserving MTP state-ring slack.
+
+    The SWA opaque cache stores ``window + gamma`` entries and rounds that
+    count up to an even number.  FlashMLA addresses it through the runtime
+    tensor shape, so the extra ring entries are physical capacity rather than
+    a change to the 128-token attention window.  Compressed pools retain the
+    exact-page contract.
+    """
+    actual_page = int(actual_page)
+    expected_page = int(expected_page)
+    if actual_page == expected_page:
+        return
+    if (
+        allow_ring_extension
+        and actual_page > expected_page
+        and actual_page <= 2 * expected_page
+        and actual_page % 2 == 0
+    ):
+        return
+    raise ValueError(
+        f"{name}: unsupported MODEL1 page {actual_page}; "
+        f"expected {expected_page}"
+    )
 
 
 def _validate_lengths(length, *, q: torch.Tensor, name: str) -> None:
@@ -150,6 +185,7 @@ def attn_fp8_swa_paged(
         q=q, pool=swa_pool_3d, indices=swa_topk_3d, sink=attn_sink,
         page=RICH_SWA_PAGE, index_width=RICH_SWA_INDEX_WIDTH, name="swa",
         allowed_widths=(RICH_SWA_INDEX_WIDTH,),
+        allow_ring_extension=True,
     )
     _validate_lengths(topk_length, q=q, name="swa.topk_length")
     _debug_check_topk_length("swa", topk_length, swa_topk_3d)
@@ -201,6 +237,7 @@ def attn_fp8_dual_paged(
     _validate_rich_pool(
         q=q, pool=swa_pool_3d, indices=swa_topk_3d, sink=attn_sink,
         page=RICH_SWA_PAGE, index_width=RICH_SWA_INDEX_WIDTH, name="dual.swa",
+        allow_ring_extension=True,
     )
     _validate_lengths(topk_length, q=q, name="dual.topk_length")
     _validate_lengths(extra_topk_length, q=q, name="dual.extra_topk_length")
