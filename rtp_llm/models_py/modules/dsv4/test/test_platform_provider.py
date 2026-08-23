@@ -19,6 +19,7 @@ Dsv4ProviderCapability = _PROVIDER_MODULE.Dsv4ProviderCapability
 Dsv4AttentionLayout = _PROVIDER_MODULE.Dsv4AttentionLayout
 resolve_dsv4_attention_layout = _PROVIDER_MODULE.resolve_dsv4_attention_layout
 build_dsv4_fp8_linear = _PROVIDER_MODULE.build_dsv4_fp8_linear
+build_dsv4_wo_a_fp8_linear = _PROVIDER_MODULE.build_dsv4_wo_a_fp8_linear
 build_dsv4_fp4_linear = _PROVIDER_MODULE.build_dsv4_fp4_linear
 prepare_dsv4_fp4_weight_scale = _PROVIDER_MODULE.prepare_dsv4_fp4_weight_scale
 
@@ -86,6 +87,15 @@ class _Fp8Provider(_Provider):
         return ("provider-fp8", default_factory, args, kwargs)
 
 
+class _WoAFp8Provider(_Provider):
+    capabilities = _Provider.capabilities | {
+        Dsv4ProviderCapability.WO_A_FP8_LINEAR,
+    }
+
+    def build_wo_a_fp8_linear(self, default_factory, *args, **kwargs):
+        return ("provider-wo-a-fp8", default_factory, args, kwargs)
+
+
 class _Fp4Provider(_Provider):
     capabilities = _Provider.capabilities | {
         Dsv4ProviderCapability.FP4_LINEAR,
@@ -146,6 +156,30 @@ class Dsv4PlatformProviderRegistryTest(unittest.TestCase):
             self.assertEqual(result[0], "provider-fp8")
             self.assertIs(result[2][0], sentinel)
             self.assertTrue(result[3]["flag"])
+        finally:
+            _PROVIDER_MODULE._PROVIDER_REGISTRY = original_registry
+
+    def test_wo_a_fp8_dispatch_is_separate_and_explicit(self):
+        original_registry = _PROVIDER_MODULE._PROVIDER_REGISTRY
+        try:
+            _PROVIDER_MODULE._PROVIDER_REGISTRY = Dsv4PlatformProviderRegistry()
+            sentinel = object()
+            self.assertIs(
+                build_dsv4_wo_a_fp8_linear(lambda value, **_: value, sentinel),
+                sentinel,
+            )
+
+            registry = Dsv4PlatformProviderRegistry()
+            registry.register(_WoAFp8Provider())
+            _PROVIDER_MODULE._PROVIDER_REGISTRY = registry
+            result = build_dsv4_wo_a_fp8_linear(
+                lambda *_args, **_kwargs: self.fail("default factory used"),
+                sentinel,
+                groups=1,
+            )
+            self.assertEqual(result[0], "provider-wo-a-fp8")
+            self.assertIs(result[2][0], sentinel)
+            self.assertEqual(result[3]["groups"], 1)
         finally:
             _PROVIDER_MODULE._PROVIDER_REGISTRY = original_registry
 
