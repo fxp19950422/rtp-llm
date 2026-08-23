@@ -45,6 +45,10 @@ public:
             // 需配合 GRPC_CLIENT_CHANNEL_BACKUP_POLL_INTERVAL_MS 使用，例如 500
             args.SetInt(GRPC_ARG_KEEPALIVE_TIMEOUT_MS, 5000);
             args.SetInt(GRPC_ARG_KEEPALIVE_PERMIT_WITHOUT_CALLS, 1);
+            // Model RPC peers are direct rank endpoints.  An ambient HTTP proxy
+            // can accept CONNECT while failing to forward the HTTP/2 stream,
+            // which surfaces later as a misleading "Socket closed" error.
+            args.SetInt("grpc.enable_http_proxy", 0);
             auto grpc_channel = grpc::CreateCustomChannel(peer, grpc::InsecureChannelCredentials(), args);
             if (!grpc_channel) {
                 std::string error_msg = "create grpc channel for " + peer + " failed";
