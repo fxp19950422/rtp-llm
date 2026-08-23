@@ -209,6 +209,31 @@ class EngineConfig:
         # as RoleType::VIT to model code.
         parallelism_config.role_type = pd_sep_config.role_type
 
+        # Page-level CP sharding changes the physical cache layout only on a
+        # PREFILL worker. A DECODE worker keeps the full layout but needs the
+        # flag plus the explicit prefill CP size to reconstruct transferred
+        # shards. PDFUSION/NORMAL has neither contract: allowing the flag in
+        # that role makes Python interpret an unsliced SWA/STATE pool as
+        # byte-sliced and can silently return incorrect tokens.
+        cp_config = parallelism_config.prefill_cp_config
+        if cp_config.kv_cache_sharded:
+            role_type = parallelism_config.role_type
+            if role_type not in (RoleType.PREFILL, RoleType.DECODE):
+                raise ValueError(
+                    "prefill_cp_kv_cache_sharded requires role_type PREFILL "
+                    "or DECODE; PDFUSION/NORMAL does not use the CP-sharded "
+                    "physical cache layout"
+                )
+            if role_type == RoleType.PREFILL and parallelism_config.tp_size <= 1:
+                raise ValueError(
+                    "PREFILL page-level CP KV sharding requires tp_size > 1"
+                )
+            if role_type == RoleType.DECODE and cp_config.prefill_cp_size <= 1:
+                raise ValueError(
+                    "DECODE receiving page-level CP KV shards requires an "
+                    "explicit prefill_cp_size > 1"
+                )
+
         if nccl_comm_config is None:
             nccl_comm_config = NcclCommConfig(
                 nccl_ip="",

@@ -208,6 +208,36 @@ class GenerateConfigTest(TestCase):
                 self.assertEqual(engine_config.pd_sep_config.role_type, role_type)
                 self.assertEqual(engine_config.parallelism_config.role_type, role_type)
 
+    def test_engine_config_rejects_cp_sharded_cache_for_pdfusion(self):
+        py_env_configs = PyEnvConfigs()
+        py_env_configs.role_config.role_type = RoleType.PDFUSION
+        py_env_configs.parallelism_config.prefill_cp_config.kv_cache_sharded = True
+        py_env_configs.parallelism_config.prefill_cp_config.prefill_cp_size = 8
+        py_env_configs.parallelism_config.tp_size = 8
+
+        with self.assertRaisesRegex(ValueError, "PREFILL or DECODE"):
+            EngineConfig.create(py_env_configs)
+
+    def test_engine_config_accepts_cp_sharded_prefill_and_decode_contracts(self):
+        prefill = PyEnvConfigs()
+        prefill.role_config.role_type = RoleType.PREFILL
+        prefill.parallelism_config.prefill_cp_config.kv_cache_sharded = True
+        prefill.parallelism_config.prefill_cp_config.prefill_cp_size = 8
+        prefill.parallelism_config.tp_size = 8
+        self.assertEqual(
+            EngineConfig.create(prefill).parallelism_config.role_type,
+            RoleType.PREFILL,
+        )
+
+        decode = PyEnvConfigs()
+        decode.role_config.role_type = RoleType.DECODE
+        decode.parallelism_config.prefill_cp_config.kv_cache_sharded = True
+        decode.parallelism_config.prefill_cp_config.prefill_cp_size = 8
+        self.assertEqual(
+            EngineConfig.create(decode).parallelism_config.role_type,
+            RoleType.DECODE,
+        )
+
     def test_engine_config_minimal_dataclass_construction_from_py_env_configs(self):
         py_env_configs = PyEnvConfigs()
 
