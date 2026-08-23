@@ -254,6 +254,51 @@ def _last_hidden_by_request(
     return flat[-1:].contiguous()
 
 
+def _cp_local_varlen_metadata(
+    cp_ctx: Any,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Rebuild rank-local varlen metadata from canonical CP context.
+
+    The production ZigZagProcessor may consume the framework-owned
+    ``attention_inputs.cu_seqlens`` and ``input_lengths`` while producing the
+    rank-local token slice.  DSV4 must not forward those now-empty tensors to
+    its varlen attention stack.  ``CPContext.chunk_lengths_per_req`` is the
+    canonical post-split layout and is available on every rank, so derive the
+    local cumulative lengths from it and retain the context's global prefix
+    lengths.
+    """
+    chunk_lengths = tuple(int(v) for v in cp_ctx.chunk_lengths_per_req or ())
+    if not chunk_lengths:
+        raise RuntimeError("CP context is missing rank-local request chunk lengths")
+    if any(v <= 0 for v in chunk_lengths):
+        raise RuntimeError(
+            f"CP rank-local chunk lengths must be positive: {chunk_lengths}"
+        )
+    if sum(chunk_lengths) != int(cp_ctx.chunk_length):
+        raise RuntimeError(
+            f"sum(CP rank-local chunk lengths)={sum(chunk_lengths)} != "
+            f"chunk_length={int(cp_ctx.chunk_length)}"
+        )
+
+    input_lengths = torch.tensor(chunk_lengths, dtype=torch.int32, device=device)
+    cu_seqlens = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int32, device=device),
+            torch.cumsum(input_lengths, dim=0).to(torch.int32),
+        ]
+    ).contiguous()
+    prefix_lengths = cp_ctx.prefix_lengths.to(
+        device=device, dtype=torch.int32
+    ).contiguous()
+    if prefix_lengths.numel() != input_lengths.numel():
+        raise RuntimeError(
+            f"CP prefix lengths has {prefix_lengths.numel()} entries, "
+            f"expected {input_lengths.numel()}"
+        )
+    return cu_seqlens, input_lengths, prefix_lengths, max(chunk_lengths)
+
+
 def set_cp_info(
     v4: V4Transformer,
     parallelism_config: Optional[ParallelismConfig],
@@ -335,6 +380,9 @@ def forward_layers(
     cp_size = getattr(v4, "_cp_size", 1)
     cp_rank = getattr(v4, "_cp_rank", 0)
     cp_ctx = None
+    cp_input_lengths: Optional[torch.Tensor] = None
+    cp_prefix_lengths: Optional[torch.Tensor] = None
+    cp_max_seqlen_q = 0
     if cp_info is not None and cp_size > 1:
         cp_ctx = build_cp_context_for_forward(
             cp_info,
@@ -345,6 +393,12 @@ def forward_layers(
             prefix_lengths=getattr(attn_inputs, "prefix_lengths", None),
             kv_cache_sharded=bool(getattr(v4, "_kv_cache_sharded", False)),
         )
+        (
+            cu_seqlens,
+            cp_input_lengths,
+            cp_prefix_lengths,
+            cp_max_seqlen_q,
+        ) = _cp_local_varlen_metadata(cp_ctx, input_ids.device)
     v4._propagate_cp_ctx(cp_ctx)
     if cp_ctx is not None:
         # The framework's fallback position_ids are rank-local contiguous
@@ -444,7 +498,11 @@ def forward_layers(
             input_lengths: Optional[torch.Tensor] = None
             prefix_lengths: Optional[torch.Tensor] = None
             max_seqlen_q = 0
-            if attn_inputs is not None:
+            if cp_ctx is not None:
+                input_lengths = cp_input_lengths
+                prefix_lengths = cp_prefix_lengths
+                max_seqlen_q = cp_max_seqlen_q
+            elif attn_inputs is not None:
                 il = getattr(attn_inputs, "input_lengths", None)
                 if il is not None and il.numel() > 0:
                     input_lengths = il.to(
