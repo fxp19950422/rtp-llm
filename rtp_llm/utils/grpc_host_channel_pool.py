@@ -29,7 +29,14 @@ class GrpcHostChannelPool:
         """
         :param options: aio.insecure_channel 的 gRPC options
         """
-        self._options = options or []
+        self._options = [
+            (key, value)
+            for key, value in (options or [])
+            if key != "grpc.enable_http_proxy"
+        ]
+        # Model RPC addresses are direct rank endpoints.  Never route these
+        # high-volume streaming channels through an ambient HTTP proxy.
+        self._options.append(("grpc.enable_http_proxy", 0))
         self._channels: Dict[str, GrpcHostChannel] = {}
         self._closed_channels: List[GrpcHostChannel] = []
         self._lock = asyncio.Lock()

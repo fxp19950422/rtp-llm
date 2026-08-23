@@ -29,6 +29,18 @@ class GrpcHostChannelPoolTest(TestCase):
         if hasattr(self.pool, "_channels"):
             self.pool._channels.clear()
 
+    def test_model_rpc_channels_force_http_proxy_off(self):
+        pool = GrpcHostChannelPool(
+            options=[
+                ("grpc.keepalive_time_ms", 1000),
+                ("grpc.enable_http_proxy", 1),
+            ]
+        )
+        self.assertEqual(
+            pool._options,
+            [("grpc.keepalive_time_ms", 1000), ("grpc.enable_http_proxy", 0)],
+        )
+
     async def test_pool_start_stop(self):
         """Test starting and stopping the pool cleanup task"""
         # Test start

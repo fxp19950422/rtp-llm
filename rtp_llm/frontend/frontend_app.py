@@ -260,6 +260,10 @@ class GracefulShutdownServer(Server):
 
 
 class FrontendApp(object):
+    _BACKEND_HEALTH_READY_TIMEOUT_S = 3600.0
+    _BACKEND_HEALTH_REQUEST_TIMEOUT_S = 5.0
+    _BACKEND_HEALTH_RETRY_INTERVAL_S = 1.0
+
     def __init__(
         self,
         py_env_configs: PyEnvConfigs,
@@ -302,11 +306,18 @@ class FrontendApp(object):
         """Loop until backend gRPC health_check returns ok (used when PD 不分离)."""
         if self.frontend_server.is_embedding:
             return
-        timeout_s = 3600
+        timeout_s = self._BACKEND_HEALTH_READY_TIMEOUT_S
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             try:
-                response = await self.grpc_client.post_request("health_check", {})
+                # The backend binds its RPC socket before a long model load is
+                # complete.  A health request can connect at that point and
+                # then wait forever.  Bound each attempt so Uvicorn startup
+                # retries after the backend becomes ready.
+                response = await asyncio.wait_for(
+                    self.grpc_client.post_request("health_check", {}),
+                    timeout=self._BACKEND_HEALTH_REQUEST_TIMEOUT_S,
+                )
                 if response.get("status") == "ok":
                     logging.info(
                         "Backend health_check ready, starting frontend rank_id=%s frontend_server_id=%s",
@@ -321,9 +332,9 @@ class FrontendApp(object):
                     self.server_config.frontend_server_id,
                     e,
                 )
-            await asyncio.sleep(1)
+            await asyncio.sleep(self._BACKEND_HEALTH_RETRY_INTERVAL_S)
         raise RuntimeError(
-            "Backend health_check did not become ready within %ds" % timeout_s
+            "Backend health_check did not become ready within %ss" % timeout_s
         )
 
     def start(self):

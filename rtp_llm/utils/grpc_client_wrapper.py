@@ -17,6 +17,8 @@ from rtp_llm.utils.time_util import Timer
 class GrpcClientWrapper:
     """Wrapper for direct gRPC calls to replace async_request_server"""
 
+    _CHANNEL_CLOSE_TIMEOUT_S = 1.0
+
     def __init__(
         self,
         server_port: int,
@@ -33,12 +35,25 @@ class GrpcClientWrapper:
         self._dp_stubs: Dict[str, Any] = {}
         self._client_config = client_config or {}
 
+    def _channel_options(self):
+        # Rank-to-rank model RPC is never an HTTP-proxy workload.  In build
+        # environments with http_proxy set, gRPC otherwise tunnels even
+        # localhost through the proxy and backend health can never become
+        # ready.  Force direct channels for both the local and DP paths.
+        options = [
+            (key, value)
+            for key, value in self._client_config.items()
+            if key != "grpc.enable_http_proxy"
+        ]
+        options.append(("grpc.enable_http_proxy", 0))
+        return options
+
     async def _ensure_connection(self):
         """Ensure gRPC channel and stub are created"""
         if self.channel is None or self.stub is None:
             self.channel = grpc.aio.insecure_channel(
                 self.address,
-                options=[(k, v) for k, v in self._client_config.items()],
+                options=self._channel_options(),
             )
             self.stub = RpcServiceStub(self.channel)
 
@@ -47,23 +62,40 @@ class GrpcClientWrapper:
         if address not in self._dp_channels or self._dp_stubs.get(address) is None:
             self._dp_channels[address] = grpc.aio.insecure_channel(
                 address,
-                options=[(k, v) for k, v in self._client_config.items()],
+                options=self._channel_options(),
             )
             self._dp_stubs[address] = RpcServiceStub(self._dp_channels[address])
 
+    async def _close_channel_bounded(self, channel, label: str) -> None:
+        close_task = asyncio.create_task(channel.close())
+        done, _ = await asyncio.wait(
+            {close_task}, timeout=self._CHANNEL_CLOSE_TIMEOUT_S
+        )
+        if close_task not in done:
+            close_task.cancel()
+            logging.warning(
+                "Timed out closing %s gRPC channel after %.3fs",
+                label,
+                self._CHANNEL_CLOSE_TIMEOUT_S,
+            )
+            return
+        try:
+            close_task.result()
+        except Exception as e:
+            logging.warning("Failed to close %s gRPC channel: %s", label, e)
+
     async def close(self):
         """Close the gRPC channel"""
-        if self.channel:
-            await self.channel.close()
-            self.channel = None
-            self.stub = None
-        for address, channel in self._dp_channels.items():
-            try:
-                await channel.close()
-            except Exception as e:
-                logging.warning(f"Failed to close DP channel for {address}: {e}")
+        channel = self.channel
+        self.channel = None
+        self.stub = None
+        if channel:
+            await self._close_channel_bounded(channel, self.address)
+        dp_channels = tuple(self._dp_channels.items())
         self._dp_channels.clear()
         self._dp_stubs.clear()
+        for address, channel in dp_channels:
+            await self._close_channel_bounded(channel, address)
 
     async def health_check(self) -> Dict[str, Any]:
         """Check server health"""
