@@ -80,7 +80,11 @@ from rtp_llm.models_py.modules.dsv4.fp8._swa_cp_byte_sliced import (
 from rtp_llm.models_py.modules.dsv4.fp8.compressor import CompressorFP8, CompressorMeta
 from rtp_llm.models_py.modules.dsv4.fp8.indexer import IndexerFP8
 from rtp_llm.models_py.modules.dsv4.prefill_workspace import PrefillWorkspace
-from rtp_llm.models_py.modules.dsv4.rope import precompute_freqs_cis
+from rtp_llm.models_py.modules.dsv4.rope import (
+    apply_rotary_emb,
+    apply_rotary_emb_batched,
+    precompute_freqs_cis,
+)
 from rtp_llm.models_py.modules.factory.linear import LinearFactory
 from rtp_llm.models_py.utils.memory import dispose_tensor
 from rtp_llm.ops.compute_ops import rtp_llm_ops
@@ -997,11 +1001,26 @@ class AttentionFP8(nn.Module):
         self.wo_a_w = wo_a_w
         self.wo_a_s = wo_a_s
         K_local = n_heads_local * head_dim // n_groups_local
-        _stk_w, _stk_s = _prepare_wo_a_stacked(
-            wo_a_w, wo_a_s, n_groups_local, o_lora_rank, K_local
+        from rtp_llm.models_py.modules.dsv4.platform_provider import (
+            build_dsv4_wo_a_fp8_linear,
         )
-        self.register_buffer("_wo_a_stk_w", _stk_w, persistent=False)
-        self.register_buffer("_wo_a_stk_s", _stk_s, persistent=False)
+
+        self.wo_a = build_dsv4_wo_a_fp8_linear(
+            lambda *_args, **_kwargs: None,
+            wo_a_w,
+            wo_a_s,
+            groups=n_groups_local,
+            k_local=K_local,
+        )
+        if self.wo_a is None:
+            _stk_w, _stk_s = _prepare_wo_a_stacked(
+                wo_a_w, wo_a_s, n_groups_local, o_lora_rank, K_local
+            )
+            self.register_buffer("_wo_a_stk_w", _stk_w, persistent=False)
+            self.register_buffer("_wo_a_stk_s", _stk_s, persistent=False)
+        else:
+            self.register_buffer("_wo_a_stk_w", None, persistent=False)
+            self.register_buffer("_wo_a_stk_s", None, persistent=False)
 
         # wo_b row-split along K (cols), all_reduce after forward
         self.wo_b = _fp8_w_s(
@@ -2022,6 +2041,7 @@ class AttentionFP8(nn.Module):
         consumes, so the wo_a projection is a single einsum launch.
         Matches vLLM ``deepseek_v4_attention.py:325`` (same
         ``"bhr,hdr->bhd"`` + recipe ``(1, 1, 128)`` for SM100 UE8M0)."""
+        assert self.wo_a is None, "provider wo_a consumes BF16 grouped input"
         M, G, _K = o_fp8.shape
         R = self.o_lora_rank
         out = torch.empty(M, G, R, dtype=torch.bfloat16, device=o_fp8.device)
@@ -2033,6 +2053,28 @@ class AttentionFP8(nn.Module):
             recipe=(1, 1, 128),
         )
         return out.view(B, S, G, R)
+
+    def _wo_a_from_bf16(
+        self,
+        o: torch.Tensor,
+        freqs_cis: torch.Tensor,
+        B: int,
+        S: int,
+    ) -> torch.Tensor:
+        """Inverse-RoPE then invoke a provider-owned grouped FP8 projection."""
+        assert self.wo_a is not None
+        o_4d = o.view(B, S, self.n_heads, self.head_dim)
+        rope = o_4d[..., -self.rope_head_dim :]
+        if freqs_cis.dim() == 2 and int(freqs_cis.shape[0]) == B:
+            apply_rotary_emb_batched(rope, freqs_cis, inverse=True)
+        else:
+            apply_rotary_emb(
+                rope,
+                freqs_cis.reshape(-1, freqs_cis.shape[-1]).contiguous(),
+                inverse=True,
+            )
+        grouped = o_4d.reshape(B, S, self.n_groups, -1)
+        return self.wo_a(grouped)
 
     def forward_decode(
         self,
@@ -5518,17 +5560,21 @@ class AttentionFP8(nn.Module):
         """
         o_3d = o.view(-1, self.n_heads, self.head_dim)
         seqlen = o_3d.shape[0]
-        with record_function_range("dsv4.fp8.attn.out.fused_inv_rope_quant"):
-            o_fp8, o_scale = fused_inv_rope_fp8_quant(
-                o_3d,
-                freqs_cis,
-                n_groups=self.n_groups,
-                heads_per_group=self.n_heads // self.n_groups,
-                nope_dim=self.head_dim - self.rope_head_dim,
-                rope_head_dim=self.rope_head_dim,
-            )
-        with record_function_range("dsv4.fp8.attn.out.wo_a_einsum"):
-            o_proj = self._wo_a_einsum_from_fp8(o_fp8, o_scale, 1, seqlen)
+        if self.wo_a is not None:
+            with record_function_range("dsv4.fp8.attn.out.provider_wo_a"):
+                o_proj = self._wo_a_from_bf16(o_3d, freqs_cis, 1, seqlen)
+        else:
+            with record_function_range("dsv4.fp8.attn.out.fused_inv_rope_quant"):
+                o_fp8, o_scale = fused_inv_rope_fp8_quant(
+                    o_3d,
+                    freqs_cis,
+                    n_groups=self.n_groups,
+                    heads_per_group=self.n_heads // self.n_groups,
+                    nope_dim=self.head_dim - self.rope_head_dim,
+                    rope_head_dim=self.rope_head_dim,
+                )
+            with record_function_range("dsv4.fp8.attn.out.wo_a_einsum"):
+                o_proj = self._wo_a_einsum_from_fp8(o_fp8, o_scale, 1, seqlen)
         with record_function_range("dsv4.fp8.attn.out.wo_b"):
             wo_b_in = o_proj.flatten(2).reshape(seqlen, -1)
             self.wo_b(wo_b_in, out=out)
