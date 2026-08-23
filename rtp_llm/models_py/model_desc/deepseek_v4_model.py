@@ -55,6 +55,9 @@ from rtp_llm.models_py.modules.dsv4.moe.moe_layer import (
     resolve_moe_max_tokens_per_rank,
 )
 from rtp_llm.models_py.modules.dsv4.prefill.forward import forward_prefill
+from rtp_llm.models_py.modules.dsv4.prefill_workspace import (
+    tp_local_prefill_q_dim,
+)
 from rtp_llm.models_py.modules.dsv4.platform_provider import (
     Dsv4ProviderCapability,
     resolve_dsv4_platform_provider,
@@ -520,6 +523,14 @@ class DeepSeekV4Model(GptModelBase):
     def _resolve_prefill_q_token_capacity(self) -> int:
         return self._resolve_shared_token_capacity()
 
+    def _resolve_prefill_q_dim(self) -> int:
+        """Return the TP-local dense-Q width backed by the prefill workspace."""
+        return tp_local_prefill_q_dim(
+            self._v4_args.n_heads,
+            self._v4_args.head_dim,
+            self._v4_args.tp_size,
+        )
+
     def _resolve_mtp_last_hidden_token_capacity(self) -> Optional[int]:
         return None
 
@@ -582,7 +593,13 @@ class DeepSeekV4Model(GptModelBase):
         # lifetime. CP gather/restore region is sized only when CP is active.
         cp_size = int(self._prefill_cp_size)
         q_rows = int(self._resolve_prefill_q_token_capacity())
-        q_dim = int(self._v4_args.n_heads) * int(self._v4_args.head_dim)
+        # Attention Q is row-sharded by heads under tensor parallelism.  The
+        # workspace backs the local ``wq_b`` output, so sizing it with the
+        # global head count makes ``_materialize_prefill_q`` try to reinterpret
+        # a TP-size-larger buffer as the local Q tensor (for TP8: 32768 vs
+        # 4096 elements per token).  Keep TP1 unchanged and fail loudly on an
+        # invalid head partition.
+        q_dim = self._resolve_prefill_q_dim()
         if cp_size > 1:
             full_rows = q_rows * cp_size
             main_w, idx_w = self._resolve_prefill_ws_gather_widths()
