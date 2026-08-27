@@ -17,6 +17,7 @@ _SOURCE_PATH = (
     / "strategies"
     / "ppu_grouped_fp4.py"
 )
+_REGISTRY_PATH = _SOURCE_PATH.parent / "__init__.py"
 
 
 def _load_helpers():
@@ -97,6 +98,16 @@ class PpuGroupedFP4SourceContractTest(unittest.TestCase):
         )
         self.assertIn("_supports_topology(cfg)", ast.unparse(can_handle))
         self.assertIn("_runtime_eligible()", ast.unparse(can_handle))
+
+    def test_registered_ahead_of_generic_and_loop_fallbacks(self):
+        registry = _REGISTRY_PATH.read_text()
+        ppu = registry.index("from .ppu_grouped_fp4 import")
+        generic = registry.index("from .grouped_fp4 import")
+        deepep = registry.index("from .deepep import")
+        local_loop = registry.index("from .local_loop import")
+        self.assertLess(ppu, generic)
+        self.assertLess(ppu, deepep)
+        self.assertLess(ppu, local_loop)
 
     def test_runtime_eligibility_rejects_generic_gpu_and_missing_symbol(self):
         runtime_eligible = self.helpers["_runtime_eligible"]

@@ -22,6 +22,15 @@ py_test(
 )
 
 py_test(
+    name = "test_ppu_grouped_fp4_strategy_source",
+    srcs = ["test_ppu_grouped_fp4_strategy_source.py"],
+    # Source-only: parses the strategy and runs isolated helpers without
+    # importing torch, deep_gemm, or any native runtime.
+    data = ["//rtp_llm/models_py:modules"],
+    tags = ["source-only"],
+)
+
+py_test(
     name = "test_ppu_deep_gemm_layout_compat",
     srcs = ["test_ppu_deep_gemm_layout_compat.py"],
     deps = [
