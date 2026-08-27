@@ -170,12 +170,17 @@ class PpuGroupedFP4SourceContractTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             derive(_cfg(tp_size=1), *_shapes(2048))
 
-    def test_hidden_dim_requires_ep_scatter_scale_block_alignment(self):
+    def test_hidden_dim_rejects_ep_gather_incompatible_alignment(self):
         derive = self.helpers["_derive_inter_local_and_tp"]
 
-        with self.assertRaisesRegex(ValueError, "dim aligned to 128"):
-            derive(_cfg(dim=64, inter=256), *_shapes(64, dim=64))
+        for dim in (64, 128, 384):
+            with self.subTest(dim=dim), self.assertRaisesRegex(
+                ValueError, "dim aligned to 512"
+            ):
+                derive(_cfg(dim=dim, inter=256), *_shapes(64, dim=dim))
 
+    def test_real_hidden_dim_accepts_full_route_alignment(self):
+        derive = self.helpers["_derive_inter_local_and_tp"]
         inter_local, routed_tp = derive(_cfg(dim=7168), *_shapes(512, dim=7168))
         self.assertEqual((inter_local, routed_tp), (512, 4))
 
