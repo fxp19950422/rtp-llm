@@ -3,6 +3,13 @@ py_test_deps = [
 ]
 
 py_test(
+    name = "deepseek_v4_mtp_contiguous_source_test",
+    srcs = ["deepseek_v4_mtp_contiguous_source_test.py"],
+    data = ["//rtp_llm/models_py:dsv4_mtp_model_source"],
+    tags = ["source-only"],
+)
+
+py_test(
     name = "generic_moe_allreduce_test",
     srcs = ["generic_moe_allreduce_test.py"],
     deps = py_test_deps + [

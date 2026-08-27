@@ -41,6 +41,12 @@ filegroup(
 )
 
 filegroup(
+    name = "dsv4_mtp_model_source",
+    srcs = ["model_desc/deepseek_v4_mtp_model.py"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
     name = "dsv4_rich_attention_contract_sources",
     srcs = [
         "modules/dsv4/fp8/decode/attention_kernels.py",
