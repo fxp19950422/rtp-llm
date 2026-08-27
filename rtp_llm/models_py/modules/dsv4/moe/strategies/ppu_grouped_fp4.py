@@ -410,7 +410,7 @@ class PpuGroupedFP4Strategy(RoutedExpertsStrategy):
             expected_m,
         )
 
-        gathered = torch.empty((token_count, dim), dtype=torch.bfloat16, device=x.device)
+        gathered = torch.empty((token_count, dim), dtype=torch.float32, device=x.device)
         ep_gather(
             down.view(total, dim),
             adjusted_ids,
@@ -418,7 +418,7 @@ class PpuGroupedFP4Strategy(RoutedExpertsStrategy):
             output_index,
             gathered,
         )
-        return gathered.float()
+        return gathered
 
 
 __all__ = ["PpuGroupedFP4Strategy"]
