@@ -91,18 +91,6 @@ public:
                                                        bool                   is_dspark = false);
 
 protected:
-    enum class ExecutionPhase : int64_t {
-        MTP          = 0,
-        NORMAL       = 1,
-        MIXED_ERROR  = 2,
-    };
-
-    // Only TP rank 0 owns scheduler streams. It classifies the local batch,
-    // then syncExecutionPhase broadcasts that decision before any model
-    // collective so non-root ranks never infer a phase from an empty list.
-    static ExecutionPhase classifyExecutionPhase(const std::list<GenerateStreamPtr>& streams);
-    ExecutionPhase        syncExecutionPhase(const std::list<GenerateStreamPtr>& streams) const;
-
     static bool dsparkPrefillCPRoleIsValid(const PrefillCPConfig& prefill_cp_config, RoleType role_type);
     static bool dsparkDraftGraphAllowed(bool is_dspark, RoleType role_type);
     struct AcceptLenMetricsSnapshot {

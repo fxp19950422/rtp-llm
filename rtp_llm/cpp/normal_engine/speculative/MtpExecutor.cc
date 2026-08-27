@@ -212,42 +212,6 @@ bool MtpExecutor::isTpRank0() const {
     return tp_rank_ == 0;
 }
 
-MtpExecutor::ExecutionPhase
-MtpExecutor::classifyExecutionPhase(const std::list<GenerateStreamPtr>& streams) {
-    const size_t force_disabled_count =
-        std::count_if(streams.begin(), streams.end(), [](const auto& stream) { return stream->forceDisableSpRun(); });
-    if (force_disabled_count == 0) {
-        return ExecutionPhase::MTP;
-    }
-    if (force_disabled_count == streams.size()) {
-        return ExecutionPhase::NORMAL;
-    }
-    return ExecutionPhase::MIXED_ERROR;
-}
-
-MtpExecutor::ExecutionPhase
-MtpExecutor::syncExecutionPhase(const std::list<GenerateStreamPtr>& streams) const {
-    auto phase = isTpRank0() ? classifyExecutionPhase(streams) : ExecutionPhase::MTP;
-    if (parallelism_config_.tp_size <= 1) {
-        return phase;
-    }
-
-    // Match tpSyncModelInputs' proven control-plane transport: intra-node TP
-    // uses CpuTpBroadcaster after Python bootstrap; cross-node TP falls back
-    // inside execBroadcastCpu to the registered collective plus CUDA sync.
-    auto phase_tensor = torch::empty({1}, torch::TensorOptions().dtype(torch::kInt64).pinned_memory(true));
-    if (isTpRank0()) {
-        phase_tensor.data_ptr<int64_t>()[0] = static_cast<int64_t>(phase);
-    }
-    execBroadcastCpu({{phase_tensor}, 0});
-    const auto phase_value = phase_tensor.data_ptr<int64_t>()[0];
-    RTP_LLM_CHECK_WITH_INFO(phase_value >= static_cast<int64_t>(ExecutionPhase::MTP)
-                                && phase_value <= static_cast<int64_t>(ExecutionPhase::MIXED_ERROR),
-                            "invalid MTP execution phase broadcast: %ld",
-                            static_cast<long>(phase_value));
-    return static_cast<ExecutionPhase>(phase_value);
-}
-
 void MtpExecutor::maybeOverrideLastHiddenWithMtpBuffer(GptModelInputs& model_input,
                                                        ModelBase&      source,
                                                        bool            request_actual_rows) {
@@ -2164,22 +2128,23 @@ absl::Status MtpExecutor::process(const std::list<GenerateStreamPtr>& streams, i
     auto wall_tps_active_guard =
         wall_tps_reporter_.makeActiveGuard(metrics_reporter_ && isTpRank0() && !warm_up_ && !streams.empty());
 
-    // This is the first TP collective in process(). Non-root scheduler stream
-    // lists are empty, so rank 0 is the sole authority and broadcasts the
-    // phase before any normal/MTP model-input collective can diverge.
-    const auto execution_phase = syncExecutionPhase(streams);
-    if (execution_phase == ExecutionPhase::MIXED_ERROR) {
+    size_t force_disabled_count = 0;
+    for (const auto& stream : streams) {
+        force_disabled_count += stream->forceDisableSpRun() ? 1 : 0;
+    }
+    if (force_disabled_count != 0 && force_disabled_count != streams.size()) {
         const std::string message =
             "force_disable_sp_run cannot share one MTP executor batch with speculative requests";
         for (const auto& stream : streams) {
             stream->reportError(ErrorCode::INVALID_PARAMS, message);
         }
-        RTP_LLM_LOG_ERROR("[MTP force-disable] reject mixed batch before model collective: stream_count=%zu",
+        RTP_LLM_LOG_ERROR("[MTP force-disable] reject mixed batch: disabled=%zu total=%zu",
+                          force_disabled_count,
                           streams.size());
         return absl::InvalidArgumentError(message);
     }
 
-    if (execution_phase == ExecutionPhase::NORMAL) {
+    if (force_disabled_count == streams.size() && !streams.empty()) {
         RTP_LLM_LOG_DEBUG("[MTP force-disable] target-only normal path: stream_count=%zu", streams.size());
         MtpMetricsCollector normal_metrics_collector;
         auto status = normalStep(streams, normal_metrics_collector, schedule_time_us);
