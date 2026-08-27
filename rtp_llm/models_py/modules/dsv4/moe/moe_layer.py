@@ -43,6 +43,7 @@ from .strategies.base import MoeCfg, _resolve_forced, select_strategy
 _FINAL_OUT_CACHE: dict[tuple, torch.Tensor] = {}
 _CHUNKED_MOE_LOGGED = False
 _POST_W2_ROUTE_WEIGHT_CONTRACT = "post_w2_normalized_then_scale_v1"
+logger = logging.getLogger(__name__)
 
 
 def _all_reduce_routed_tp(routed: torch.Tensor) -> torch.Tensor:
@@ -295,6 +296,30 @@ class MoE(nn.Module):
         # (e.g. LocalLoopStrategy.experts ModuleList) propagate through
         # ``MoE.to(device)``.
         self._strategy = strategy_cls(cfg)
+        runtime_rank = os.environ.get(
+            "WORLD_RANK",
+            os.environ.get("RANK", os.environ.get("LOCAL_RANK", "unknown")),
+        )
+        logger.info(
+            "DSV4_MOE_FINAL_STRATEGY env_strategy=%r env_use_mega=%r "
+            "env_use_mega_se=%r env_use_grouped_fp4=%r ctor=%r resolved=%r "
+            "strict=%s selected_name=%s selected_class=%s layer=%d rank=%s "
+            "tp=%d ep=%d ep_rank=%d",
+            os.environ.get("DSV4_MOE_STRATEGY"),
+            os.environ.get("DSV4_USE_MEGA_MOE"),
+            os.environ.get("DSV4_USE_MEGA_MOE_SE"),
+            os.environ.get("DSV4_USE_GROUPED_FP4"),
+            strategy,
+            forced,
+            strict,
+            getattr(strategy_cls, "name", "unknown"),
+            f"{strategy_cls.__module__}.{strategy_cls.__name__}",
+            layer_id,
+            runtime_rank,
+            tp_size,
+            ep_size,
+            ep_rank,
+        )
         self._gate_pack_static = os.environ.get(
             "MOEDBG", "0"
         ) == "0" and self._strategy.can_use_gate_pack_static(self.gate)
