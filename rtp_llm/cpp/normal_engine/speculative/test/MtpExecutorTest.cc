@@ -64,6 +64,17 @@ TEST(MtpExecutorPolicyTest, DSparkPrefillRoleDisablesDraftGraphCapture) {
     EXPECT_TRUE(MtpExecutor::dsparkDraftGraphAllowed(/*is_dspark=*/false, RoleType::DECODE));
 }
 
+TEST(MtpExecutorPolicyTest, ForceDisableExecutionPhaseIsRankZeroBatchPolicy) {
+    // Classification itself is covered with live streams in the executor
+    // tests below. Keep the enum contract explicit here: empty is the default
+    // MTP phase used by rank 0 for a genuine empty scheduler step, never a
+    // non-root inference rule.
+    EXPECT_EQ(MtpExecutor::classifyExecutionPhase({}), MtpExecutor::ExecutionPhase::MTP);
+    EXPECT_EQ(static_cast<int64_t>(MtpExecutor::ExecutionPhase::MTP), 0);
+    EXPECT_EQ(static_cast<int64_t>(MtpExecutor::ExecutionPhase::NORMAL), 1);
+    EXPECT_EQ(static_cast<int64_t>(MtpExecutor::ExecutionPhase::MIXED_ERROR), 2);
+}
+
 struct MtpExecutorTestConfig {
     size_t  max_seq_len            = 2048;
     size_t  vocab_size             = 4;
