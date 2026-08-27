@@ -212,10 +212,65 @@ class PpuGroupedFP4SourceContractTest(unittest.TestCase):
             "m_grouped_gemm_fp4_fp4_bf16_nt_nopad",
             "compact_mxfp4_routes_nopad",
             "self.routed_tp_size = routed_tp_size",
+            "PPU rtp_llm_ops lacks ppu_silu_and_mul_post_quant_mxfp4",
+            "ppu_grouped_fp4 operators were not bound by setup",
         )
         for fragment in required_fragments:
             self.assertIn(fragment, self.source)
         self.assertNotIn("except Exception", self.source)
+
+    def test_setup_logs_bound_operator_path_once_and_forward_does_not_sync(self):
+        strategy = next(
+            node
+            for node in self.tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "PpuGroupedFP4Strategy"
+        )
+        setup = next(
+            node
+            for node in strategy.body
+            if isinstance(node, ast.FunctionDef) and node.name == "setup_weights"
+        )
+        forward = next(
+            node
+            for node in strategy.body
+            if isinstance(node, ast.FunctionDef) and node.name == "forward"
+        )
+        log_once = next(
+            node
+            for node in self.tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_log_operator_path_once"
+        )
+
+        self.assertEqual(len(log_once.decorator_list), 1)
+        self.assertEqual(ast.unparse(log_once.decorator_list[0]), "lru_cache(maxsize=1)")
+        log_source = ast.unparse(log_once)
+        for field in (
+            "DSV4_PPU_GROUPED_OPERATOR_PATH",
+            "strategy=ppu_grouped_fp4",
+            "operator_module=%s",
+            "fused_module=%s",
+            "fused_mode=%s",
+        ):
+            self.assertIn(field, log_source)
+
+        setup_source = ast.unparse(setup)
+        self.assertIn("self._grouped_gemm = grouped_gemm", setup_source)
+        self.assertIn("self._fused_swiglu_quant = fused_swiglu_quant", setup_source)
+        self.assertIn("_log_operator_path_once", setup_source)
+        self.assertLess(
+            setup_source.index("self._fused_swiglu_quant = fused_swiglu_quant"),
+            setup_source.index("_log_operator_path_once"),
+        )
+
+        forward_source = ast.unparse(forward)
+        self.assertNotIn("_log_operator_path_once", forward_source)
+        self.assertNotIn("import deep_gemm", forward_source)
+        self.assertNotIn("rtp_llm.ops.compute_ops", forward_source)
+        for host_sync in (".cpu()", ".tolist()", ".item()", "cuda.synchronize"):
+            self.assertNotIn(host_sync, forward_source)
+
     def test_forward_uses_single_fused_swiglu_quant_without_fallback(self) -> None:
         tree = ast.parse(self.source)
         strategy = next(
@@ -235,7 +290,7 @@ class PpuGroupedFP4SourceContractTest(unittest.TestCase):
             node
             for node in calls
             if isinstance(node.func, ast.Attribute)
-            and node.func.attr == "ppu_silu_and_mul_post_quant_mxfp4"
+            and node.func.attr == "_fused_swiglu_quant"
         ]
         self.assertEqual(len(fused_calls), 1)
         self.assertEqual(ast.unparse(fused_calls[0].args[0]), "gate_up")
@@ -254,7 +309,8 @@ class PpuGroupedFP4SourceContractTest(unittest.TestCase):
         grouped_calls = [
             node
             for node in calls
-            if isinstance(node.func, ast.Name) and node.func.id == "grouped_gemm"
+            if isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_grouped_gemm"
         ]
         self.assertEqual(len(grouped_calls), 2)
         self.assertIn("self._ppu_w13", ast.unparse(grouped_calls[0]))

@@ -11,6 +11,8 @@ device, or external symbol fails closed.
 
 from __future__ import annotations
 
+import logging
+from functools import lru_cache
 from typing import Dict, Tuple
 
 import torch
@@ -18,7 +20,37 @@ import torch
 from .base import MoeCfg, RoutedExpertsStrategy, register_strategy
 
 
+logger = logging.getLogger(__name__)
+
 _ROUTE_WEIGHT_CONTRACT = "post_w2_normalized_then_scale_v1"
+_GROUPED_GEMM_SYMBOL = "deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad"
+_FUSED_QUANT_SYMBOL = "rtp_llm_ops.ppu_silu_and_mul_post_quant_mxfp4"
+_FUSED_QUANT_MODE = "aot_ppu_fused_swiglu_mxfp4"
+
+
+@lru_cache(maxsize=1)
+def _log_operator_path_once(grouped_module: str, fused_module: str) -> None:
+    """Emit one process-local marker for the exact callables bound by setup."""
+
+    logger.info(
+        "DSV4_PPU_GROUPED_OPERATOR_PATH strategy=ppu_grouped_fp4 "
+        "operator=%s operator_module=%s fused=%s fused_module=%s fused_mode=%s",
+        _GROUPED_GEMM_SYMBOL,
+        grouped_module,
+        _FUSED_QUANT_SYMBOL,
+        fused_module,
+        _FUSED_QUANT_MODE,
+    )
+
+
+def _module_path(module: object) -> str:
+    """Return a stable module identity without inspecting device state."""
+
+    return str(
+        getattr(module, "__file__", None)
+        or getattr(module, "__name__", None)
+        or type(module).__module__
+    )
 
 
 def _supports_topology(cfg: MoeCfg) -> bool:
@@ -128,6 +160,8 @@ class PpuGroupedFP4Strategy(RoutedExpertsStrategy):
     def __init__(self, cfg: MoeCfg):
         super().__init__(cfg)
         self.inter_local = 0
+        self._grouped_gemm = None
+        self._fused_swiglu_quant = None
 
     @classmethod
     def can_handle(cls, cfg: MoeCfg) -> bool:
@@ -184,6 +218,24 @@ class PpuGroupedFP4Strategy(RoutedExpertsStrategy):
         if torch.cuda.get_device_name(w1.device) != "ZW-M890P":
             raise RuntimeError("ppu_grouped_fp4 requires ZW-M890P")
 
+        import deep_gemm
+
+        grouped_gemm = getattr(
+            deep_gemm, "m_grouped_gemm_fp4_fp4_bf16_nt_nopad", None
+        )
+        if not callable(grouped_gemm):
+            raise RuntimeError(
+                "PPU deep_gemm lacks m_grouped_gemm_fp4_fp4_bf16_nt_nopad"
+            )
+        from rtp_llm.ops.compute_ops import rtp_llm_ops
+
+        fused_swiglu_quant = getattr(
+            rtp_llm_ops, "ppu_silu_and_mul_post_quant_mxfp4", None
+        )
+        if not callable(fused_swiglu_quant):
+            raise RuntimeError(
+                "PPU rtp_llm_ops lacks ppu_silu_and_mul_post_quant_mxfp4"
+            )
         from internal_source.rtp_llm.models_py.kernels.ppu_mxfp4 import (
             prepare_fp4_weight_scale_mxfp4,
         )
@@ -201,8 +253,14 @@ class PpuGroupedFP4Strategy(RoutedExpertsStrategy):
         self.register_buffer("_ppu_s2", s2_prepared, persistent=False)
         self.inter_local = inter_local
         self.routed_tp_size = routed_tp_size
+        self._grouped_gemm = grouped_gemm
+        self._fused_swiglu_quant = fused_swiglu_quant
         for key in keys:
             layer_weights.pop(key)
+        _log_operator_path_once(
+            _module_path(deep_gemm),
+            _module_path(rtp_llm_ops),
+        )
 
     def forward(
         self,
@@ -214,6 +272,8 @@ class PpuGroupedFP4Strategy(RoutedExpertsStrategy):
 
         if self.inter_local <= 0:
             raise RuntimeError("ppu_grouped_fp4 weights were not bound")
+        if self._grouped_gemm is None or self._fused_swiglu_quant is None:
+            raise RuntimeError("ppu_grouped_fp4 operators were not bound by setup")
         if x.ndim != 2 or x.dtype != torch.bfloat16:
             raise TypeError(f"x must be BF16 [N,D], got dtype={x.dtype}, shape={x.shape}")
         if weights.ndim != 2 or weights.dtype != torch.float32:
@@ -240,22 +300,12 @@ class PpuGroupedFP4Strategy(RoutedExpertsStrategy):
         if token_count == 0:
             return torch.zeros((0, dim), dtype=torch.float32, device=x.device)
 
-        import deep_gemm
-
-        grouped_gemm = getattr(
-            deep_gemm, "m_grouped_gemm_fp4_fp4_bf16_nt_nopad", None
-        )
-        if not callable(grouped_gemm):
-            raise RuntimeError(
-                "PPU deep_gemm lacks m_grouped_gemm_fp4_fp4_bf16_nt_nopad"
-            )
         from internal_source.rtp_llm.models_py.kernels.ppu_moe_nopad import (
             compact_mxfp4_routes_nopad,
         )
         from internal_source.rtp_llm.models_py.kernels.ppu_mxfp4 import (
             downcast_to_mxfp4,
         )
-        from rtp_llm.ops.compute_ops import rtp_llm_ops
         from rtp_llm.models_py.triton_kernels.moe.ep_kernels import (
             ep_gather,
         )
@@ -278,7 +328,7 @@ class PpuGroupedFP4Strategy(RoutedExpertsStrategy):
             dtype=torch.bfloat16,
             device=x.device,
         )
-        grouped_gemm(
+        self._grouped_gemm(
             (compact_fp4, compact_scale),
             (self._ppu_w13, self._ppu_s13),
             None,
@@ -288,11 +338,9 @@ class PpuGroupedFP4Strategy(RoutedExpertsStrategy):
         )
 
         limit = self.cfg.swiglu_limit if self.cfg.swiglu_limit > 0 else None
-        hidden_fp4, hidden_scale = (
-            rtp_llm_ops.ppu_silu_and_mul_post_quant_mxfp4(gate_up, limit)
-        )
+        hidden_fp4, hidden_scale = self._fused_swiglu_quant(gate_up, limit)
         down = torch.empty((total, dim), dtype=torch.bfloat16, device=x.device)
-        grouped_gemm(
+        self._grouped_gemm(
             (hidden_fp4, hidden_scale),
             (self._ppu_w2, self._ppu_s2),
             None,
