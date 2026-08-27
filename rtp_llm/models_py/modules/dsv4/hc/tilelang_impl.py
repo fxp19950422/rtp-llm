@@ -116,7 +116,7 @@ class TileLangHCUnit(HCUnitBase):
 
 
 class HybridHCUnit(TileLangHCUnit):
-    """DeepGEMM/TileLang PRE with the validated FP32 PyTorch POST.
+    """Selectable PRE with the validated FP32 PyTorch POST by default.
 
     The PPU TileLang POST kernel currently fails JIT compilation because it
     emits unsupported PDL.  PRE is independently parity/performance gated, so
@@ -139,6 +139,13 @@ class HybridHCUnit(TileLangHCUnit):
         # determinism/parity gate. Keep every other/default backend on the
         # validated FP32 reference path during capture.
         pre_backend = os.environ.get("DSV4_MHC_PRE_GEMM_BACKEND", "").strip().lower()
+        if pre_backend == "fallback":
+            from rtp_llm.models_py.modules.dsv4.hc.fallback_impl import (
+                FallbackHCUnit,
+            )
+
+            return FallbackHCUnit._pre_impl(self, x, dbg_tag=dbg_tag)
+
         graph_safe_backends = {"tilelang_single", "deepgemm"}
         capture_uses_fallback = pre_backend not in graph_safe_backends
         if (

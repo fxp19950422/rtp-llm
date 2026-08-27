@@ -366,6 +366,61 @@ class TestHCImpl(unittest.TestCase):
         )
         torch.testing.assert_close(actual_post, expected_post, atol=0, rtol=0)
 
+    def test_factory_hybrid_routes_fallback_pre_tilelang_post_and_fallback_head(
+        self,
+    ) -> None:
+        hc, dim = 4, 16
+        fn, base, scale = _weights(hc, dim)
+        with _env("DSV4_HC_IMPL", "hybrid"), _env(
+            "DSV4_MHC_PRE_GEMM_BACKEND", " fallback "
+        ), _env("DSV4_MHC_POST_BACKEND", " TILELANG "):
+            unit = build_hc_unit(
+                fn,
+                base,
+                scale,
+                dim=dim,
+                hc_mult=hc,
+                hc_sinkhorn_iters=3,
+                norm_eps=1e-6,
+                hc_eps=1e-6,
+            )
+            head = build_hc_head(
+                fn[:hc],
+                base[:hc],
+                scale[:1],
+                dim=dim,
+                hc_mult=hc,
+                norm_eps=1e-6,
+                hc_eps=1e-6,
+            )
+            pre_result = object()
+            post_result = object()
+            pre_input = object()
+            post_args = tuple(object() for _ in range(4))
+            with mock.patch.object(
+                FallbackHCUnit, "_pre_impl", return_value=pre_result
+            ) as fallback_pre, mock.patch.object(
+                TileLangHCUnit, "_pre_impl"
+            ) as tilelang_pre:
+                actual_pre = unit._pre_impl(pre_input, dbg_tag="explicit-fallback")
+            with mock.patch.object(
+                TileLangHCUnit, "_post_impl", return_value=post_result
+            ) as tilelang_post, mock.patch.object(
+                FallbackHCUnit, "_post_impl"
+            ) as fallback_post:
+                actual_post = unit._post_impl(*post_args)
+
+        self.assertIsInstance(unit, HybridHCUnit)
+        self.assertIsInstance(head, FallbackHCHead)
+        self.assertIs(actual_pre, pre_result)
+        fallback_pre.assert_called_once_with(
+            unit, pre_input, dbg_tag="explicit-fallback"
+        )
+        tilelang_pre.assert_not_called()
+        self.assertIs(actual_post, post_result)
+        tilelang_post.assert_called_once_with(*post_args)
+        fallback_post.assert_not_called()
+
     def test_hybrid_graph_capture_routes_only_tilelang_single_to_tilelang(self) -> None:
         hc, dim = 4, 16
         fn, base, scale = _weights(hc, dim)
