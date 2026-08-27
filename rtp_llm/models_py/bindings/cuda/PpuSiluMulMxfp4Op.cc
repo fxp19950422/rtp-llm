@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "rtp_llm/models_py/bindings/cuda/PpuSiluMulMxfp4Op.h"
 #ifdef USE_PPU
-#include "rtp_llm/models_py/bindings/Torch_ext.h"
+#include "rtp_llm/models_py/bindings/common/Torch_ext.h"
 #include "rtp_llm/models_py/bindings/cuda/kernels/ppu_silu_mul_mxfp4.h"
 #include <limits>
 namespace rtp_llm {
