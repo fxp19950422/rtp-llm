@@ -706,6 +706,74 @@ TEST_F(MtpExecutorTest, testSingleBatchPrefill) {
     checkOutput(stream1, {0, 1, 2, 3, 1}, {1, 2}, {0.0, 0.0, 1.0, 0.0}, {0.17, 0.18});
 }
 
+TEST_F(MtpExecutorTest, testForceDisableSpRunUsesTargetOnlyNormalPath) {
+    MtpExecutorTestConfig test_config;
+    test_config.gen_num_per_cycle = 4;
+    auto components               = createMtpExecutorComponents(test_config);
+
+    auto stream = createContextStream(
+        components.model_config, components.runtime_config, components.resource_context, {0, 1, 2, 3});
+    stream->generateConfig()->force_disable_sp_run = true;
+
+    GptModelInputs target_input;
+    target_input.combo_tokens      = torch::tensor({0, 1, 2, 3}, torch::kInt32);
+    target_input.input_lengths     = torch::tensor({4}, torch::kInt32);
+    target_input.prefix_lengths    = torch::tensor({0}, torch::kInt32);
+    target_input.lm_output_indexes = torch::tensor({3}, torch::kInt32);
+    GptModelOutputs target_output;
+    target_output.logits = torch::tensor({0.1f, 0.2f, 0.3f, 0.4f}).reshape({1, 4});
+    components.fake_target_model->setInputs({target_input});
+    components.fake_target_model->setOutputs({target_output});
+
+    SamplerInputs sampler_input{target_output.logits};
+    SamplerOutput sampler_output{torch::tensor({2}, torch::kInt32).reshape({1, 1})};
+    components.fake_sampler->setInputs({sampler_input});
+    components.fake_sampler->setOutputs({sampler_output});
+
+    auto* target_model = components.fake_target_model.get();
+    auto* draft_model  = components.fake_draft_model.get();
+    setupFakeModels(components.executor.get(),
+                    std::move(components.fake_target_model),
+                    std::move(components.fake_draft_model),
+                    std::move(components.fake_fast_topk_sampler),
+                    std::move(components.fake_speculative_sampler),
+                    std::move(components.fake_sampler));
+
+    auto status = components.executor->process({stream});
+    ASSERT_TRUE(status.ok()) << status;
+    EXPECT_EQ(target_model->forwardCount(), 1u);
+    EXPECT_EQ(draft_model->forwardCount(), 0u);
+    EXPECT_EQ(stream->getSPOutputBuffer(), nullptr);
+    EXPECT_EQ(stream->getCompleteTokenIds()->completeTokenIdsVec(0), (std::vector<int>{0, 1, 2, 3, 2}));
+}
+
+TEST_F(MtpExecutorTest, testForceDisableSpRunMixedBatchFailsClosed) {
+    MtpExecutorTestConfig test_config;
+    auto components = createMtpExecutorComponents(test_config);
+    auto disabled = createContextStream(
+        components.model_config, components.runtime_config, components.resource_context, {0, 1});
+    auto speculative = createContextStream(
+        components.model_config, components.runtime_config, components.resource_context, {2, 3});
+    disabled->generateConfig()->force_disable_sp_run = true;
+
+    auto* target_model = components.fake_target_model.get();
+    auto* draft_model  = components.fake_draft_model.get();
+    setupFakeModels(components.executor.get(),
+                    std::move(components.fake_target_model),
+                    std::move(components.fake_draft_model),
+                    std::move(components.fake_fast_topk_sampler),
+                    std::move(components.fake_speculative_sampler),
+                    std::move(components.fake_sampler));
+
+    auto status = components.executor->process({disabled, speculative});
+    EXPECT_FALSE(status.ok());
+    EXPECT_EQ(status.code(), absl::StatusCode::kInvalidArgument);
+    EXPECT_EQ(target_model->forwardCount(), 0u);
+    EXPECT_EQ(draft_model->forwardCount(), 0u);
+    EXPECT_EQ(disabled->getSPOutputBuffer(), nullptr);
+    EXPECT_EQ(speculative->getSPOutputBuffer(), nullptr);
+}
+
 TEST_F(MtpExecutorTest, testDSparkPrefillCommitDoesNotUseTargetVerifyContract) {
     MtpExecutorTestConfig test_config;
     test_config.gen_num_per_cycle    = 3;

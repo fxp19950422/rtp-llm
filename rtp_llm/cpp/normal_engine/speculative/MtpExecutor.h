@@ -125,6 +125,14 @@ protected:
 
     absl::Status decodeStep(const std::list<GenerateStreamPtr>& streams, MtpMetricsCollector& metrics_collector);
 
+    // Execute request-level force_disable_sp_run streams with the target model
+    // only.  This is deliberately a synchronous NormalExecutor-equivalent
+    // path: it must not create speculative state, run draft/verify forwards,
+    // or call speculative stream update/dispatch code.
+    absl::Status normalStep(const std::list<GenerateStreamPtr>& streams,
+                            MtpMetricsCollector&                metrics_collector,
+                            int64_t                             schedule_time_us);
+
     // decodeStep helpers — extracted to keep decodeStep readable. Each helper
     // owns a single phase (sync, prepare, forward, broadcast, dispatch) and
     // preserves the original PROFILE_SCOPE labels.
@@ -217,9 +225,10 @@ protected:
 private:
     GptModelOutputs forwardModel(ModelBase* model, const GptModelInputs& inputs, ModelInputsModelRole role);
 
-    std::unique_ptr<ModelBase>               model_;
-    std::unique_ptr<Sampler>                 sampler_;
-    std::unique_ptr<MtpBatchStreamProcessor> batch_stream_processor_;
+    std::unique_ptr<ModelBase>                  model_;
+    std::unique_ptr<Sampler>                    sampler_;
+    std::unique_ptr<MtpBatchStreamProcessor>    batch_stream_processor_;
+    std::unique_ptr<NormalBatchStreamProcessor> normal_batch_stream_processor_;
     std::shared_ptr<KVCacheManager>          cache_manager_;
     std::shared_ptr<ModelInputsLogger>       model_inputs_logger_;
     bool                                     enable_ffn_disaggregate_ = false;

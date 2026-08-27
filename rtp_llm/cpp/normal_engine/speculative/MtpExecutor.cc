@@ -673,6 +673,11 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
                                                               cache_config,
                                                               params.sp_config,
                                                               warm_up_));
+    normal_batch_stream_processor_.reset(new NormalBatchStreamProcessor(params.model_config_,
+                                                                         params.pd_sep_config,
+                                                                         params.profiling_debug_logging_config,
+                                                                         cache_config,
+                                                                         warm_up_));
 
     LogitsProcessorFactory::init(params.model_config_, params.grammar_config, params.sp_config.tree_decode_config);
     cudaProfilerBegin();
@@ -1997,6 +2002,112 @@ void MtpExecutor::prepareStreams(const std::list<GenerateStreamPtr>& streams,
     }
 }
 
+absl::Status MtpExecutor::normalStep(const std::list<GenerateStreamPtr>& streams,
+                                     MtpMetricsCollector&                metrics_collector,
+                                     int64_t                             schedule_time_us) {
+    RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.normal_step(stream_size=%zu)", streams.size());
+
+    auto& executor_collector = metrics_collector.executor_collector;
+    auto& tps_collector      = metrics_collector.tps_collector;
+    StreamGroups stream_groups(streams);
+    GptModelInputs model_input;
+
+    {
+        RTP_LLM_PROFILE_SCOPE("executor.mtp.normal_step(gather_model_input)");
+        const int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+        auto model_input_status = normal_batch_stream_processor_->gatherModelInput(stream_groups, buffer_holder_);
+        RETURN_IF_STATUS_OR_ERROR(model_input_status);
+        model_input = std::move(model_input_status.value());
+        executor_collector.gather_model_input_us +=
+            autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
+    }
+
+    {
+        RTP_LLM_PROFILE_SCOPE("executor.mtp.normal_step(tp_sync_input)");
+        const int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+        model_input.skip_run = streams.empty() && !enable_ffn_disaggregate_;
+        ensureModelInputsOnCuda(model_input, "normal_step.before_tp_sync");
+        tpSyncModelInputs(model_input, parallelism_config_);
+        if (model_input.skip_run) {
+            return absl::OkStatus();
+        }
+        ensureModelInputsOnCuda(model_input, "normal_step.after_tp_sync");
+        executor_collector.tp_sync_input_us +=
+            autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
+    }
+
+    metrics_collector.not_skip = true;
+    releaseAllModelBuffers();
+
+    if (model_input.kv_cache_update_mapping.defined()) {
+        RTP_LLM_PROFILE_SCOPE("executor.mtp.normal_step(kv_cache_update)");
+        cache_manager_->blockBatchCopy(model_input.kv_cache_update_mapping);
+    }
+
+    GptModelOutputs model_output;
+    {
+        RTP_LLM_PROFILE_SCOPE("executor.mtp.normal_step(target_model_forward)");
+        const int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+        model_output = forwardModel(model_.get(), model_input, ModelInputsModelRole::NORMAL);
+        executor_collector.model_forward_us +=
+            autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
+    }
+
+    if (expert_balancer_) {
+        const int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+        expert_balancer_->stepForward(*model_, executor_collector);
+        executor_collector.eplb_step_latency_us =
+            autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
+    }
+
+    if (!isTpRank0() || warm_up_ || streams.empty()) {
+        cudaSyncAndCheck();
+        releaseAllModelBuffers();
+        return absl::OkStatus();
+    }
+
+    SamplerOutput sampler_output;
+    {
+        RTP_LLM_PROFILE_SCOPE("executor.mtp.normal_step(sampler_forward)");
+        const int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+        CHECK_AND_RETURN_REF(sampler_input,
+                             normal_batch_stream_processor_->gatherSamplerInput(
+                                 stream_groups, model_input, model_output));
+        holdSamplerInputHostBuffers(buffer_holder_, sampler_input);
+        sampler_output = sampler_->forward(sampler_input);
+        executor_collector.sample_input_us +=
+            autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
+    }
+
+    const auto token_counts_by_priority = stream_groups.tokenCountsByPriority();
+    {
+        RTP_LLM_PROFILE_SCOPE("executor.mtp.normal_step(dispatch_output)");
+        const int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+        MergedOutput merge_output{std::move(model_output), std::move(sampler_output)};
+        auto status = normal_batch_stream_processor_->dispatch(stream_groups, merge_output);
+        executor_collector.dispatch_output_us +=
+            autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
+        RETURN_IF_STATUS_ERROR(status);
+    }
+
+    if (metrics_reporter_) {
+        executor_collector.context_batch_size  = stream_groups.totalContextBatchSize();
+        executor_collector.generate_batch_size = stream_groups.totalDecodeBatchSize();
+        executor_collector.execute_token_size  = stream_groups.modelExecuteTokenSize();
+        executor_collector.max_seq_len         = stream_groups.maxSeqLen();
+        const int64_t execute_time_us =
+            std::max<int64_t>(1, autil::TimeUtility::currentTimeInMicroSeconds() - schedule_time_us);
+        tps_collector.addTokenSize(stream_groups.contextExecuteTokenSize(),
+                                   stream_groups.contextExecuteTokenSizeWithCache(),
+                                   stream_groups.totalDecodeBatchSize(),
+                                   stream_groups.modelExecuteTokenSize(),
+                                   execute_time_us);
+        tps_collector.addTokenSizeByPriority(token_counts_by_priority, execute_time_us);
+    }
+    releaseAllModelBuffers();
+    return absl::OkStatus();
+}
+
 void MtpExecutor::synchronizeBeforeSchedule() {
     if (useStreamAsync() && !useDropBroadSync()) {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.sync_before_schedule");
@@ -2016,6 +2127,37 @@ absl::Status MtpExecutor::process(const std::list<GenerateStreamPtr>& streams, i
         tps_reporter_.makeActiveGuard(metrics_reporter_ && isTpRank0() && !warm_up_ && !streams.empty());
     auto wall_tps_active_guard =
         wall_tps_reporter_.makeActiveGuard(metrics_reporter_ && isTpRank0() && !warm_up_ && !streams.empty());
+
+    size_t force_disabled_count = 0;
+    for (const auto& stream : streams) {
+        force_disabled_count += stream->forceDisableSpRun() ? 1 : 0;
+    }
+    if (force_disabled_count != 0 && force_disabled_count != streams.size()) {
+        const std::string message =
+            "force_disable_sp_run cannot share one MTP executor batch with speculative requests";
+        for (const auto& stream : streams) {
+            stream->reportError(ErrorCode::INVALID_PARAMS, message);
+        }
+        RTP_LLM_LOG_ERROR("[MTP force-disable] reject mixed batch: disabled=%zu total=%zu",
+                          force_disabled_count,
+                          streams.size());
+        return absl::InvalidArgumentError(message);
+    }
+
+    if (force_disabled_count == streams.size() && !streams.empty()) {
+        RTP_LLM_LOG_DEBUG("[MTP force-disable] target-only normal path: stream_count=%zu", streams.size());
+        MtpMetricsCollector normal_metrics_collector;
+        auto status = normalStep(streams, normal_metrics_collector, schedule_time_us);
+        if (isTpRank0() && metrics_reporter_ && normal_metrics_collector.not_skip) {
+            metrics_reporter_->report<RtpLLMExecutorMetrics, RtpLLMExecutorMetricsCollector>(
+                nullptr, &normal_metrics_collector.executor_collector);
+            tps_reporter_.report(&normal_metrics_collector.tps_collector);
+            wall_tps_reporter_.report(&normal_metrics_collector.tps_collector);
+            // No speculative collector is reported here: draft rounds and
+            // accepted speculative tokens are exactly zero by construction.
+        }
+        return status;
+    }
 
     std::list<GenerateStreamPtr> prefill_streams;
     std::list<GenerateStreamPtr> decode_streams;
