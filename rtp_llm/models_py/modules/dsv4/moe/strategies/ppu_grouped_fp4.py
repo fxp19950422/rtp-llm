@@ -1,19 +1,17 @@
 """M890P grouped-MXFP4 routed experts for the DSV4 TP4/EP1 topology.
 
 This strategy is deliberately separate from the CUDA ``grouped_fp4`` backend.
-It consumes the checkpoint's packed MXFP4 tensors, executes two PPU masked
+It consumes the checkpoint's packed MXFP4 tensors, executes two PPU nopad
 grouped GEMMs, and returns the normalized routed partial expected by ``MoE``'s
 post-W2 route-scale/TP-reduce contract.
 
 There is no fallback in this module.  A wrong topology, storage geometry,
-device, external symbol, or fixed graph capacity fails closed.
+device, or external symbol fails closed.
 """
 
 from __future__ import annotations
 
-import math
-import os
-from typing import Dict, Sequence, Tuple
+from typing import Dict, Tuple
 
 import torch
 
@@ -21,8 +19,6 @@ from .base import MoeCfg, RoutedExpertsStrategy, register_strategy
 
 
 _ROUTE_WEIGHT_CONTRACT = "post_w2_normalized_then_scale_v1"
-_CAPACITY_ENV = "DSV4_PPU_GROUPED_FP4_CAPACITY"
-_GROUPED_M_ALIGNMENT = 128
 
 
 def _supports_topology(cfg: MoeCfg) -> bool:
@@ -44,7 +40,7 @@ def _runtime_eligible() -> bool:
     except (ImportError, RuntimeError):
         return False
     return callable(
-        getattr(deep_gemm, "m_grouped_gemm_fp4_fp4_bf16_nt_masked", None)
+        getattr(deep_gemm, "m_grouped_gemm_fp4_fp4_bf16_nt_nopad", None)
     )
 
 
@@ -76,7 +72,7 @@ def _derive_inter_local_and_tp(
     if dim <= 0 or dim % 512:
         raise ValueError(
             "PPU grouped MXFP4 requires positive dim aligned to 512 for "
-            f"ep_scatter_v2 hidden scales and ep_gather, got dim={dim}"
+            f"MXFP4 scale blocks and ep_gather, got dim={dim}"
         )
     if inter_local <= 0 or inter_local % 64:
         raise ValueError(
@@ -121,45 +117,6 @@ def _derive_inter_local_and_tp(
     return inter_local, routed_tp_size
 
 
-def _select_capacity(
-    configured_capacity: int,
-    observed_counts: Sequence[int],
-    n_experts: int,
-    *,
-    fixed_shape: bool,
-    fixed_required: int = 0,
-) -> int:
-    """Select an aligned capacity without ever truncating an expert count."""
-
-    configured_capacity = int(configured_capacity)
-    n_experts = int(n_experts)
-    if configured_capacity <= 0 or n_experts <= 0:
-        raise ValueError("grouped MXFP4 capacity and expert count must be positive")
-    alignment = _GROUPED_M_ALIGNMENT // math.gcd(_GROUPED_M_ALIGNMENT, n_experts)
-
-    if fixed_shape:
-        if configured_capacity % alignment:
-            raise ValueError(
-                "fixed grouped MXFP4 capacity must make E*capacity divisible by 128"
-            )
-        if fixed_required <= 0:
-            raise RuntimeError("fixed grouped MXFP4 capacity requires a proven upper bound")
-        if configured_capacity < int(fixed_required):
-            raise RuntimeError(
-                "fixed grouped MXFP4 capacity cannot cover the proven expert-count "
-                f"upper bound: capacity={configured_capacity}, required={fixed_required}"
-            )
-        return configured_capacity
-
-    if not observed_counts:
-        raise ValueError("eager grouped MXFP4 requires observed per-expert counts")
-    required = max(int(count) for count in observed_counts)
-    if required < 0:
-        raise ValueError("grouped MXFP4 expert counts must be non-negative")
-    selected = max(configured_capacity, required)
-    return ((selected + alignment - 1) // alignment) * alignment
-
-
 @register_strategy
 class PpuGroupedFP4Strategy(RoutedExpertsStrategy):
     """Strict M890P packed-MXFP4 strategy for DSV4 TP4/EP1."""
@@ -170,9 +127,6 @@ class PpuGroupedFP4Strategy(RoutedExpertsStrategy):
 
     def __init__(self, cfg: MoeCfg):
         super().__init__(cfg)
-        self._configured_capacity = int(os.environ.get(_CAPACITY_ENV, "128"))
-        if self._configured_capacity <= 0:
-            raise ValueError(f"{_CAPACITY_ENV} must be positive")
         self.inter_local = 0
 
     @classmethod
@@ -256,7 +210,7 @@ class PpuGroupedFP4Strategy(RoutedExpertsStrategy):
         weights: torch.Tensor,
         indices: torch.Tensor,
     ) -> torch.Tensor:
-        """Route EP1 tokens, run two masked PPU grouped GEMMs, and gather."""
+        """Route EP1 tokens, run two compact nopad PPU grouped GEMMs, and gather."""
 
         if self.inter_local <= 0:
             raise RuntimeError("ppu_grouped_fp4 weights were not bound")
@@ -289,130 +243,71 @@ class PpuGroupedFP4Strategy(RoutedExpertsStrategy):
         import deep_gemm
 
         grouped_gemm = getattr(
-            deep_gemm, "m_grouped_gemm_fp4_fp4_bf16_nt_masked", None
+            deep_gemm, "m_grouped_gemm_fp4_fp4_bf16_nt_nopad", None
         )
         if not callable(grouped_gemm):
             raise RuntimeError(
-                "PPU deep_gemm lacks m_grouped_gemm_fp4_fp4_bf16_nt_masked"
+                "PPU deep_gemm lacks m_grouped_gemm_fp4_fp4_bf16_nt_nopad"
             )
+        from internal_source.rtp_llm.models_py.kernels.ppu_moe_nopad import (
+            compact_mxfp4_routes_nopad,
+        )
         from internal_source.rtp_llm.models_py.kernels.ppu_mxfp4 import (
             downcast_to_mxfp4,
         )
         from rtp_llm.models_py.modules.dsv4.moe.expert import require_silu_mul_split
         from rtp_llm.models_py.triton_kernels.moe.ep_kernels import (
             ep_gather,
-            ep_scatter_v2,
-            recompute_topk_ids_sum_expert_count,
         )
 
         experts = int(self.cfg.n_local_experts)
-        adjusted_ids, expert_counts = recompute_topk_ids_sum_expert_count(
-            indices.contiguous(),
-            current_expert_start_id=0,
-            num_local_experts=experts,
-        )
-        capturing = torch.cuda.is_current_stream_capturing()
-        if capturing:
-            capacity = _select_capacity(
-                self._configured_capacity,
-                (),
+        adjusted_ids = indices.contiguous()
+        x_fp4, x_scale = downcast_to_mxfp4(x.contiguous())
+        compact_fp4, compact_scale, expert_ids, output_index, expert_counts = (
+            compact_mxfp4_routes_nopad(
+                x_fp4,
+                x_scale,
+                adjusted_ids,
                 experts,
-                fixed_shape=True,
-                fixed_required=token_count * indices.size(1),
             )
-        else:
-            observed_counts = expert_counts.cpu().tolist()
-            capacity = _select_capacity(
-                self._configured_capacity,
-                observed_counts,
-                experts,
-                fixed_shape=False,
-            )
-        expert_counts = expert_counts.to(torch.int32).contiguous()
-
-        total = experts * capacity
-        expert_start = torch.empty(experts, dtype=torch.int32, device=x.device)
-        output_index = torch.full_like(adjusted_ids, -1, dtype=torch.int64)
-        scatter_x = torch.zeros((total, dim), dtype=x.dtype, device=x.device)
-        dummy_in_scale = torch.zeros(
-            (token_count, dim // 128), dtype=torch.float32, device=x.device
-        )
-        dummy_out_scale = torch.zeros(
-            (experts, capacity, dim // 128), dtype=torch.float32, device=x.device
-        )
-        ep_scatter_v2(
-            x.contiguous(),
-            dummy_in_scale,
-            adjusted_ids,
-            capacity,
-            expert_start,
-            scatter_x,
-            dummy_out_scale,
-            output_index,
-            scale_ue8m0=False,
         )
 
-        scatter_fp4, scatter_scale = downcast_to_mxfp4(scatter_x.contiguous())
-        scatter_fp4 = scatter_fp4.view(experts, capacity, -1)
-        scatter_scale = scatter_scale.as_strided(
-            (experts, capacity, scatter_scale.size(1)),
-            (capacity, 1, total),
-        )
-        scatter_scale = (
-            scatter_scale.permute(0, 2, 1).contiguous().permute(0, 2, 1)
-        )
+        total = token_count * indices.size(1)
         gate_up = torch.empty(
-            (experts, capacity, 2 * self.inter_local),
+            (total, 2 * self.inter_local),
             dtype=torch.bfloat16,
             device=x.device,
         )
-        expected_m = max(
-            1,
-            (
-                int(self.cfg.max_tokens_per_rank)
-                * int(self.cfg.n_activated_experts)
-                + int(self.cfg.n_routed_experts)
-                - 1
-            )
-            // int(self.cfg.n_routed_experts),
-        )
         grouped_gemm(
-            (scatter_fp4, scatter_scale),
+            (compact_fp4, compact_scale),
             (self._ppu_w13, self._ppu_s13),
             None,
             gate_up,
+            expert_ids,
             expert_counts,
-            expected_m,
         )
 
-        gate_up_flat = gate_up.view(total, 2 * self.inter_local)
         hidden = require_silu_mul_split()(
-            gate_up_flat[:, : self.inter_local].float().contiguous(),
-            gate_up_flat[:, self.inter_local :].float().contiguous(),
+            gate_up[:, : self.inter_local].float().contiguous(),
+            gate_up[:, self.inter_local :].float().contiguous(),
             clamp_limit=self.cfg.swiglu_limit,
         ).to(torch.bfloat16).contiguous()
         hidden_fp4, hidden_scale = downcast_to_mxfp4(hidden)
-        hidden_fp4 = hidden_fp4.view(experts, capacity, -1)
-        hidden_scale = hidden_scale.as_strided(
-            (experts, capacity, hidden_scale.size(1)),
-            (capacity, 1, total),
-        )
-        hidden_scale = hidden_scale.permute(0, 2, 1).contiguous().permute(0, 2, 1)
-        down = torch.empty(
-            (experts, capacity, dim), dtype=torch.bfloat16, device=x.device
-        )
+        down = torch.empty((total, dim), dtype=torch.bfloat16, device=x.device)
         grouped_gemm(
             (hidden_fp4, hidden_scale),
             (self._ppu_w2, self._ppu_s2),
             None,
             down,
+            expert_ids,
             expert_counts,
-            expected_m,
         )
 
-        gathered = torch.empty((token_count, dim), dtype=torch.float32, device=x.device)
+        gathered = torch.empty(
+            (token_count, dim), dtype=torch.float32, device=x.device
+        )
         ep_gather(
-            down.view(total, dim),
+            down,
             adjusted_ids,
             weights.contiguous(),
             output_index,
