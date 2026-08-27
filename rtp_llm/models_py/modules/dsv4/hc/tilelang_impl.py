@@ -139,6 +139,19 @@ class HybridHCUnit(TileLangHCUnit):
         # determinism/parity gate. Keep every other/default backend on the
         # validated FP32 reference path during capture.
         pre_backend = os.environ.get("DSV4_MHC_PRE_GEMM_BACKEND", "").strip().lower()
+        allowed_pre_backends = {
+            "",
+            "fallback",
+            "tilelang",
+            "tilelang_single",
+            "deepgemm",
+        }
+        if pre_backend not in allowed_pre_backends:
+            allowed = ", ".join(repr(value) for value in sorted(allowed_pre_backends))
+            raise ValueError(
+                "invalid DSV4_MHC_PRE_GEMM_BACKEND="
+                f"{pre_backend!r}; expected one of: {allowed}"
+            )
         if pre_backend == "fallback":
             from rtp_llm.models_py.modules.dsv4.hc.fallback_impl import (
                 FallbackHCUnit,
@@ -172,6 +185,13 @@ class HybridHCUnit(TileLangHCUnit):
         # M890P (DSV4_MHC_POST_PDL=0); all other values preserve the validated
         # FP32 reference implementation.
         post_backend = os.environ.get("DSV4_MHC_POST_BACKEND", "").strip().lower()
+        allowed_post_backends = {"", "fallback", "tilelang", "tilelang_single"}
+        if post_backend not in allowed_post_backends:
+            allowed = ", ".join(repr(value) for value in sorted(allowed_post_backends))
+            raise ValueError(
+                f"invalid DSV4_MHC_POST_BACKEND={post_backend!r}; "
+                f"expected one of: {allowed}"
+            )
         if post_backend == "tilelang":
             return super()._post_impl(x, residual, post, comb)
 

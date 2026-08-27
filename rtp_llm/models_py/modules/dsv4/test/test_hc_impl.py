@@ -492,6 +492,51 @@ class TestHCImpl(unittest.TestCase):
         tilelang_pre.assert_called_once_with(cuda_x, dbg_tag="eager")
         fallback_pre.assert_not_called()
 
+    def test_hybrid_unknown_backends_fail_closed_before_leaf_selection(self) -> None:
+        hc, dim = 4, 16
+        fn, base, scale = _weights(hc, dim)
+        unit = HybridHCUnit(
+            fn,
+            base,
+            scale,
+            dim=dim,
+            hc_mult=hc,
+            hc_sinkhorn_iters=3,
+            norm_eps=1e-6,
+            hc_eps=1e-6,
+        )
+        cuda_x = mock.Mock(is_cuda=True)
+
+        for capturing in (False, True):
+            with self.subTest(path="pre", capturing=capturing), _env(
+                "DSV4_MHC_PRE_GEMM_BACKEND", " typo "
+            ), mock.patch(
+                "torch.cuda.is_current_stream_capturing", return_value=capturing
+            ), mock.patch.object(
+                TileLangHCUnit, "_pre_impl"
+            ) as tilelang_pre, mock.patch.object(
+                FallbackHCUnit, "_pre_impl"
+            ) as fallback_pre, self.assertRaisesRegex(
+                ValueError, "DSV4_MHC_PRE_GEMM_BACKEND"
+            ):
+                unit._pre_impl(cuda_x, dbg_tag="invalid")
+            tilelang_pre.assert_not_called()
+            fallback_pre.assert_not_called()
+
+        post_args = tuple(object() for _ in range(4))
+        with _env(
+            "DSV4_MHC_POST_BACKEND", " typo "
+        ), mock.patch.object(
+            TileLangHCUnit, "_post_impl"
+        ) as tilelang_post, mock.patch.object(
+            FallbackHCUnit, "_post_impl"
+        ) as fallback_post, self.assertRaisesRegex(
+            ValueError, "DSV4_MHC_POST_BACKEND"
+        ):
+            unit._post_impl(*post_args)
+        tilelang_post.assert_not_called()
+        fallback_post.assert_not_called()
+
     def test_hybrid_post_routes_only_explicit_tilelang_backend(self) -> None:
         hc, dim = 4, 16
         fn, base, scale = _weights(hc, dim)
