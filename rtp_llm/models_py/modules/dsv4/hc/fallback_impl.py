@@ -17,7 +17,8 @@ def _tp_linear_mixes(
     """Compute global mHC mixes from one hidden-dimension TP shard."""
 
     weight = module.fn if use_fp32 else module._fn_bf16()
-    linear_input = x_flat.float() if use_fp32 else x_flat
+    rms_input = x_flat.float()
+    linear_input = rms_input if use_fp32 else x_flat
     local_k = int(x_flat.shape[-1])
     global_k = int(weight.shape[-1])
     tp_size = int(getattr(module, "tp_size", 1))
@@ -26,7 +27,7 @@ def _tp_linear_mixes(
         # Standard tensor parallelism keeps the residual hidden dimension
         # replicated after the embedding gather and output all-reduce.
         rsqrt = torch.rsqrt(
-            x_flat.float().square().mean(-1, keepdim=True) + module.norm_eps
+            rms_input.square().mean(-1, keepdim=True) + module.norm_eps
         )
         if not use_fp32:
             rsqrt = rsqrt.to(x_flat.dtype)
@@ -55,7 +56,7 @@ def _tp_linear_mixes(
         [:, :, start : start + local_dim]
         .reshape(weight.shape[0], local_k)
     )
-    local_square_sum = x_flat.float().square().sum(-1, keepdim=True)
+    local_square_sum = rms_input.square().sum(-1, keepdim=True)
     local_mixes = F.linear(linear_input, weight_shard).float()
     combined = torch.cat((local_square_sum, local_mixes), dim=-1)
     from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce

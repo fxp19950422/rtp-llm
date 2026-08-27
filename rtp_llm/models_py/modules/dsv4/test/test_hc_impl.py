@@ -1,4 +1,7 @@
+import ast
+import inspect
 import os
+import textwrap
 import unittest
 from contextlib import contextmanager
 from unittest import mock
@@ -10,6 +13,7 @@ from rtp_llm.models_py.modules.dsv4.hc.fallback_impl import (
     FallbackHCHead,
     FallbackHCUnit,
     _hc_split_sinkhorn,
+    _tp_linear_mixes,
 )
 from rtp_llm.models_py.modules.dsv4.hc.tilelang_impl import (
     HybridHCUnit,
@@ -44,6 +48,21 @@ def _weights(hc: int, dim: int, device: str = "cpu"):
 
 
 class TestHCImpl(unittest.TestCase):
+    def test_tp_linear_mixes_materializes_x_flat_fp32_once(self) -> None:
+        source = textwrap.dedent(inspect.getsource(_tp_linear_mixes))
+        tree = ast.parse(source)
+        x_flat_float_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "float"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "x_flat"
+        ]
+
+        self.assertEqual(len(x_flat_float_calls), 1)
+
     def test_fallback_unit_linear_mixes_matches_fp32_reference(self) -> None:
         hc, dim = 4, 8
         fn, base, scale = _weights(hc, dim)
