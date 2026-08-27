@@ -8,6 +8,7 @@
 #include "rtp_llm/cpp/cache/KVCacheManager.h"
 #include "rtp_llm/cpp/engine_base/Executor.h"
 #include "rtp_llm/cpp/normal_engine/NormalBatchStreamProcessor.h"
+#include "rtp_llm/cpp/normal_engine/NormalExecutor.h"
 #include "rtp_llm/models_py/bindings/core/Types.h"
 #include "rtp_llm/models_py/bindings/core/DeviceData.h"
 #include "rtp_llm/cpp/metrics/RtpLLMMetrics.h"
@@ -241,6 +242,7 @@ private:
     std::unique_ptr<Sampler>                    sampler_;
     std::unique_ptr<MtpBatchStreamProcessor>    batch_stream_processor_;
     std::unique_ptr<NormalBatchStreamProcessor> normal_batch_stream_processor_;
+    NormalNumericalStatusGate                    normal_numerical_status_gate_;
     std::shared_ptr<KVCacheManager>          cache_manager_;
     std::shared_ptr<ModelInputsLogger>       model_inputs_logger_;
     bool                                     enable_ffn_disaggregate_ = false;
