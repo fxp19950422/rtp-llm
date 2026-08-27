@@ -583,6 +583,19 @@ class CompressorFP8(PoolBackedModule):
         _rt.record_if_level(2, f"{label.replace('.', '_')}_{suffix}", tensor)
 
     def _debug_record_pool_rows(self, meta: CompressorMeta) -> None:
+        label = self._profile_label or ""
+        if len(label) < 4 or label[0] != "L" or label[3] != ".":
+            return
+        try:
+            layer_id = int(label[1:3])
+        except ValueError:
+            return
+        # This helper is called from every production prefill compressor.  The
+        # recorder is disabled by default, so reject the call before reading
+        # kv_slots: boolean indexing lowers to nonzero/index and synchronizes
+        # the device even when _debug_record() later discards the tensors.
+        if not _rt.should_record_layer(layer_id):
+            return
         if meta.kv_slots is None or self._kv_pool_view is None:
             return
         self._debug_record("kv_slots", meta.kv_slots)
