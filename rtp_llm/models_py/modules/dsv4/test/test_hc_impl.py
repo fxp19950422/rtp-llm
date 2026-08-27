@@ -4,6 +4,7 @@ import os
 import textwrap
 import unittest
 from contextlib import contextmanager
+from pathlib import Path
 from unittest import mock
 
 import torch
@@ -763,6 +764,19 @@ class TestHCImpl(unittest.TestCase):
         torch.testing.assert_close(tk_out, ref_out, atol=2e-2, rtol=2e-2)
 
     def test_tilelang_post_reuses_residual_buffer_in_place(self) -> None:
+        source = (
+            Path(__file__).resolve().parents[3]
+            / "3rdparty/tile_kernels/mhc/post_kernel.py"
+        ).read_text()
+        loop_start = source.index("for i_mhco, i1_h in T.Parallel(mhc, h_blk):")
+        loop_end = source.index("T.copy(x_local, x_shared)", loop_start)
+        forward_loop = source[loop_start:loop_end]
+        zero = forward_loop.index("x_local[i_mhco, i1_h] = 0.0")
+        comb = forward_loop.index("for i_mhci in T.serial(mhc):")
+        post = forward_loop.index("c_local[i_mhco] * d_local[i1_h]")
+        self.assertLess(zero, comb)
+        self.assertLess(comb, post)
+
         # Pins the memory-saving wiring (no CUDA needed): _post_impl must pass
         # out=residual so the kernel writes in place instead of allocating a
         # fresh empty_like(residual). A future refactor that drops the alias

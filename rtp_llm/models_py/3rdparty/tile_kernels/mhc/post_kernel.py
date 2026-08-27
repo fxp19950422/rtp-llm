@@ -55,11 +55,14 @@ def _mhc_post_fwd(
                 T.copy(b_shared, b_local)
                 T.copy(d_shared, d_local)
                 for i_mhco, i1_h in T.Parallel(mhc, h_blk):
-                    x_local[i_mhco, i1_h] = c_local[i_mhco] * d_local[i1_h]
+                    x_local[i_mhco, i1_h] = 0.0
                     for i_mhci in T.serial(mhc):
                         x_local[i_mhco, i1_h] += (
                             a_local[i_mhci, i_mhco] * b_local[i_mhci, i1_h]
                         )
+                    x_local[i_mhco, i1_h] += (
+                        c_local[i_mhco] * d_local[i1_h]
+                    )
                 T.copy(x_local, x_shared)
 
                 T.copy(x_shared, x[pid_n, 0, i0_h * h_blk], disable_tma=True)
