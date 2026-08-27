@@ -2,6 +2,15 @@ load("//:def.bzl", "copts")
 load("@arch_config//:arch_select.bzl", "torch_deps")
 
 cc_test(
+    name = "cuda_graph_metadata_utils_test",
+    srcs = ["cuda_graph_metadata_utils_test.cc"],
+    deps = [
+        "//rtp_llm/cpp/cuda_graph:cuda_graph_metadata_utils",
+        "@com_google_googletest//:gtest_main",
+    ],
+)
+
+cc_test(
     name = "combo_position_ids_validation_test",
     srcs = ["combo_position_ids_validation_test.cc"],
     copts = copts(),

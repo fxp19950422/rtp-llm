@@ -181,7 +181,10 @@ class DeepSeekV4MtpModel(DeepSeekV4Model):
             end = min(start + chunk_tokens, T)
             input_ids_chunk = input_ids[start:end]
             positions_chunk = positions[start:end]
-            embed_chunk = self.v4.embed(input_ids_chunk)
+            # The checkpoint embedding is hidden-sharded under TP.  MTP's
+            # fusion norms/projections consume the global hidden dimension,
+            # so use the transformer's TP-aware embedding accessor.
+            embed_chunk = self.v4._embed(input_ids_chunk)
             embed_chunk = torch.where(
                 positions_chunk.reshape(-1, 1) == 0,
                 torch.zeros_like(embed_chunk),
@@ -215,7 +218,7 @@ class DeepSeekV4MtpModel(DeepSeekV4Model):
                 input_ids.reshape(-1), pre_hc, positions[:T], chunk_tokens
             )
 
-        inputs_embeds = self.v4.embed(input_ids)  # [T, dim]
+        inputs_embeds = self.v4._embed(input_ids)  # [T, dim]
         # Suppress position-0 embedding (matches main-model "step 0 of a
         # brand-new request" behavior the official MTP impl relies on).
         inputs_embeds = torch.where(

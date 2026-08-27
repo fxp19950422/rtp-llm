@@ -22,6 +22,20 @@ class NormalEngineTest: public DeviceTestBase {
 public:
 };
 
+TEST_F(NormalEngineTest, testEpDecodePaddingLatchesThroughDrainTail) {
+    bool latched = false;
+
+    EXPECT_FALSE(NormalEngine::shouldPadEpDecodeBatch(0, 8, latched));
+    EXPECT_FALSE(latched);
+    EXPECT_FALSE(NormalEngine::shouldPadEpDecodeBatch(7, 8, latched));
+    EXPECT_FALSE(latched);
+
+    EXPECT_TRUE(NormalEngine::shouldPadEpDecodeBatch(8, 8, latched));
+    EXPECT_TRUE(latched);
+    EXPECT_TRUE(NormalEngine::shouldPadEpDecodeBatch(1, 8, latched));
+    EXPECT_TRUE(NormalEngine::shouldPadEpDecodeBatch(0, 8, latched));
+}
+
 TEST_F(NormalEngineTest, testFp8KVCache) {
     CustomConfig config;
     config.kv_cache_data_type = DataType::TYPE_FP8_E4M3;

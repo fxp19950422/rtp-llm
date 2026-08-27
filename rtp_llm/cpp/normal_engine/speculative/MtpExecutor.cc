@@ -21,7 +21,6 @@
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include <algorithm>
 #include <cstring>
-#include <sstream>
 #if USING_CUDA
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDACachingAllocator.h>
@@ -65,18 +64,6 @@ bool readEnvFlagOnce(const char* env_name, const char* log_tag, const char* labe
     const bool  on  = (env != nullptr && std::string(env) == "1");
     RTP_LLM_LOG_INFO("[%s] %s=%s -> %s=%d", log_tag, env_name, env ? env : "(unset)", label, static_cast<int>(on));
     return on;
-}
-
-bool debugTargetVerifyInputEnabled() {
-    static const bool enabled = []() {
-        const char* env = std::getenv("RTP_LLM_DEBUG_TARGET_VERIFY_INPUT");
-        const bool  on  = env != nullptr && std::string(env) != "0";
-        if (on) {
-            RTP_LLM_LOG_WARNING("[debug-target-verify] enabled; this performs D2H copies and serializes the hot path");
-        }
-        return on;
-    }();
-    return enabled;
 }
 
 void holdSamplerInputHostBuffers(TensorHolder& holder, const SamplerInputs& inputs) {
@@ -1222,6 +1209,15 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
     bool                          spec_logits_processor_present           = false;
 
     waitPreviousBookkeepingAndKvSwaps(streams);
+    // When broad-sync dropping is disabled, the wait above lets the previous
+    // bookkeeping worker commit accepted tokens to the host streams.  Refresh
+    // cached StreamGroups geometry before allocating model/sampler inputs;
+    // otherwise maxSeqLen can lag seqLength by the accepted MTP width and the
+    // verify history buffer is undersized (for example seq_len=24, step=24,
+    // gamma=3).
+    if (useStreamAsync() && !useDropBroadSync()) {
+        stream_groups = StreamGroups(streams);
+    }
     prepareGrpcMtpDeviceState(streams, buffer_holder_);
 
     {
@@ -1414,10 +1410,18 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
         RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(rejection_sampling)");
 
         if (model_input.is_fake_stream) {
+            // Fake warmup must preserve the same dense [B, gamma + 1]
+            // rejection contract as a live batch.  Decode EP padding may make
+            // an all-fake outer batch larger than one (for example B80); using
+            // singleton placeholders then makes updateDecodePostDraftModelInput
+            // reshape 3 values as B80 * 3.
             speculative_sampler_output.accept_len = torch::full(
-                {1}, (int64_t)(propose_step_ + 1), torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+                {(int64_t)batch_size},
+                (int64_t)(propose_step_ + 1),
+                torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
             speculative_sampler_output.accept_tokens = torch::zeros(
-                {1, (int64_t)(propose_step_ + 1)}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+                {(int64_t)batch_size, (int64_t)(propose_step_ + 1)},
+                torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
         } else {
             // gatherSpecSamplerInput reads host stream state updated by the previous
             // bookkeeping worker. DROP_BROAD_SYNC therefore needs this narrow sync
@@ -1723,11 +1727,6 @@ GptModelOutputs MtpExecutor::runTargetVerifyForward(GptModelInputs& model_input,
         // skipping unrelated prepareAttentionInputs work.
         model_->updateKVCacheKernelBlockId(model_input);
 
-        // Optional pre-kernel safety check. It performs D2H and can hide the
-        // async race being diagnosed, so keep it out of the default hot path.
-        if (debugTargetVerifyInputEnabled()) {
-            debugCheckLinearBlockMapAtKernelRead(model_input, stream_groups);
-        }
     }
 
     ensureModelInputsOnCuda(model_input, "decode.target_verify_forward");
@@ -1762,110 +1761,6 @@ MtpExecutor::buildSpecLogitsVerifyInline(const std::list<GenerateStreamPtr>& str
         return {};
     }
     return spec_logits_verify_runner_->run(task);
-}
-
-void MtpExecutor::debugCheckLinearBlockMapAtKernelRead(const GptModelInputs& model_input,
-                                                       const StreamGroups&   stream_groups) const {
-    // Diagnose causal_conv1d_update IMA: it reads block_map[(seq_len - 2) / SBP].
-    // Host-check before forward captures NULL slots without GPU coredumps.
-    static const bool always_print = debugTargetVerifyInputEnabled();
-
-    if (!model_input.kv_cache_kernel_block_id.defined() || !model_input.sequence_lengths.defined()) {
-        return;
-    }
-    if (cache_manager_ == nullptr) {
-        return;
-    }
-    const int sbp = static_cast<int>(cache_manager_->cacheConfig().seq_size_per_block);
-    if (sbp <= 0) {
-        return;
-    }
-
-    auto seq_len_cpu  = model_input.sequence_lengths.to(torch::kCPU);
-    auto block_id_cpu = model_input.kv_cache_kernel_block_id.to(torch::kCPU);
-    if (seq_len_cpu.scalar_type() != torch::kInt32 || block_id_cpu.scalar_type() != torch::kInt32) {
-        return;
-    }
-    if (block_id_cpu.dim() != 3) {
-        return;
-    }
-
-    const auto    all_streams = stream_groups.allStreams();
-    const int64_t group_dim   = block_id_cpu.size(0);
-    const int64_t batch_dim   = block_id_cpu.size(1);
-    const int64_t max_blocks  = block_id_cpu.size(2);
-    const int     batch       = static_cast<int>(seq_len_cpu.numel());
-
-    auto dump_row = [&](int64_t g, int64_t b) {
-        std::ostringstream oss;
-        oss << "[";
-        auto row = block_id_cpu.select(0, g).select(0, b);
-        for (int64_t i = 0; i < row.size(0); ++i) {
-            oss << row[i].item<int32_t>();
-            if (i + 1 < row.size(0))
-                oss << ",";
-        }
-        oss << "]";
-        return oss.str();
-    };
-
-    const auto*        sl         = seq_len_cpu.data_ptr<int32_t>();
-    bool               found_null = false;
-    std::ostringstream summary;
-    summary << "[debug-target-verify] batch=" << batch << " sbp=" << sbp << " group_dim=" << group_dim
-            << " batch_dim=" << batch_dim << " max_blocks=" << max_blocks;
-    for (int b = 0; b < batch && b < batch_dim; ++b) {
-        const int seq_len   = sl[b];
-        const int read_off  = (seq_len - 2) / sbp;
-        int64_t   stream_id = -1;
-        if (b < static_cast<int>(all_streams.size())) {
-            auto it = all_streams.begin();
-            std::advance(it, b);
-            if (*it) {
-                stream_id = (*it)->streamId();
-            }
-        }
-        for (int64_t g = 0; g < group_dim; ++g) {
-            std::string row_dump;
-            if (always_print || (read_off >= 0 && read_off < max_blocks)) {
-                row_dump = dump_row(g, b);
-            }
-            if (read_off < 0 || read_off >= max_blocks) {
-                RTP_LLM_LOG_ERROR(
-                    "[debug-target-verify] OOB read_off batch=%d stream=%ld group=%ld seq_len=%d read_off=%d max_blocks=%ld row=%s",
-                    b,
-                    stream_id,
-                    g,
-                    seq_len,
-                    read_off,
-                    max_blocks,
-                    dump_row(g, b).c_str());
-                found_null = true;
-                continue;
-            }
-            const int32_t bid = block_id_cpu.select(0, g).select(0, b).index({read_off}).item<int32_t>();
-            if (always_print) {
-                summary << "\n  batch=" << b << " stream=" << stream_id << " group=" << g << " seq_len=" << seq_len
-                        << " read_off=" << read_off << " bid=" << bid << " row=" << row_dump;
-            }
-            if (bid == -1) {
-                RTP_LLM_LOG_ERROR(
-                    "[debug-target-verify] NULL block_id at kernel read batch=%d stream=%ld group=%ld seq_len=%d read_off=%d row=%s",
-                    b,
-                    stream_id,
-                    g,
-                    seq_len,
-                    read_off,
-                    row_dump.c_str());
-                found_null = true;
-            }
-        }
-    }
-    if (always_print) {
-        RTP_LLM_LOG_INFO("%s", summary.str().c_str());
-    }
-    RTP_LLM_CHECK_WITH_INFO(!found_null,
-                            "linear cache NULL at kernel read position — see [debug-target-verify] log lines above");
 }
 
 void MtpExecutor::broadcastPostRejectionInputs(GptModelInputs& model_input) {
@@ -2099,6 +1994,13 @@ void MtpExecutor::prepareStreams(const std::list<GenerateStreamPtr>& streams,
         // set propose_step
         auto sp_output_buffer          = stream->getSPOutputBuffer();
         sp_output_buffer->propose_step = propose_step_;
+    }
+}
+
+void MtpExecutor::synchronizeBeforeSchedule() {
+    if (useStreamAsync() && !useDropBroadSync()) {
+        RTP_LLM_PROFILE_SCOPE("executor.mtp.sync_before_schedule");
+        spec_bookkeeping_runner_.sync(cuda_graph::graphGetCurrentStream());
     }
 }
 

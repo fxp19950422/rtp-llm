@@ -15,6 +15,10 @@ namespace rtp_llm {
 class Executor {
 public:
     Executor() {};
+    // Complete any host-side output bookkeeping that determines stream
+    // finished/batch state before the scheduler snapshots running streams.
+    // Executors without asynchronous bookkeeping keep the default no-op.
+    virtual void synchronizeBeforeSchedule() {}
     virtual absl::Status process(const std::list<GenerateStreamPtr>& streams, int64_t schedule_time_us = 0) = 0;
 
     static GptModelDescription genModelDescription(const ModelConfig&       model_config,

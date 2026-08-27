@@ -243,6 +243,14 @@ class OpenaiEndpoint(object):
             config.is_streaming = True
         if request.temperature != None:
             config.temperature = request.temperature
+            # OpenAI temperature=0 is greedy decoding.  Leaving do_sample=true
+            # sends the normal sampler and speculative rejection path through
+            # stochastic kernels even though the requested distribution is
+            # deterministic; on graph/DP execution this can also expose padded
+            # rows to multinomial sampling.  Preserve the explicit temperature
+            # value for observability, but make the sampling mode unambiguous.
+            if request.temperature == 0.0:
+                config.do_sample = False
         if request.top_p != None:
             config.top_p = request.top_p
         if request.top_k != None:

@@ -208,7 +208,8 @@ void PrefillRpcServer::prepareGenerateInput(PrefillGenerateContext& prefill_cont
         RTP_LLM_CHECK_WITH_INFO(engine_ != nullptr, "prefill rpc server engine is not initialized");
         auto input                                   = QueryConverter::transQuery(prefill_context.rpc_context.request);
         input->generate_config->pd_separation        = true;
-        input->generate_config->force_disable_sp_run = !engine_->isMTPEagle();
+        input->generate_config->force_disable_sp_run =
+            input->generate_config->force_disable_sp_run || !engine_->isMTPEagle();
         prefill_context.generate_input               = std::move(input);
     }
     prefill_context.request_info = prefill_context.generate_input->request_info;

@@ -2115,10 +2115,9 @@ def _launch_dummy_mhc_prenorm_gemm(
 
     n_value, k_value = key
     x = torch.zeros((m_value, k_value), dtype=torch.bfloat16, device=device)
-    out = torch.empty(
-        (num_splits, m_value, n_value), dtype=torch.float32, device=device
-    )
-    sqrsum = torch.empty((num_splits, m_value), dtype=torch.float32, device=device)
+    # PPU DeepGEMM reduces split-K internally and exposes one output plane.
+    out = torch.empty((1, m_value, n_value), dtype=torch.float32, device=device)
+    sqrsum = torch.empty((1, m_value), dtype=torch.float32, device=device)
     tf32_hc_prenorm_gemm(x, info["fn"], out, sqrsum, int(num_splits))
     del x, out, sqrsum
 
@@ -2146,12 +2145,11 @@ def _launch_dummy_mhc_pre_big_fuse(
     hc_eps = float(info.get("hc_eps", 1.0e-6))
     sinkhorn_iters = int(info.get("hc_sinkhorn_iters", 20) or 20)
 
+    # The preceding PPU DeepGEMM kernel has already reduced split-K.
     gemm_out_mul = torch.zeros(
-        (num_splits, m_value, n_value), dtype=torch.float32, device=device
+        (1, m_value, n_value), dtype=torch.float32, device=device
     )
-    gemm_out_sqrsum = torch.ones(
-        (num_splits, m_value), dtype=torch.float32, device=device
-    )
+    gemm_out_sqrsum = torch.ones((1, m_value), dtype=torch.float32, device=device)
     scale = info.get("scale")
     if not isinstance(scale, torch.Tensor) or tuple(scale.shape) != (3,):
         scale = torch.ones((3,), dtype=torch.float32, device=device)
@@ -2179,7 +2177,7 @@ def _launch_dummy_mhc_pre_big_fuse(
         hc_eps,
         2.0,
         sinkhorn_iters,
-        n_splits=int(num_splits),
+        n_splits=1,
         mhc_mult=mhc_mult,
     )(
         gemm_out_mul,

@@ -18,6 +18,12 @@ cc_library(
     visibility = ["//visibility:public"],
 )
 
+cc_library(
+    name = "cuda_graph_metadata_utils",
+    hdrs = ["cuda_graph_metadata_utils.h"],
+    visibility = ["//visibility:public"],
+)
+
 filegroup(
     name = "cuda_graph_srcs",
     srcs = [
@@ -74,6 +80,7 @@ cc_library(
     deps = torch_deps() + [
         ":cuda_graph_base",
         ":combo_position_ids_validation",
+        ":cuda_graph_metadata_utils",
         ":cuda_graph_hdrs_lib",
         "//rtp_llm/models_py/bindings/core:exec_ops_hdr",
         "//rtp_llm/cpp/utils:core_utils",

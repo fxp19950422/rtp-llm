@@ -254,6 +254,17 @@ def _last_hidden_by_request(
     return flat[-1:].contiguous()
 
 
+def _resolve_prefill_cu_seqlens(attn: Any) -> Optional[torch.Tensor]:
+    """Return populated request boundaries from host or device input metadata."""
+    cu_seqlens = getattr(attn, "cu_seqlens", None)
+    if cu_seqlens is not None and cu_seqlens.numel() >= 2:
+        return cu_seqlens
+    cu_seqlens_device = getattr(attn, "cu_seqlens_device", None)
+    if cu_seqlens_device is not None and cu_seqlens_device.numel() >= 2:
+        return cu_seqlens_device
+    return cu_seqlens
+
+
 def _cp_local_varlen_metadata(
     cp_ctx: Any,
     device: torch.device,
@@ -649,6 +660,7 @@ def forward_layers(
         if _rt_on:
             _rt.record("prefill_hc_reduced", h)
         h = v4._norm(h)  # [T, dim]
+
     if _rt_on:
         _rt.record("prefill_final_norm", h)
         if cp_ctx is None:
@@ -687,6 +699,21 @@ def forward_layers(
                     "seq_len_total": cp_ctx.seq_len_total,
                     "relative_positions": cp_ctx.relative_positions.detach().cpu(),
                     "global_positions": cp_ctx.global_positions.detach().cpu(),
+                    "req_id_per_token": (
+                        cp_ctx.req_id_per_token.detach().cpu()
+                        if cp_ctx.req_id_per_token is not None
+                        else None
+                    ),
+                    "input_lengths_global": (
+                        cp_ctx.input_lengths_global.detach().cpu()
+                        if cp_ctx.input_lengths_global is not None
+                        else None
+                    ),
+                    "prefix_lengths_global": (
+                        cp_ctx.prefix_lengths.detach().cpu()
+                        if cp_ctx.prefix_lengths is not None
+                        else None
+                    ),
                     "unpad_restore": cp_ctx.unpad_restore.detach().cpu(),
                     "local_is_real": cp_ctx.local_is_real.detach().cpu(),
                 }
@@ -775,7 +802,10 @@ def forward_prefill(
     #    (the field the dev branch called ``position_ids``; it is only populated
     #    when the model declares a position-id length factor, so the synthesize
     #    branch below stays the live path for DSV4).
-    cu_seqlens = attn.cu_seqlens
+    # Device-input MTP tail-prefill constructs request boundaries directly on
+    # the GPU and deliberately leaves the host mirror empty. Graph preparation
+    # replaces that mirror, but eager execution reaches this function unchanged.
+    cu_seqlens = _resolve_prefill_cu_seqlens(attn)
     positions = getattr(attn, "combo_position_ids", None)
     # warmup / cudagraph capture path doesn't populate combo_position_ids —
     # synthesize from (prefix_lengths, input_lengths). Prefer ``_d`` (GPU)

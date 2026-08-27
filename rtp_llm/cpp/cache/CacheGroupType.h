@@ -90,6 +90,25 @@ inline bool compactCpTailSlotKeyIndex(size_t slot_index,
     return true;
 }
 
+// Decode receives cache_keys in the base FULL-group namespace, while a
+// COMPACT_LAST_RANK table represents one additional CP-width coarsening of
+// that namespace. Reconstruct the group-local logical key count before using
+// the common compact-tail projection. This matters for partially filled CP
+// spans: e.g. two or four base keys still correspond to fixed-group key zero,
+// not base key one or three.
+inline bool compactCpDecodeTableSlotKeyIndex(size_t slot_index,
+                                             size_t slot_count,
+                                             size_t base_cache_key_count,
+                                             int    cp_size,
+                                             size_t& cache_key_index) {
+    if (base_cache_key_count == 0 || cp_size <= 0) {
+        return false;
+    }
+    const size_t cp_size_t            = static_cast<size_t>(cp_size);
+    const size_t group_cache_key_count = (base_cache_key_count + cp_size_t - 1) / cp_size_t;
+    return compactCpTailSlotKeyIndex(slot_index, slot_count, group_cache_key_count, cp_size, cache_key_index);
+}
+
 // Decode keeps compact CP groups in a base-block table whose usable entries
 // are the last block of each CP-width span (for CP8: 7, 15, ...). Convert that
 // physical position to the compact slot ordinal before resolving the global

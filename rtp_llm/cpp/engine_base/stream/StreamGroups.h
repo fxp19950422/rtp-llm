@@ -22,12 +22,13 @@ public:
     using TokenCountsByPriority = std::map<int32_t, TokenCounts>;
 
     StreamGroups(const std::list<GenerateStreamPtr>& streams) {
+        bool has_stream = false;
+        bool all_fake   = true;
         for (auto& stream : streams) {
+            has_stream = true;
             auto cur_batch_size  = stream->currentBatchSize();
             auto next_batch_size = stream->nextBatchSize();
-            if (stream->isFakeStream()) {
-                is_fake_stream_ = true;
-            }
+            all_fake = all_fake && stream->isFakeStream();
             if (stream->isContextStream()) {
                 context_streams_.push_back(stream);
                 total_context_batch_size_ += cur_batch_size;
@@ -74,6 +75,12 @@ public:
             adapter_names.push_back(stream->adapterName());
             gen_timeline_ |= stream->genTimeline();
         }
+        // is_fake_stream is a batch-level short-circuit: it suppresses
+        // sampling/dispatch for the whole batch.  It must therefore mean
+        // "all rows are fake", not "at least one row is fake".  Decode EP
+        // graph replay may append fake padding beside live rows to preserve a
+        // lockstep outer batch shape across ranks.
+        is_fake_stream_ = has_stream && all_fake;
     }
 
     size_t totalDecodeBatchSize() const {

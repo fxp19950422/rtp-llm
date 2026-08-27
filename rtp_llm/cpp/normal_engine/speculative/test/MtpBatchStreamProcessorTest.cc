@@ -1161,6 +1161,43 @@ TEST_F(MtpBatchStreamProcessorTest, testUpdateDecodePostDraftModelInputKeepsDens
     unsetenv("RTP_LLM_MTP_ASYNC_DEVICE_STATE");
 }
 
+TEST_F(MtpBatchStreamProcessorTest, testUpdateDecodePostDraftModelInputKeepsPaddedB80FakeGeometry) {
+    setenv("RTP_LLM_MTP_ASYNC_DEVICE_STATE", "1", 1);
+    constexpr int64_t batch_size = 80;
+    constexpr int64_t verify_width = 3;
+
+    ModelConfig                 model_config;
+    PDSepConfig                 pd_sep_config;
+    ProfilingDebugLoggingConfig profiling_debug_logging_config;
+    CacheConfig                 cache_config = makeProcessorCacheConfig();
+    SpeculativeExecutionConfig  sp_config;
+    model_config.num_layers     = 1;
+    sp_config.gen_num_per_cycle = verify_width - 1;
+
+    MtpBatchStreamProcessor processor(
+        model_config, pd_sep_config, profiling_debug_logging_config, cache_config, sp_config, false);
+    GptModelInputs model_input;
+    speculative::SpeculativeSamplerOutput spec_decode_output;
+    spec_decode_output.accept_len = torch::full(
+        {batch_size}, verify_width, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+    spec_decode_output.accept_tokens = torch::zeros(
+        {batch_size, verify_width}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
+    GptModelOutputs model_output;
+    model_output.all_hidden_states = torch::zeros(
+        {batch_size * verify_width, 2}, torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+    torch::Tensor hidden_states_d_t;
+    TensorHolder  holder;
+
+    processor.updateDecodePostDraftModelInput(
+        model_input, model_output, spec_decode_output, batch_size, hidden_states_d_t, holder);
+
+    EXPECT_TRUE(model_input.combo_tokens.is_cuda());
+    EXPECT_EQ(batch_size * verify_width, model_input.combo_tokens.numel());
+    EXPECT_EQ(batch_size, model_input.lm_output_indexes.numel());
+    EXPECT_EQ(batch_size * verify_width, model_input.last_hidden_states.size(0));
+    unsetenv("RTP_LLM_MTP_ASYNC_DEVICE_STATE");
+}
+
 TEST_F(MtpBatchStreamProcessorTest, testUpdateDecodePostDraftModelInputCompactsComboPositionIds) {
     ModelConfig                 model_config;
     RuntimeConfig               runtime_config;
@@ -1280,6 +1317,45 @@ TEST_F(MtpBatchStreamProcessorTest, testUpdateDecodeDraftModelInputAdvancesCombo
     EXPECT_EQ((vector<int>{6, 8}), toVec<int>(model_input.sequence_lengths));
     EXPECT_EQ((vector<float>{0.1, 0.2, 1.1, 1.2}), toVec<float>(model_input.last_hidden_states));
     EXPECT_EQ((vector<int>{6, 7, 8, 11, 12, 13}), toVec<int>(model_input.combo_position_ids));
+}
+
+TEST_F(MtpBatchStreamProcessorTest, testUpdateDecodeDraftModelInputKeepsCudaPositionIdsOnDevice) {
+    if (!torch::cuda::is_available()) {
+        GTEST_SKIP() << "No GPU device available";
+    }
+    ModelConfig                 model_config;
+    PDSepConfig                 pd_sep_config;
+    ProfilingDebugLoggingConfig profiling_debug_logging_config;
+    CacheConfig                 cache_config = makeProcessorCacheConfig();
+    SpeculativeExecutionConfig  sp_config;
+
+    model_config.max_seq_len                           = 2048;
+    model_config.vocab_size                            = 4;
+    model_config.num_layers                            = 1;
+    model_config.mm_model_config.mm_position_ids_style = MROPE;
+    model_config.attn_config.rope_config.index_factor  = 3;
+    sp_config.gen_num_per_cycle                        = 2;
+
+    MtpBatchStreamProcessor processor(
+        model_config, pd_sep_config, profiling_debug_logging_config, cache_config, sp_config, false);
+
+    GptModelInputs model_input;
+    model_input.combo_tokens       = torch::tensor({11, 21}, torch::kInt32).to(torch::kCUDA);
+    model_input.sequence_lengths   = torch::tensor({5, 7}, torch::kInt32).to(torch::kCUDA);
+    model_input.combo_position_ids =
+        torch::tensor({5, 6, 7, 10, 11, 12}, torch::kInt32).to(torch::kCUDA);
+
+    GptModelOutputs model_output;
+    model_output.all_hidden_states =
+        torch::tensor({0.1f, 0.2f, 1.1f, 1.2f}, torch::kFloat32).reshape({2, 2}).to(torch::kCUDA);
+    auto draft_token_ids = torch::tensor({12, 22}, torch::kInt32).reshape({2, 1}).to(torch::kCUDA);
+
+    TensorHolder holder;
+    processor.updateDecodeDraftModelInput(model_input, model_output, draft_token_ids, holder);
+
+    EXPECT_TRUE(model_input.combo_position_ids.is_cuda());
+    EXPECT_EQ((vector<int>{6, 7, 8, 11, 12, 13}), toVec<int>(model_input.combo_position_ids));
+    EXPECT_EQ((vector<int>{6, 8}), toVec<int>(model_input.sequence_lengths));
 }
 
 TEST_F(MtpBatchStreamProcessorTest, testExpandTargetVerifyPositionIdsInitializesNonDriverPlaceholder) {

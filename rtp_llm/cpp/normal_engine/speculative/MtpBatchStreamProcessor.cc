@@ -784,16 +784,24 @@ void MtpBatchStreamProcessor::updateDecodeDraftModelInput(GptModelInputs&       
     model_input.combo_tokens = draft_token_ids.reshape({batch_size});
 
     if (model_input.combo_position_ids.defined()) {
-        const size_t position_id_len_factor = model_input_gatherer_config_.position_id_len_factor;
-        auto         next_position_ids =
-            torch::empty({(int64_t)(batch_size * position_id_len_factor)}, torch::kInt32).pin_memory();
-        int*       dst_position_ids = next_position_ids.data_ptr<int>();
-        const auto src_position_ids = model_input.combo_position_ids.cpu().contiguous();
-        const int* src              = src_position_ids.data_ptr<int>();
-        for (int64_t i = 0; i < next_position_ids.numel(); ++i) {
-            dst_position_ids[i] = src[i] + 1;
+        if (useMtpDeviceInput() || model_input.combo_position_ids.is_cuda()) {
+            // Multi-step draft decode advances every position component by one.
+            // Keep this on the model stream: a CUDA->CPU copy here serialized
+            // every extra draft step and made gamma=3 pay two avoidable round
+            // trips relative to gamma=1.
+            model_input.combo_position_ids = (model_input.combo_position_ids + 1).to(torch::kInt32);
+        } else {
+            const size_t position_id_len_factor = model_input_gatherer_config_.position_id_len_factor;
+            auto         next_position_ids =
+                torch::empty({(int64_t)(batch_size * position_id_len_factor)}, torch::kInt32).pin_memory();
+            int*       dst_position_ids = next_position_ids.data_ptr<int>();
+            const auto src_position_ids = model_input.combo_position_ids.contiguous();
+            const int* src              = src_position_ids.data_ptr<int>();
+            for (int64_t i = 0; i < next_position_ids.numel(); ++i) {
+                dst_position_ids[i] = src[i] + 1;
+            }
+            model_input.combo_position_ids = std::move(next_position_ids);
         }
-        model_input.combo_position_ids = std::move(next_position_ids);
     }
 
     if (useMtpDeviceInput() || model_input.sequence_lengths.is_cuda()) {
@@ -1190,7 +1198,6 @@ void MtpBatchStreamProcessor::preparePrefillSpecUpdateInfo(const StreamGroups&  
     RTP_LLM_LOG_DEBUG("new_all_token_ids = [%s]", tensorDebugStringWithData<int32_t>(new_all_token_ids).c_str());
     RTP_LLM_LOG_DEBUG("propose_new_all_token_ids = [%s]",
                       tensorDebugStringWithData<int64_t>(propose_new_all_token_ids).c_str());
-
     const size_t total_batch_size_out = stream_groups.totalSamplerBatchSizeOut();
     RTP_LLM_CHECK(total_batch_size_out == (size_t)new_all_token_ids.size(0));
     const size_t token_stride = new_all_token_ids.size(1);

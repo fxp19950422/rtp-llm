@@ -589,6 +589,14 @@ absl::Status NormalEngine::step() {
     int64_t                 tps_schedule_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
     list<GenerateStreamPtr> streams;
     if (parallelism_config.tp_rank == 0 && !ffn_disaggregate_config.is_ffn_service()) {
+        // Output bookkeeping owns the authoritative finished/batch state.  If
+        // the executor is configured to retain the broad synchronization, do
+        // it before schedule() rather than after: scheduling first can retain
+        // a just-finished batch on one EP rank while a peer already compacts
+        // it, making the next collective/graph iteration observe different
+        // real/fake phase state.  This moves the existing barrier; it does not
+        // add one to DROP_BROAD_SYNC=1.
+        executor_->synchronizeBeforeSchedule();
         {
             RTP_LLM_PROFILE_SCOPE_DYNAMIC("engine.normal.schedule(reserve_step=%d)", reserve_step_);
             CHECK_AND_ASSIGN(streams, scheduler_->schedule());
@@ -685,6 +693,43 @@ bool NormalEngine::isDSpark() {
     return propose_params_ && propose_params_->sp_type == SP_TYPE_DSPARK;
 }
 
+namespace {
+
+bool padEpDecodeBatchToMaxEnabled() {
+    static const bool enabled = []() {
+        const char* env = std::getenv("RTP_LLM_EP_DECODE_PAD_TO_MAX_BATCH");
+        return env != nullptr && std::string(env) == "1";
+    }();
+    return enabled;
+}
+
+size_t padEpDecodeMinRealBatch() {
+    static const size_t min_batch = []() {
+        const char* env = std::getenv("RTP_LLM_EP_DECODE_PAD_MIN_REAL_BATCH");
+        if (env == nullptr || *env == '\0') {
+            return size_t{1};
+        }
+        char*              end   = nullptr;
+        const unsigned long value = std::strtoul(env, &end, 10);
+        RTP_LLM_CHECK_WITH_INFO(end != env && *end == '\0' && value > 0,
+                                "RTP_LLM_EP_DECODE_PAD_MIN_REAL_BATCH must be a positive integer, got %s",
+                                env);
+        return static_cast<size_t>(value);
+    }();
+    return min_batch;
+}
+
+}  // namespace
+
+bool NormalEngine::shouldPadEpDecodeBatch(size_t scheduled_streams,
+                                          size_t min_real_batch,
+                                          bool&  high_load_latched) {
+    if (!high_load_latched && scheduled_streams >= min_real_batch) {
+        high_load_latched = true;
+    }
+    return high_load_latched;
+}
+
 void NormalEngine::mayAddFakeStream(std::list<GenerateStreamPtr>& streams) {
     if (isMTPEagle()) {
         int        propose_step   = sp_config.gen_num_per_cycle;
@@ -698,7 +743,28 @@ void NormalEngine::mayAddFakeStream(std::list<GenerateStreamPtr>& streams) {
                 }
                 break;
             case RoleType::DECODE:
-                if (streams.empty()) {
+                if (padEpDecodeBatchToMaxEnabled() && parallelism_config.dp_size > 1
+                    && shouldPadEpDecodeBatch(
+                        streams.size(), padEpDecodeMinRealBatch(), ep_decode_high_load_latched_)
+                    && streams.size() < static_cast<size_t>(runtime_config.max_generate_batch_size)) {
+                    // EP collectives are captured inside the decode CUDA graph,
+                    // but MTP metadata/prepare phases outside the graph still
+                    // observe the real local stream count.  At the drain tail,
+                    // ranks compact from B80 to different B12..B18 shapes in
+                    // the same cycle.  Keep the outer batch lockstep by padding
+                    // every sufficiently loaded rank to the common configured
+                    // maximum. Low-batch accuracy-sensitive shapes remain on
+                    // their native path; the minimum is an explicit experiment
+                    // knob. Reuse one
+                    // fake stream object: it is read-only during model phases,
+                    // and the batch-level fake flag is true only when all rows
+                    // are fake (StreamGroups contract).
+                    auto fake_stream = MtpExecutor::createMinFakeDecodeStream(
+                        propose_step, model_config_, runtime_config, resource_context_, mtp_vocab_size, is_dspark);
+                    streams.insert(streams.end(),
+                                   static_cast<size_t>(runtime_config.max_generate_batch_size) - streams.size(),
+                                   fake_stream);
+                } else if (streams.empty()) {
                     streams.emplace_back(MtpExecutor::createMinFakeDecodeStream(
                         propose_step, model_config_, runtime_config, resource_context_, mtp_vocab_size, is_dspark));
                 }

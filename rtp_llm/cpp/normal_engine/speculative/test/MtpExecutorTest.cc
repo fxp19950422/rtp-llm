@@ -1834,6 +1834,14 @@ TEST_F(MtpExecutorTest, testDSparkFakeDecodeStartsWithoutProposalState) {
     EXPECT_FALSE(sp_buffer->hidden_states.defined());
     EXPECT_FALSE(stream->getProposeTokensGpu().defined());
 
+    StreamGroups all_fake_groups({stream});
+    EXPECT_TRUE(all_fake_groups.isFakeStream());
+    auto live_row =
+        MtpExecutor::createMinFakeDecodeStream(gamma, model_config, runtime_config, resource_context, vocab_size, true);
+    live_row->setIsFakeStream(false);
+    StreamGroups mixed_groups({live_row, stream});
+    EXPECT_FALSE(mixed_groups.isFakeStream());
+
     StreamSpecUpdateInfo update_info{
         torch::tensor({7}, torch::kInt32).reshape({1, 1}), 1, -1, torch::Tensor(), torch::Tensor()};
     update_info.speculative_propose_step = 3;

@@ -9,8 +9,10 @@ from rtp_llm.models_py.modules.dsv4.hc import build_hc_head, build_hc_unit
 from rtp_llm.models_py.modules.dsv4.hc.fallback_impl import (
     FallbackHCHead,
     FallbackHCUnit,
+    _hc_split_sinkhorn,
 )
 from rtp_llm.models_py.modules.dsv4.hc.tilelang_impl import (
+    HybridHCUnit,
     TileLangHCHead,
     TileLangHCUnit,
 )
@@ -42,6 +44,66 @@ def _weights(hc: int, dim: int, device: str = "cpu"):
 
 
 class TestHCImpl(unittest.TestCase):
+    def test_fallback_unit_linear_mixes_matches_fp32_reference(self) -> None:
+        hc, dim = 4, 8
+        fn, base, scale = _weights(hc, dim)
+        unit = FallbackHCUnit(
+            fn,
+            base,
+            scale,
+            dim=dim,
+            hc_mult=hc,
+            hc_sinkhorn_iters=3,
+            norm_eps=1e-6,
+            hc_eps=1e-6,
+        )
+        residual = torch.randn(3, hc, dim, dtype=torch.bfloat16)
+        x_flat = residual.flatten(-2)
+        expected = torch.nn.functional.linear(x_flat.float(), fn)
+        expected *= torch.rsqrt(
+            x_flat.float().square().mean(-1, keepdim=True) + unit.norm_eps
+        )
+        torch.testing.assert_close(unit._linear_mixes(x_flat), expected)
+
+    def test_fallback_unit_pre_post_accumulate_in_fp32(self) -> None:
+        hc, dim = 4, 8
+        fn, base, scale = _weights(hc, dim)
+        unit = FallbackHCUnit(
+            fn,
+            base,
+            scale,
+            dim=dim,
+            hc_mult=hc,
+            hc_sinkhorn_iters=3,
+            norm_eps=1e-6,
+            hc_eps=1e-6,
+        )
+        torch.manual_seed(17)
+        residual = (torch.randn(5, hc, dim) * 7).to(torch.bfloat16)
+
+        y, post, comb = unit.pre(residual)
+        mixes = unit._linear_mixes(residual.flatten(-2))
+        pre_ref, post_ref, comb_ref = _hc_split_sinkhorn(
+            mixes,
+            scale,
+            base,
+            hc_mult=hc,
+            sinkhorn_iters=3,
+            eps=1e-6,
+        )
+        y_ref = torch.sum(
+            pre_ref.unsqueeze(-1) * residual.float(), dim=-2
+        ).to(torch.bfloat16)
+        torch.testing.assert_close(y, y_ref, rtol=0, atol=0)
+
+        sublayer = (torch.randn(5, dim) * 5).to(torch.bfloat16)
+        actual = unit.post(sublayer, residual, post, comb)
+        expected = torch.matmul(
+            comb_ref.transpose(-1, -2), residual.float()
+        )
+        expected.add_(post_ref.unsqueeze(-1) * sublayer.float().unsqueeze(-2))
+        torch.testing.assert_close(actual, expected.to(torch.bfloat16), rtol=0, atol=0)
+
     def test_fallback_tp_replicated_hidden_matches_single_rank(self) -> None:
         hc, dim = 4, 8
         fn, base, scale = _weights(hc, dim)
@@ -236,6 +298,162 @@ class TestHCImpl(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             unit.pre(x)
 
+    def test_factory_hybrid_uses_tilelang_pre_and_fallback_post_head(self) -> None:
+        hc, dim = 4, 16
+        fn, base, scale = _weights(hc, dim)
+        with _env("DSV4_HC_IMPL", "hybrid"):
+            unit = build_hc_unit(
+                fn,
+                base,
+                scale,
+                dim=dim,
+                hc_mult=hc,
+                hc_sinkhorn_iters=3,
+                norm_eps=1e-6,
+                hc_eps=1e-6,
+            )
+            head = build_hc_head(
+                fn[:hc],
+                base[:hc],
+                scale[:1],
+                dim=dim,
+                hc_mult=hc,
+                norm_eps=1e-6,
+                hc_eps=1e-6,
+            )
+        self.assertIsInstance(unit, HybridHCUnit)
+        self.assertIsInstance(head, FallbackHCHead)
+
+        import rtp_llm.models_py.modules.dsv4.hc.tilelang_impl as tilelang_impl
+
+        residual = torch.randn(5, hc, dim, dtype=torch.bfloat16)
+        pre = torch.randn(5, dim, dtype=torch.bfloat16)
+        post = torch.randn(5, hc, 1, dtype=torch.float32)
+        comb = torch.randn(5, hc, hc, dtype=torch.float32)
+        with mock.patch.object(
+            tilelang_impl,
+            "tk_mhc_pre",
+            return_value=(pre.unsqueeze(0), post.unsqueeze(0), comb.unsqueeze(0)),
+        ) as tk_pre:
+            actual_pre = unit.pre(residual)
+        tk_pre.assert_called_once()
+        for actual, expected in zip(actual_pre, (pre, post, comb)):
+            torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+
+        sublayer = torch.randn(5, dim, dtype=torch.bfloat16)
+        actual_post = unit.post(sublayer, residual, post, comb)
+        expected_post = FallbackHCUnit._post_impl(
+            unit, sublayer, residual, post, comb
+        )
+        torch.testing.assert_close(actual_post, expected_post, atol=0, rtol=0)
+
+    def test_hybrid_graph_capture_routes_only_tilelang_single_to_tilelang(self) -> None:
+        hc, dim = 4, 16
+        fn, base, scale = _weights(hc, dim)
+        unit = HybridHCUnit(
+            fn,
+            base,
+            scale,
+            dim=dim,
+            hc_mult=hc,
+            hc_sinkhorn_iters=3,
+            norm_eps=1e-6,
+            hc_eps=1e-6,
+        )
+        cuda_x = mock.Mock(is_cuda=True)
+        tilelang_result = object()
+        fallback_result = object()
+
+        for backend in (None, "tilelang", "deepgemm", "TILELANG_SINGLE "):
+            with self.subTest(backend=backend), _env(
+                "DSV4_MHC_PRE_GEMM_BACKEND", backend
+            ), mock.patch(
+                "torch.cuda.is_current_stream_capturing", return_value=True
+            ), mock.patch.object(
+                TileLangHCUnit, "_pre_impl", return_value=tilelang_result
+            ) as tilelang_pre, mock.patch.object(
+                FallbackHCUnit, "_pre_impl", return_value=fallback_result
+            ) as fallback_pre:
+                actual = unit._pre_impl(cuda_x, dbg_tag="graph")
+
+            if backend is not None and backend.strip().lower() in {
+                "tilelang_single",
+                "deepgemm",
+            }:
+                self.assertIs(actual, tilelang_result)
+                tilelang_pre.assert_called_once_with(cuda_x, dbg_tag="graph")
+                fallback_pre.assert_not_called()
+            else:
+                self.assertIs(actual, fallback_result)
+                fallback_pre.assert_called_once_with(unit, cuda_x, dbg_tag="graph")
+                tilelang_pre.assert_not_called()
+
+    def test_hybrid_eager_always_uses_selected_tilelang_pre(self) -> None:
+        hc, dim = 4, 16
+        fn, base, scale = _weights(hc, dim)
+        unit = HybridHCUnit(
+            fn,
+            base,
+            scale,
+            dim=dim,
+            hc_mult=hc,
+            hc_sinkhorn_iters=3,
+            norm_eps=1e-6,
+            hc_eps=1e-6,
+        )
+        cuda_x = mock.Mock(is_cuda=True)
+        expected = object()
+        with _env(
+            "DSV4_MHC_PRE_GEMM_BACKEND", "deepgemm"
+        ), mock.patch(
+            "torch.cuda.is_current_stream_capturing", return_value=False
+        ), mock.patch.object(
+            TileLangHCUnit, "_pre_impl", return_value=expected
+        ) as tilelang_pre, mock.patch.object(
+            FallbackHCUnit, "_pre_impl"
+        ) as fallback_pre:
+            actual = unit._pre_impl(cuda_x, dbg_tag="eager")
+
+        self.assertIs(actual, expected)
+        tilelang_pre.assert_called_once_with(cuda_x, dbg_tag="eager")
+        fallback_pre.assert_not_called()
+
+    def test_hybrid_post_routes_only_explicit_tilelang_backend(self) -> None:
+        hc, dim = 4, 16
+        fn, base, scale = _weights(hc, dim)
+        unit = HybridHCUnit(
+            fn,
+            base,
+            scale,
+            dim=dim,
+            hc_mult=hc,
+            hc_sinkhorn_iters=3,
+            norm_eps=1e-6,
+            hc_eps=1e-6,
+        )
+        args = tuple(object() for _ in range(4))
+        tilelang_result = object()
+        fallback_result = object()
+
+        for backend in (None, "fallback", "tilelang_single", " TILELANG "):
+            with self.subTest(backend=backend), _env(
+                "DSV4_MHC_POST_BACKEND", backend
+            ), mock.patch.object(
+                TileLangHCUnit, "_post_impl", return_value=tilelang_result
+            ) as tilelang_post, mock.patch.object(
+                FallbackHCUnit, "_post_impl", return_value=fallback_result
+            ) as fallback_post:
+                actual = unit._post_impl(*args)
+
+            if backend is not None and backend.strip().lower() == "tilelang":
+                self.assertIs(actual, tilelang_result)
+                tilelang_post.assert_called_once_with(*args)
+                fallback_post.assert_not_called()
+            else:
+                self.assertIs(actual, fallback_result)
+                fallback_post.assert_called_once_with(unit, *args)
+                tilelang_post.assert_not_called()
+
     def test_tilelang_none_result_is_not_fallback(self) -> None:
         hc, dim = 4, 16
         fn, base, scale = _weights(hc, dim)
@@ -360,7 +578,7 @@ class TestHCImpl(unittest.TestCase):
     def test_shape_contract_is_checked_before_impl(self) -> None:
         hc, dim = 4, 16
         fn, base, scale = _weights(hc, dim)
-        for mode in ("fallback", "tilelang"):
+        for mode in ("fallback", "tilelang", "hybrid"):
             with self.subTest(mode=mode), _env("DSV4_HC_IMPL", mode):
                 unit = build_hc_unit(
                     fn,

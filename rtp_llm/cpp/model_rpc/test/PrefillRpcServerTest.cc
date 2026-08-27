@@ -361,6 +361,22 @@ TEST_F(PrefillRpcServerTest, retryRebuildsPbInputBeforeMultimodalProcessing) {
     EXPECT_TRUE(context->generate_input->generate_config->force_disable_sp_run);
 }
 
+TEST_F(PrefillRpcServerTest, mtpPrefillPreservesRequestLevelSpeculativeDisable) {
+    GenerateInputPB request;
+    request.set_request_id(1);
+    request.add_token_ids(10);
+    request.mutable_generate_config()->set_force_disable_sp_run(true);
+    auto context = makeContext(&request);
+
+    TestPrefillRpcServer server;
+    server.setEngineForTest(/*is_mtp_eagle=*/true);
+    server.prepareGenerateInputForTest(*context);
+
+    ASSERT_NE(context->generate_input, nullptr);
+    EXPECT_TRUE(context->generate_input->generate_config->pd_separation);
+    EXPECT_TRUE(context->generate_input->generate_config->force_disable_sp_run);
+}
+
 TEST_F(PrefillRpcServerTest, multimodalProcessDoesNotMutateOriginalRequest) {
     GenerateInputPB request;
     request.set_request_id(1);

@@ -189,6 +189,38 @@ TEST_F(CPSlotMapperTest, CompactCpDecodePhysicalBlocksUseGlobalTailKeysForLongRe
     EXPECT_FALSE(compactCpPhysicalBlockKeyIndex(16, block_count, cache_key_count, cp_size, key_index));
 }
 
+TEST_F(CPSlotMapperTest, CompactCpDecodeTableSlotsUseCanonicalKeysForShortAndLongRequests) {
+    constexpr int cp_size = 8;
+    size_t        key_index = 0;
+
+    // Decode allocates one compact fixed-group block for a short request.
+    // Slot zero must load its only canonical key instead of being rejected
+    // for not looking like an uncompressed CP8 position (7, 15, ...).
+    ASSERT_TRUE(compactCpDecodeTableSlotKeyIndex(
+        /*slot_index=*/0, /*slot_count=*/1, /*base_cache_key_count=*/1, cp_size, key_index));
+    EXPECT_EQ(key_index, 0u);
+
+    // A partial base CP span is still fixed-group key zero. This is the
+    // 516-token regression: the FULL namespace has two keys while the fixed
+    // SWA/STATE namespace has only one.
+    ASSERT_TRUE(compactCpDecodeTableSlotKeyIndex(
+        /*slot_index=*/0, /*slot_count=*/1, /*base_cache_key_count=*/2, cp_size, key_index));
+    EXPECT_EQ(key_index, 0u);
+    ASSERT_TRUE(compactCpDecodeTableSlotKeyIndex(
+        /*slot_index=*/0, /*slot_count=*/1, /*base_cache_key_count=*/4, cp_size, key_index));
+    EXPECT_EQ(key_index, 0u);
+
+    // 69 base keys coarsen to nine fixed-group keys; two retained table slots
+    // map to the fixed-group tail keys seven and eight, matching Prefill's
+    // buildCacheStorePlan input namespace.
+    ASSERT_TRUE(compactCpDecodeTableSlotKeyIndex(
+        /*slot_index=*/0, /*slot_count=*/2, /*base_cache_key_count=*/69, cp_size, key_index));
+    EXPECT_EQ(key_index, 7u);
+    ASSERT_TRUE(compactCpDecodeTableSlotKeyIndex(
+        /*slot_index=*/1, /*slot_count=*/2, /*base_cache_key_count=*/69, cp_size, key_index));
+    EXPECT_EQ(key_index, 8u);
+}
+
 TEST_F(CPSlotMapperTest, FullGroupIgnoresByteSlicePolicy) {
     CacheConfig config;
     config.seq_size_per_block = 8;

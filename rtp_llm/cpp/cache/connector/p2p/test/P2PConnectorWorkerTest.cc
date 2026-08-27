@@ -1117,6 +1117,7 @@ TEST_F(P2PConnectorWorkerTest, HandleRead_ReturnFalse_CallbackWaitTimeout) {
 
     std::atomic<bool> done{false};
     ErrorInfo         result;
+    const auto        wait_started = std::chrono::steady_clock::now();
     std::thread       write_thread([&]() {
         result = prefill_->sendKVCache(request_id, unique_key, deadline_ms, decode_transfer_servers);
         done   = true;
@@ -1136,6 +1137,11 @@ TEST_F(P2PConnectorWorkerTest, HandleRead_ReturnFalse_CallbackWaitTimeout) {
     // callback 未收齐，必须报告失败（fix: 修复前此处可能误判成功）
     EXPECT_TRUE(result.hasError());
     EXPECT_EQ(result.code(), ErrorCode::P2P_CONNECTOR_WORKER_HANDLE_READ_TIMEOUT);
+    const auto elapsed_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - wait_started).count();
+    // The RDMA cap must be an end-to-end cap.  Before the fix it was treated
+    // as a poll interval and this test waited until the 5s outer deadline.
+    EXPECT_LT(elapsed_ms, 1000);
 }
 
 // ==================== LayerCacheBufferUtil 边界测试 ====================

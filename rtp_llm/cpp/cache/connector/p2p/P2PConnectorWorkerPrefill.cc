@@ -250,6 +250,17 @@ bool P2PConnectorWorkerPrefill::waitSendCallbacksWithTimeout(const std::shared_p
         if (ready) {
             return true;
         }
+        // rdma_transfer_wait_timeout_ms is an independent cap, not merely a
+        // polling interval.  Re-entering the loop here used to reset the cap
+        // and could hide a missing completion callback until the much larger
+        // outer cache-load deadline (30 minutes in production).
+        RTP_LLM_LOG_WARNING("waitSendCallbacksWithTimeout rdma cap reached, done_count: %ld, expected: %d, "
+                            "rdma_cap_ms: %ld, return_deadline_ms: %ld",
+                            transfer_result->done_count.load(std::memory_order_relaxed),
+                            sent_transfer_count,
+                            rdma_cap_ms,
+                            return_deadline_ms);
+        return false;
     }
     return true;
 }

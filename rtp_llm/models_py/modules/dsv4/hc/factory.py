@@ -51,6 +51,21 @@ def build_hc_unit(
             layer_id=layer_id,
             name=name,
         )
+    elif mode is HCMode.HYBRID:
+        from rtp_llm.models_py.modules.dsv4.hc.tilelang_impl import HybridHCUnit
+
+        unit = HybridHCUnit(
+            fn,
+            base,
+            scale,
+            dim=dim,
+            hc_mult=hc_mult,
+            hc_sinkhorn_iters=hc_sinkhorn_iters,
+            norm_eps=norm_eps,
+            hc_eps=hc_eps,
+            layer_id=layer_id,
+            name=name,
+        )
     else:
         from rtp_llm.models_py.modules.dsv4.hc.fallback_impl import FallbackHCUnit
 
@@ -98,6 +113,8 @@ def build_hc_head(
             hc_eps=hc_eps,
         )
     else:
+        # Hybrid deliberately uses the validated FP32 fallback head because
+        # only the PRE path has passed the production-shape PPU gate.
         from rtp_llm.models_py.modules.dsv4.hc.fallback_impl import FallbackHCHead
 
         head = FallbackHCHead(

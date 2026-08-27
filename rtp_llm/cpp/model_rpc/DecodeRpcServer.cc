@@ -927,7 +927,14 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
             }
             cache_key_index = block_pos;
             if (isCompactFixedBlockTable(cfg, gid)) {
-                return compactCpPhysicalBlockKeyIndex(
+                // Fixed STATE/SWA groups already expose a CP-compacted block
+                // table: block_pos is the compact slot ordinal (0, 1, ...),
+                // not an uncompressed base-table position (7, 15, ... for
+                // CP8). Map that ordinal directly back to the canonical key
+                // namespace. Treating it as a base-table position skips every
+                // fixed group for a one-block request and drops compact tail
+                // slots for longer requests.
+                return compactCpDecodeTableSlotKeyIndex(
                     block_pos, block_num, cache_key_count, load_context.prefill_cp_size, cache_key_index);
             }
             return cache_key_index < cache_key_count;

@@ -46,6 +46,7 @@ public:
                          int32_t                                        kv_cache_group_num = 1,
                          bool                                           warm_up            = false);
 
+    void         synchronizeBeforeSchedule() override;
     absl::Status process(const std::list<GenerateStreamPtr>& streams, int64_t schedule_time_us = 0) override;
     bool         updateEplbConfig(const EPLBConfig& config) override;
 
@@ -132,8 +133,6 @@ protected:
     void            launchTargetVerifyPrepareAsync(const GptModelInputs& model_input, size_t batch_size);
     void            launchDraftPrefillPrepareAsync(const GptModelInputs& model_input);
     GptModelOutputs runTargetVerifyForward(GptModelInputs& model_input, const StreamGroups& stream_groups);
-    void            debugCheckLinearBlockMapAtKernelRead(const GptModelInputs& model_input,
-                                                         const StreamGroups&   stream_groups) const;
     void            broadcastPostRejectionInputs(GptModelInputs& model_input);
     GptModelOutputs runDSparkProposeForward(GptModelInputs& model_input);
     SamplerOutput   sampleDSparkDraft(const StreamGroups&  stream_groups,

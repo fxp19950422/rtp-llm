@@ -396,6 +396,20 @@ class OpenaiGenerateConfigTest(TestCase):
             {"anyOf": [{"type": "object"}, {"type": "array"}]},
         )
 
+    def test_zero_temperature_forces_greedy_sampling(self):
+        request = ChatCompletionRequest(
+            messages=[],
+            temperature=0.0,
+            top_k=0,
+            extra_configs=GenerateConfig(do_sample=True),
+        )
+
+        config = self._extract_openai_generation_config(request)
+
+        self.assertEqual(config.temperature, 0.0)
+        self.assertEqual(config.top_k, 0)
+        self.assertFalse(config.do_sample)
+
     def _generate_config_with_stop_word(
         self,
         model_stop_word_str: Optional[List[str]] = None,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import NoReturn
 
 import torch
@@ -112,6 +113,64 @@ class TileLangHCUnit(HCUnitBase):
         if out is None:
             _raise_unavailable("post", residual, self.hc_mult)
         return squeeze_hc_batch(out, wrapped, name="mhc_post output")
+
+
+class HybridHCUnit(TileLangHCUnit):
+    """DeepGEMM/TileLang PRE with the validated FP32 PyTorch POST.
+
+    The PPU TileLang POST kernel currently fails JIT compilation because it
+    emits unsupported PDL.  PRE is independently parity/performance gated, so
+    hybrid mode keeps that speedup without routing serving through the broken
+    POST kernel.
+    """
+
+    def _linear_mixes(self, x_flat: torch.Tensor) -> torch.Tensor:
+        # Fallback PRE calls this method. Keep the exact FP32 reference
+        # projection used by FallbackHCUnit without constructing another
+        # module or caching an unnecessary BF16 weight copy.
+        from rtp_llm.models_py.modules.dsv4.hc.fallback_impl import (
+            _tp_linear_mixes,
+        )
+
+        return _tp_linear_mixes(self, x_flat, use_fp32=True)
+
+    def _pre_impl(self, x: torch.Tensor, dbg_tag=None):
+        # DeepGEMM and TileLang single-kernel PRE each have a graph replay
+        # determinism/parity gate. Keep every other/default backend on the
+        # validated FP32 reference path during capture.
+        pre_backend = os.environ.get("DSV4_MHC_PRE_GEMM_BACKEND", "").strip().lower()
+        graph_safe_backends = {"tilelang_single", "deepgemm"}
+        capture_uses_fallback = pre_backend not in graph_safe_backends
+        if (
+            x.is_cuda
+            and torch.cuda.is_current_stream_capturing()
+            and capture_uses_fallback
+        ):
+            from rtp_llm.models_py.modules.dsv4.hc.fallback_impl import (
+                FallbackHCUnit,
+            )
+
+            return FallbackHCUnit._pre_impl(self, x, dbg_tag=dbg_tag)
+        return super()._pre_impl(x, dbg_tag=dbg_tag)
+
+    def _post_impl(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor,
+        post: torch.Tensor,
+        comb: torch.Tensor,
+    ) -> torch.Tensor:
+        # The PPU production path may opt into the separately gated TileLang
+        # POST kernel. Its explicit PDL launch hint must also be disabled on
+        # M890P (DSV4_MHC_POST_PDL=0); all other values preserve the validated
+        # FP32 reference implementation.
+        post_backend = os.environ.get("DSV4_MHC_POST_BACKEND", "").strip().lower()
+        if post_backend == "tilelang":
+            return super()._post_impl(x, residual, post, comb)
+
+        from rtp_llm.models_py.modules.dsv4.hc.fallback_impl import FallbackHCUnit
+
+        return FallbackHCUnit._post_impl(self, x, residual, post, comb)
 
 
 class TileLangHCHead(HCHeadBase):

@@ -126,11 +126,19 @@ def mhc_pre_big_fuse(
         num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
     )
 
+    # The PPU DeepGEMM implementation performs its split-K reduction inside
+    # HcPrenormGemm and writes a single reduced plane. Its current ABI accepts
+    # [1, M, N] / [1, M], unlike the old exposed-partials caller contract.
+    output_splits = 1 if backend in ("deepgemm", "tilelang_single") else n_splits
     gemm_out_mul = torch.empty(
-        n_splits, num_tokens, mhc_mult3, dtype=torch.float32, device=residual.device
+        output_splits,
+        num_tokens,
+        mhc_mult3,
+        dtype=torch.float32,
+        device=residual.device,
     )
     gemm_out_sqrsum = torch.empty(
-        n_splits, num_tokens, dtype=torch.float32, device=residual.device
+        output_splits, num_tokens, dtype=torch.float32, device=residual.device
     )
     if backend == "deepgemm":
         _run_deepgemm_splitk_gemm(
@@ -140,6 +148,8 @@ def mhc_pre_big_fuse(
             gemm_out_sqrsum,
             n_splits,
         )
+        # DeepGEMM has already reduced all internal split-K partials.
+        n_splits = 1
     elif backend == "tilelang_single":
         n_splits = _run_tilelang_single_gemm(
             residual_flat,
@@ -171,6 +181,8 @@ def mhc_pre_big_fuse(
         sinkhorn_repeat,
         n_splits=n_splits,
         mhc_mult=mhc_mult,
+        stabilize_mixes=backend == "deepgemm",
+        stabilize_comb=backend == "deepgemm",
     )(
         gemm_out_mul,
         gemm_out_sqrsum,

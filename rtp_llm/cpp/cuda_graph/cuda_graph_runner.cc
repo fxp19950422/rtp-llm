@@ -4,9 +4,11 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <string>
 #include <c10/core/InferenceMode.h>
 #include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
+#include "rtp_llm/cpp/cuda_graph/cuda_graph_metadata_utils.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
 #include "torch/csrc/autograd/generated/variable_factories.h"
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
@@ -616,6 +618,8 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
         }
     }
 
+    bool fill_padded_cu_kv_tail = false;
+
     // Prefill attention consumes cumulative Q/KV lengths. Target verify uses the
     // same attention path even though it is replayed by the decode graph runner;
     // it is covered by num_tokens_per_bs_ > 1 (a verify step always scores
@@ -636,17 +640,14 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
             .slice(0, state.current_batch_size, selected_graph_batch_size)
             .fill_(0);
 
-        const int last_valid_q  = is_prefill_cuda_graph_mode_ ? state.current_seq_len : state.seq_len_sum;
-        const int last_valid_kv = inputs.attention_inputs.context_total_kv_length;
+        const int last_valid_q = is_prefill_cuda_graph_mode_ ? state.current_seq_len : state.seq_len_sum;
         py_model_inputs_.attention_inputs.cu_seqlens
             .slice(0, state.current_batch_size + 1, selected_graph_batch_size + 1)
             .fill_(last_valid_q);
         py_model_inputs_.attention_inputs.cu_seqlens_device
             .slice(0, state.current_batch_size + 1, selected_graph_batch_size + 1)
             .fill_(last_valid_q);
-        py_model_inputs_.attention_inputs.cu_kv_seqlens_device
-            .slice(0, state.current_batch_size + 1, selected_graph_batch_size + 1)
-            .fill_(last_valid_kv);
+        fill_padded_cu_kv_tail = true;
     }
 
     // launch prepare_cuda_graph when attention inputs are ready.
@@ -662,6 +663,24 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
             // values instead of the previous step's.
             RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareAttentionInputs(wait_host_mirror_d2h)");
             cuda_graph::graphGetCurrentStream().synchronize();
+        }
+        if (fill_padded_cu_kv_tail) {
+            // The active input/prefix rows above now live in the graph's pinned
+            // host mirrors for both the legacy H2H path and the device-metadata
+            // D2H path. Derive the last valid cumulative KV offset here instead
+            // of forcing an earlier CUDA sum().item() in PyWrappedModel.
+            const auto* input_lengths =
+                py_model_inputs_.attention_inputs.input_lengths.data_ptr<int32_t>();
+            const auto* prefix_lengths =
+                py_model_inputs_.attention_inputs.prefix_lengths.data_ptr<int32_t>();
+            const int64_t last_valid_kv =
+                sumActiveKvLengths(input_lengths, prefix_lengths, state.current_batch_size);
+            RTP_LLM_CHECK_WITH_INFO(last_valid_kv >= 0 && last_valid_kv <= std::numeric_limits<int32_t>::max(),
+                                    "CUDA graph cumulative KV length out of int32 range: %ld",
+                                    last_valid_kv);
+            py_model_inputs_.attention_inputs.cu_kv_seqlens_device
+                .slice(0, state.current_batch_size + 1, selected_graph_batch_size + 1)
+                .fill_(static_cast<int32_t>(last_valid_kv));
         }
         py::gil_scoped_acquire gil;
         callPrepareCudaGraph(attn_pyobj, py_model_inputs_);

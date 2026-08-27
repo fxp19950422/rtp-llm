@@ -680,16 +680,33 @@ class IndexerFP8(PoolBackedModule):
                 if self._kv_pool_view.dim() == 3
                 else self._kv_pool_view
             )
-            logits = fp8_paged_indexer_score(
-                q_fp8,
-                w_fold.view(bsz * q_len, self.n_heads),
-                pool_2d,
-                bt_i32,
-                ctx_lens_2d,
-                block_size=self._kv_eb,
-                max_ctx_len=T_max,
-            )  # [B*q_len, T_max] fp32
-            score = logits.view(bsz, q_len, T_max)
+            # PPU DeepGEMM's paged MQA kernel accepts next_n in {1, 2}.
+            # Speculative verify uses q_len=gen_num_per_cycle+1 (four for
+            # the SGLang-parity MTP3 configuration), so execute static
+            # two-token slices and concatenate their logits. The loop bounds
+            # are shape constants during CUDA Graph capture.
+            w_fold_3d = w_fold.view(bsz, q_len, self.n_heads)
+            score_parts = []
+            for q_start in range(0, q_len, 2):
+                q_end = min(q_start + 2, q_len)
+                q_part = q_fp8[:, q_start:q_end].contiguous()
+                w_part = w_fold_3d[:, q_start:q_end].contiguous().view(
+                    bsz * (q_end - q_start), self.n_heads
+                )
+                ctx_part = ctx_lens_2d[:, q_start:q_end].contiguous()
+                logits_part = fp8_paged_indexer_score(
+                    q_part,
+                    w_part,
+                    pool_2d,
+                    bt_i32,
+                    ctx_part,
+                    block_size=self._kv_eb,
+                    max_ctx_len=T_max,
+                )
+                score_parts.append(
+                    logits_part.view(bsz, q_end - q_start, T_max)
+                )
+            score = torch.cat(score_parts, dim=1)
 
             # Flash and Pro share this FP8 indexer. Decode and target verify
             # both flatten [B, q_len, T] into rows consumed by the selected

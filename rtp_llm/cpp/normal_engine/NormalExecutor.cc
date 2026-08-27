@@ -205,6 +205,13 @@ NormalExecutor::NormalExecutor(const EngineInitParams&                params,
     cudaProfilerBegin();
 }
 
+void NormalExecutor::synchronizeBeforeSchedule() {
+    if (useStreamAsync() && !useDropBroadSync()) {
+        RTP_LLM_PROFILE_SCOPE("executor.sync_before_schedule");
+        dispatch_runner_.sync(cuda_graph::graphGetCurrentStream());
+    }
+}
+
 absl::Status NormalExecutor::process(const std::list<GenerateStreamPtr>& streams, int64_t schedule_time_us) {
     const int64_t process_start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
     if (schedule_time_us <= 0) {

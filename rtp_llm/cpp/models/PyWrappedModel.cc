@@ -612,17 +612,14 @@ torch_ext::PyAttentionInputs PyWrappedModel::buildPyAttentionInputs(const GptMod
 
     if (context_batch_size > 0 && py_attn_inputs.input_lengths.is_cuda()) {
         py_attn_inputs.total_tokens = inputs.combo_tokens.defined() ? static_cast<int>(inputs.combo_tokens.numel()) : 0;
-        // Must match cu_kv_seqlens_device's definition (input_lengths +
-        // prefix_lengths): the CUDA graph padding fill copies this scalar into
-        // the cu_kv_seqlens tail, and a prefix-less value makes the array
-        // non-monotonic whenever prefix reuse / target verify is active.
-        // prefix_lengths here is a source tensor (never a deferred H2D copy),
-        // so summing it is safe; item() adds one stream sync on this path.
-        int64_t prefix_sum = 0;
-        if (py_attn_inputs.prefix_lengths.defined() && py_attn_inputs.prefix_lengths.numel() > 0) {
-            prefix_sum = py_attn_inputs.prefix_lengths.sum().item<int64_t>();
-        }
-        py_attn_inputs.context_total_kv_length = py_attn_inputs.total_tokens + static_cast<int>(prefix_sum);
+        // Do not reduce CUDA prefix_lengths to a host scalar here. In MTP
+        // draft-prefill this item() used to synchronize the entire preceding
+        // model forward once per speculative round. The graph runner already
+        // mirrors input/prefix lengths to pinned host storage for planning and
+        // derives the padded cu_kv_seqlens tail from that mirror after its
+        // mandatory D2H fence. Non-graph consumers use cu_kv_seqlens_device
+        // directly, so no eager host scalar is required on this path.
+        py_attn_inputs.context_total_kv_length = 0;
         py_attn_inputs.cu_seqlens              = torch::empty({0}, host_i32);
         py_attn_inputs.cu_seqlens_device       = torch::empty({batch_size + 1}, cuda_i32);
         py_attn_inputs.cu_kv_seqlens_device    = torch::empty({batch_size + 1}, cuda_i32);

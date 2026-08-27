@@ -59,6 +59,9 @@ private:
     std::shared_ptr<GenerateInput>  makeFakeInput(size_t seq_len);
     size_t                          getWarmUpInputLength() const;
     void                            mayAddFakeStream(std::list<GenerateStreamPtr>& streams);
+    static bool                     shouldPadEpDecodeBatch(size_t scheduled_streams,
+                                                           size_t min_real_batch,
+                                                           bool&  high_load_latched);
 
     void initExecutor(const EngineInitParams& params, std::unique_ptr<ProposeModelEngineInitParams>& propose_params);
 
@@ -85,6 +88,10 @@ private:
     std::unique_ptr<ProposeModelEngineInitParams> propose_params_;
     StepWindowProfiler                            step_profiler_;
     int                                           reserve_step_ = 0;
+    // Keep the outer EP Decode shape fixed after this worker first enters the
+    // configured high-load regime. The scheduler can temporarily return few
+    // or no streams while PD KV-transfer tasks remain KV_ALLOCATED.
+    bool                                          ep_decode_high_load_latched_ = false;
 };
 
 }  // namespace rtp_llm

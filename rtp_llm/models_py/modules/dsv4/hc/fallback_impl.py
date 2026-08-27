@@ -27,7 +27,9 @@ def _tp_linear_mixes(
         # replicated after the embedding gather and output all-reduce.
         rsqrt = torch.rsqrt(
             x_flat.float().square().mean(-1, keepdim=True) + module.norm_eps
-        ).to(x_flat.dtype)
+        )
+        if not use_fp32:
+            rsqrt = rsqrt.to(x_flat.dtype)
         return (F.linear(linear_input, weight) * rsqrt).float()
     if tp_size == 1:
         raise ValueError(f"mHC input K={local_k} disagrees with weight K={global_k}")
@@ -118,7 +120,12 @@ class FallbackHCUnit(HCUnitBase):
         return self.fn_bf16
 
     def _linear_mixes(self, x_flat: torch.Tensor) -> torch.Tensor:
-        return _tp_linear_mixes(self, x_flat)
+        # This class is the numerical reference path.  Keep the mHC projection
+        # in FP32, matching DeepSeek-V4/SGLang's torch implementation
+        # (``F.linear(x.flatten(1).float(), hc_fn.float())``).  Casting both
+        # operands to BF16 here compounds the projection error twice per layer
+        # across the 43-layer model and materially changes greedy accuracy.
+        return _tp_linear_mixes(self, x_flat, use_fp32=True)
 
     def _pre_impl(self, x: torch.Tensor, dbg_tag=None):
         shape, dtype = x.size(), x.dtype
@@ -152,13 +159,20 @@ class FallbackHCUnit(HCUnitBase):
         if x_flat.dim() == 2 and T > chunk:
             x_view = x.view(*shape)
             y = torch.empty((T, shape[-1]), dtype=dtype, device=x.device)
-            pre_dt = pre.to(dtype)
             for s in range(0, T, chunk):
                 e = min(s + chunk, T)
-                y[s:e] = torch.sum(pre_dt[s:e].unsqueeze(-1) * x_view[s:e], dim=-2)
+                # Match SGLang/Transformers mHC: the mixer and residual are
+                # accumulated in FP32, then the collapsed stream is written
+                # back in the model dtype.  Casting ``pre`` to BF16 before the
+                # reduction compounds error at every HC boundary.
+                y[s:e] = torch.sum(
+                    pre[s:e].unsqueeze(-1) * x_view[s:e].float(), dim=-2
+                ).to(dtype)
             y = y.view(*shape[:-2], shape[-1])
         else:
-            y = torch.sum(pre.to(dtype).unsqueeze(-1) * x.view(*shape), dim=-2)
+            y = torch.sum(
+                pre.unsqueeze(-1) * x.view(*shape).float(), dim=-2
+            ).to(dtype)
         return y.to(dtype), post.unsqueeze(-1), comb
 
     def _post_impl(
@@ -183,17 +197,15 @@ class FallbackHCUnit(HCUnitBase):
             else int(torch.tensor(residual.shape[:-2]).prod().item())
         )
         chunk = _hc_fallback_chunk_tokens()
-        bf16_path = x.dtype == torch.bfloat16 and residual.dtype == torch.bfloat16
-
         def _compose_chunk(_x, _res, _post_b, _comb):
-            if bf16_path:
-                first = _post_b.to(x.dtype).unsqueeze(-1) * _x.unsqueeze(-2)
-                second = torch.matmul(_comb.to(x.dtype).transpose(-1, -2), _res)
-                return (first + second).to(x.dtype)
-            y = _post_b.unsqueeze(-1) * _x.unsqueeze(-2) + torch.matmul(
-                _comb.transpose(-1, -2), _res
+            # SGLang's TileLang mHC post kernel loads BF16 x/residual into
+            # FP32 fragments and performs both products plus the HC reduction
+            # in FP32.  Preserve that contract in the reference fallback.
+            y = torch.matmul(
+                _comb.float().transpose(-1, -2), _res.float()
             )
-            return y.type_as(x)
+            y.add_(_post_b.float().unsqueeze(-1) * _x.float().unsqueeze(-2))
+            return y.to(x.dtype)
 
         if residual.dim() == 3 and T > chunk:
             out = torch.empty(residual.shape, dtype=x.dtype, device=x.device)

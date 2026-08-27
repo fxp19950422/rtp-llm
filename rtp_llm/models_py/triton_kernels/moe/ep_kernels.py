@@ -246,26 +246,31 @@ def _fwd_kernel_ep_scatter_2_v2(
             if expert_id >= 0 and expert_id < num_experts:
                 dest_token_index_int32 = tl.atomic_add(expert_start_loc + expert_id, 1)
                 dest_token_index = dest_token_index_int32.to(tl.int64)
-                tl.store(
-                    output_index + token_id * output_index_stride0 + topk_index,
-                    dest_token_index_int32,
-                )
-                output_tensor_ptr = (
-                    output_tensor + dest_token_index * output_tensor_stride0
-                )
-                token_idx = dest_token_index % alignment
-                expert_id_i64 = expert_id.to(tl.int64)
-                output_tensor_scale_ptr = (
-                    output_tensor_scale
-                    + expert_id_i64 * output_tensor_scale_stride0
-                    + token_idx * output_tensor_scale_stride1
-                )
-                tl.store(output_tensor_ptr + offset_in, to_copy, mask=mask)
-                tl.store(
-                    output_tensor_scale_ptr + index_in_s * output_tensor_scale_stride2,
-                    to_copy_s,
-                    mask=mask_s,
-                )
+                token_idx = dest_token_index - expert_id.to(tl.int64) * alignment
+                # A graph warmup can route every synthetic token to one
+                # expert. Keep fixed-capacity buffers memory-safe; callers
+                # initialize output_index to -1, so dropped overflow routes
+                # contribute zero in ep_gather.
+                if token_idx < alignment:
+                    tl.store(
+                        output_index + token_id * output_index_stride0 + topk_index,
+                        dest_token_index_int32,
+                    )
+                    output_tensor_ptr = (
+                        output_tensor + dest_token_index * output_tensor_stride0
+                    )
+                    expert_id_i64 = expert_id.to(tl.int64)
+                    output_tensor_scale_ptr = (
+                        output_tensor_scale
+                        + expert_id_i64 * output_tensor_scale_stride0
+                        + token_idx * output_tensor_scale_stride1
+                    )
+                    tl.store(output_tensor_ptr + offset_in, to_copy, mask=mask)
+                    tl.store(
+                        output_tensor_scale_ptr + index_in_s * output_tensor_scale_stride2,
+                        to_copy_s,
+                        mask=mask_s,
+                    )
 
 
 @torch.no_grad()

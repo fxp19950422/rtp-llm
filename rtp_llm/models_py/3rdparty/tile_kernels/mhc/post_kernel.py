@@ -1,4 +1,5 @@
 import math
+import os
 
 import tilelang
 import torch
@@ -41,7 +42,11 @@ def _mhc_post_fwd(
             c_local = T.alloc_fragment(mhc, T.float32)
             T.copy(a[pid_n, 0, 0], a_local)
             T.copy(c[pid_n, 0], c_local)
-            T.pdl_sync()
+            # M890P's TileLang lowering rejects kernels containing explicit
+            # PDL. Keep the upstream behavior by default and allow the PPU
+            # serving path to disable only this optional launch hint.
+            if os.environ.get("DSV4_MHC_POST_PDL", "1") != "0":
+                T.pdl_sync()
 
             for i0_h in T.Pipelined(T.ceildiv(h, h_blk), num_stages=2):
                 T.copy(b[pid_n, 0, i0_h * h_blk], b_shared, disable_tma=True)

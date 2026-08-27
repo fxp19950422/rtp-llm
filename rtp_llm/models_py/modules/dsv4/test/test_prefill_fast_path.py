@@ -107,6 +107,20 @@ class _FakeV4:
 
 
 class PrefillFastPathTest(unittest.TestCase):
+    def test_prefill_cu_seqlens_uses_populated_host_boundaries(self):
+        host = torch.tensor([0, 2, 5], dtype=torch.int32)
+        device = torch.tensor([0, 1, 5], dtype=torch.int32)
+        attn = SimpleNamespace(cu_seqlens=host, cu_seqlens_device=device)
+
+        self.assertIs(prefill_forward._resolve_prefill_cu_seqlens(attn), host)
+
+    def test_prefill_cu_seqlens_falls_back_to_device_boundaries(self):
+        host = torch.empty(0, dtype=torch.int32)
+        device = torch.tensor([0, 2, 5], dtype=torch.int32)
+        attn = SimpleNamespace(cu_seqlens=host, cu_seqlens_device=device)
+
+        self.assertIs(prefill_forward._resolve_prefill_cu_seqlens(attn), device)
+
     def test_disable_record_function_ranges_is_scoped(self):
         calls = []
 
