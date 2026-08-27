@@ -45,19 +45,18 @@ def _load_helpers():
     return tree, namespace
 
 
-def _cfg(*, tp_size=4, ep_size=1, inter=2048, experts=256):
+def _cfg(*, tp_size=4, ep_size=1, inter=2048, experts=256, dim=7168):
     return SimpleNamespace(
         tp_size=tp_size,
         ep_size=ep_size,
-        dim=7168,
+        dim=dim,
         moe_inter_dim=inter,
         n_local_experts=experts,
         n_routed_experts=experts,
     )
 
 
-def _shapes(inter_local: int, experts: int = 256):
-    dim = 7168
+def _shapes(inter_local: int, experts: int = 256, dim: int = 7168):
     w1 = (experts, inter_local, dim // 2)
     w2 = (experts, dim, inter_local // 2)
     s1 = (experts, inter_local, dim // 32)
@@ -170,6 +169,15 @@ class PpuGroupedFP4SourceContractTest(unittest.TestCase):
             derive(_cfg(), *bad)
         with self.assertRaises(RuntimeError):
             derive(_cfg(tp_size=1), *_shapes(2048))
+
+    def test_hidden_dim_requires_ep_scatter_scale_block_alignment(self):
+        derive = self.helpers["_derive_inter_local_and_tp"]
+
+        with self.assertRaisesRegex(ValueError, "dim aligned to 128"):
+            derive(_cfg(dim=64, inter=256), *_shapes(64, dim=64))
+
+        inter_local, routed_tp = derive(_cfg(dim=7168), *_shapes(512, dim=7168))
+        self.assertEqual((inter_local, routed_tp), (512, 4))
 
     def test_capacity_is_lossless_aligned_and_graph_fails_closed(self):
         select = self.helpers["_select_capacity"]

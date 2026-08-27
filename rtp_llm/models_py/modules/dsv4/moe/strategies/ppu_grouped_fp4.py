@@ -73,10 +73,15 @@ def _derive_inter_local_and_tp(
     if len(w1_shape) != 3:
         raise ValueError(f"packed MXFP4 w1 must be rank 3, got {w1_shape}")
     inter_local = int(w1_shape[1])
-    if dim <= 0 or inter_local <= 0 or dim % 64 or inter_local % 64:
+    if dim <= 0 or dim % 128:
         raise ValueError(
-            "PPU grouped MXFP4 requires positive dim/inter_local aligned to 64, "
-            f"got dim={dim}, inter_local={inter_local}"
+            "PPU grouped MXFP4 requires positive dim aligned to 128 for "
+            f"ep_scatter_v2 hidden scales, got dim={dim}"
+        )
+    if inter_local <= 0 or inter_local % 64:
+        raise ValueError(
+            "PPU grouped MXFP4 requires positive inter_local aligned to 64, "
+            f"got inter_local={inter_local}"
         )
 
     expected_w1 = (experts, inter_local, dim // 2)
