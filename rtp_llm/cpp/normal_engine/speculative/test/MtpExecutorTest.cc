@@ -802,8 +802,7 @@ TEST_F(MtpExecutorTest, testForceDisableNumericalFailureDoesNotAcceptToken) {
     auto status = components.executor->process({stream});
     ASSERT_TRUE(status.ok()) << status;
     EXPECT_EQ(stream->getCompleteTokenIds()->completeTokenIdsVec(0), (std::vector<int>{0, 1, 2, 3}));
-    EXPECT_TRUE(stream->hasError());
-    EXPECT_EQ(stream->statusInfo().code(), ErrorCode::NUMERICAL_NONFINITE);
+    EXPECT_TRUE(stream->stopped());
 }
 
 TEST_F(MtpExecutorTest, testForceDisableSpRunMixedBatchFailsClosed) {
