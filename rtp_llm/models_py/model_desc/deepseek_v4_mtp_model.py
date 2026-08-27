@@ -185,11 +185,13 @@ class DeepSeekV4MtpModel(DeepSeekV4Model):
             # fusion norms/projections consume the global hidden dimension,
             # so use the transformer's TP-aware embedding accessor.
             embed_chunk = self.v4._embed(input_ids_chunk)
+            # TP all-gather may expose the global hidden tensor as a strided
+            # view; the PPU RMSNorm kernel requires a contiguous input.
             embed_chunk = torch.where(
                 positions_chunk.reshape(-1, 1) == 0,
                 torch.zeros_like(embed_chunk),
                 embed_chunk,
-            )
+            ).contiguous()
             e_norm = self.enorm(embed_chunk)
             pre_hc_chunk = pre_hc[start:end]
             chunk_len = int(pre_hc_chunk.size(0))
@@ -221,11 +223,13 @@ class DeepSeekV4MtpModel(DeepSeekV4Model):
         inputs_embeds = self.v4._embed(input_ids)  # [T, dim]
         # Suppress position-0 embedding (matches main-model "step 0 of a
         # brand-new request" behavior the official MTP impl relies on).
+        # TP all-gather may expose the global hidden tensor as a strided view;
+        # normalize only after materializing the kernel's layout contract.
         inputs_embeds = torch.where(
             positions.reshape(-1, 1) == 0,
             torch.zeros_like(inputs_embeds),
             inputs_embeds,
-        )
+        ).contiguous()
         e_norm = self.enorm(inputs_embeds)  # [T, dim]
         h_norm = self.hnorm(pre_hc.reshape(-1, dim)).view(T, hc, dim)
         return self._apply_proj(self.h_proj, h_norm) + self._apply_proj(
