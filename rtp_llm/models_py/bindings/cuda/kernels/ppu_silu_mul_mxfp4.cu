@@ -429,6 +429,8 @@ void dispatchBlock(const __nv_bfloat16* input,
 #undef RTP_DISPATCH_PPU_BLOCK
 }
 
+}  // namespace
+
 void invokePpuSiluMulMxfp4(const void* input,
                            uint8_t* output,
                            uint8_t* scale,
