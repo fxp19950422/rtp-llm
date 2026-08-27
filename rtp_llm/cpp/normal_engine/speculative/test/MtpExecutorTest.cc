@@ -742,8 +742,7 @@ TEST_F(MtpExecutorTest, testForceDisableSpRunUsesTargetOnlyNormalPath) {
     target_input.prefix_lengths    = torch::tensor({0}, torch::kInt32);
     target_input.lm_output_indexes = torch::tensor({3}, torch::kInt32);
     GptModelOutputs target_output;
-    target_output.logits =
-        torch::tensor({0.1f, 0.2f, 0.3f, 0.4f}, torch::TensorOptions().device(torch::kCUDA)).reshape({1, 4});
+    target_output.logits = torch::tensor({0.1f, 0.2f, 0.3f, 0.4f}).reshape({1, 4});
     components.fake_target_model->setInputs({target_input});
     components.fake_target_model->setOutputs({target_output});
 
@@ -782,7 +781,8 @@ TEST_F(MtpExecutorTest, testForceDisableNumericalFailureDoesNotAcceptToken) {
     target_input.prefix_lengths    = torch::tensor({0}, torch::kInt32);
     target_input.lm_output_indexes = torch::tensor({3}, torch::kInt32);
     GptModelOutputs target_output;
-    target_output.logits = torch::tensor({0.1f, 0.2f, 0.3f, 0.4f}).reshape({1, 4});
+    target_output.logits =
+        torch::tensor({0.1f, 0.2f, 0.3f, 0.4f}, torch::TensorOptions().device(torch::kCUDA)).reshape({1, 4});
     target_output.numerical_status.values =
         torch::ones({1}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
     target_output.numerical_status.live_rows = 1;
