@@ -44,25 +44,6 @@ string makeRequestKey(const string& client_id, size_t request_id) {
 
 namespace rtp_llm {
 
-namespace model_rpc_internal {
-
-bool initializeDecodeRpcHandoff(bool  has_propose_params,
-                                bool  force_disable_sp_run,
-                                void* context,
-                                void (*mark_normal)(void*),
-                                void (*init_speculative)(void*)) {
-    RTP_LLM_CHECK_WITH_INFO(mark_normal != nullptr, "decode rpc normal handoff callback must be set");
-    RTP_LLM_CHECK_WITH_INFO(init_speculative != nullptr, "decode rpc speculative handoff callback must be set");
-    if (!has_propose_params || force_disable_sp_run) {
-        mark_normal(context);
-        return false;
-    }
-    init_speculative(context);
-    return true;
-}
-
-}  // namespace model_rpc_internal
-
 namespace {
 
 // gRPC delivers propose probs/hidden as pageable CPU tensors. Pinning them
@@ -303,13 +284,10 @@ void DecodeRpcServer::localGenerate(DecodeGenerateContext& decode_context) {
                                         .clone();
         generate_stream->setContextPositionIds(context_position_ids);
     }
-    const bool use_speculative_handoff = model_rpc_internal::initializeDecodeRpcHandoff(
-        propose_maga_init_params_ != nullptr,
-        generate_stream->forceDisableSpRun(),
-        generate_stream.get(),
-        [](void* context) { static_cast<GenerateStream*>(context)->markGrpcNormalDeviceStatePending(); },
-        [](void* context) { static_cast<GenerateStream*>(context)->initSpeculativeHandoffPositions(); });
-    if (use_speculative_handoff) {
+    if (!propose_maga_init_params_) {
+        generate_stream->markGrpcNormalDeviceStatePending();
+    }
+    if (propose_maga_init_params_) {
         // gRPC handler threads default to CUDA device 0; pin allocations below
         // to this worker's device so local_rank>0 workers don't place the MTP
         // device-state tensors on the wrong GPU.
@@ -333,6 +311,7 @@ void DecodeRpcServer::localGenerate(DecodeGenerateContext& decode_context) {
                                 "decode rpc speculative handoff has invalid proposal count=%zu for dspark=%d",
                                 propose_tokens.size(),
                                 static_cast<int>(engine_->isDSpark()));
+        generate_stream->initSpeculativeHandoffPositions();
         if (!propose_tokens.empty()) {
             generate_stream->setContainProposeToken(true);
             generate_stream->setProposeToken(propose_tokens);

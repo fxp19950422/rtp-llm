@@ -10,14 +10,6 @@
 
 namespace rtp_llm {
 
-namespace model_rpc_internal {
-void populatePrefillSpeculativeHandoff(GenerateRequestPB& generate_request,
-                                       GenerateStream*    stream,
-                                       bool               is_mtp_eagle,
-                                       bool               is_dspark,
-                                       bool               force_disable_sp_run);
-}
-
 class TestDecodeRpcService final: public RpcService::Service {
 public:
     explicit TestDecodeRpcService(bool fail_first_allocate): fail_first_allocate_(fail_first_allocate) {}
@@ -383,43 +375,6 @@ TEST_F(PrefillRpcServerTest, mtpPrefillPreservesRequestLevelSpeculativeDisable) 
     ASSERT_NE(context->generate_input, nullptr);
     EXPECT_TRUE(context->generate_input->generate_config->pd_separation);
     EXPECT_TRUE(context->generate_input->generate_config->force_disable_sp_run);
-}
-
-TEST_F(PrefillRpcServerTest, mtpPrefillPreservesRequestLevelSpeculativeEnable) {
-    GenerateInputPB request;
-    request.set_request_id(1);
-    request.add_token_ids(10);
-    request.mutable_generate_config()->set_force_disable_sp_run(false);
-    auto context = makeContext(&request);
-
-    TestPrefillRpcServer server;
-    server.setEngineForTest(/*is_mtp_eagle=*/true);
-    server.prepareGenerateInputForTest(*context);
-
-    ASSERT_NE(context->generate_input, nullptr);
-    EXPECT_TRUE(context->generate_input->generate_config->pd_separation);
-    EXPECT_FALSE(context->generate_input->generate_config->force_disable_sp_run);
-}
-
-TEST_F(PrefillRpcServerTest, disabledSpeculativeHandoffSendsEmptyProposalFields) {
-    GenerateRequestPB request;
-    request.add_propose_token_ids(11);
-    request.mutable_propose_probs()->add_shape(1);
-    request.mutable_propose_probs()->set_fp32_data("prob");
-    request.mutable_propose_hidden()->add_shape(1);
-    request.mutable_propose_hidden()->set_fp32_data("hidden");
-
-    model_rpc_internal::populatePrefillSpeculativeHandoff(request,
-                                                          /*stream=*/nullptr,
-                                                          /*is_mtp_eagle=*/true,
-                                                          /*is_dspark=*/false,
-                                                          /*force_disable_sp_run=*/true);
-
-    EXPECT_EQ(request.propose_token_ids_size(), 0);
-    EXPECT_EQ(request.propose_probs().shape_size(), 0);
-    EXPECT_EQ(request.propose_probs().fp32_data().size(), 0);
-    EXPECT_EQ(request.propose_hidden().shape_size(), 0);
-    EXPECT_EQ(request.propose_hidden().fp32_data().size(), 0);
 }
 
 TEST_F(PrefillRpcServerTest, multimodalProcessDoesNotMutateOriginalRequest) {

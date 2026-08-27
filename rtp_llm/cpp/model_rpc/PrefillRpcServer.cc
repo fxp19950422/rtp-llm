@@ -26,47 +26,6 @@ using grpc::ClientContext;
 
 namespace rtp_llm {
 
-namespace model_rpc_internal {
-
-void populatePrefillSpeculativeHandoff(GenerateRequestPB& generate_request,
-                                       GenerateStream*    stream,
-                                       bool               is_mtp_eagle,
-                                       bool               is_dspark,
-                                       bool               force_disable_sp_run) {
-    generate_request.clear_propose_token_ids();
-    generate_request.clear_propose_probs();
-    generate_request.clear_propose_hidden();
-    if (force_disable_sp_run) {
-        return;
-    }
-
-    RTP_LLM_CHECK_WITH_INFO(stream != nullptr, "prefill speculative handoff requires a generate stream");
-    if (is_mtp_eagle && !is_dspark) {
-        RTP_LLM_CHECK_WITH_INFO(stream->getProposeToken().size() > 0,
-                                "mtp remote generate propose token should not be empty");
-    }
-    generate_request.mutable_propose_token_ids()->CopyFrom(
-        {stream->getProposeToken().begin(), stream->getProposeToken().end()});
-
-    auto sp_output_buffer = stream->getSPOutputBuffer();
-    if (sp_output_buffer && !is_dspark) {
-        auto all_probs_cpu =
-            sp_output_buffer->all_probs.is_cuda() ? sp_output_buffer->all_probs.cpu() : sp_output_buffer->all_probs;
-        torch::Tensor hidden_states_cpu;
-        if (!sp_output_buffer->hidden_states.defined()) {
-            // dummy hidden states, so datatype is not important
-            hidden_states_cpu = torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat16));
-        } else {
-            hidden_states_cpu = sp_output_buffer->hidden_states.is_cuda() ? sp_output_buffer->hidden_states.cpu() :
-                                                                            sp_output_buffer->hidden_states;
-        }
-        QueryConverter::transTensorPB(generate_request.mutable_propose_probs(), all_probs_cpu);
-        QueryConverter::transTensorPB(generate_request.mutable_propose_hidden(), hidden_states_cpu);
-    }
-}
-
-}  // namespace model_rpc_internal
-
 namespace {
 
 bool envValueIsTrue(const char* value) {
@@ -529,11 +488,29 @@ void PrefillRpcServer::remoteGenerate(PrefillGenerateContext& prefill_context) {
             {context_position_ids.data_ptr<int32_t>(),
              context_position_ids.data_ptr<int32_t>() + context_position_ids.numel()});
     }
-    model_rpc_internal::populatePrefillSpeculativeHandoff(generate_request,
-                                                          stream.get(),
-                                                          engine_->isMTPEagle(),
-                                                          engine_->isDSpark(),
-                                                          stream->forceDisableSpRun());
+    if (engine_->isMTPEagle() && !engine_->isDSpark()) {
+        RTP_LLM_CHECK_WITH_INFO(stream->getProposeToken().size() > 0,
+                                "mtp remote generate propose token should not be empty");
+    }
+    generate_request.mutable_propose_token_ids()->CopyFrom(
+        {stream->getProposeToken().begin(), stream->getProposeToken().end()});
+
+    auto sp_output_buffer = stream->getSPOutputBuffer();
+
+    if (sp_output_buffer && !engine_->isDSpark()) {
+        auto all_probs_cpu =
+            sp_output_buffer->all_probs.is_cuda() ? sp_output_buffer->all_probs.cpu() : sp_output_buffer->all_probs;
+        torch::Tensor hidden_states_cpu;
+        if (!sp_output_buffer->hidden_states.defined()) {
+            // dummy hidden states, so datatype is not important
+            hidden_states_cpu = torch::empty({0}, torch::TensorOptions().dtype(torch::kFloat16));
+        } else {
+            hidden_states_cpu = sp_output_buffer->hidden_states.is_cuda() ? sp_output_buffer->hidden_states.cpu() :
+                                                                            sp_output_buffer->hidden_states;
+        }
+        QueryConverter::transTensorPB(generate_request.mutable_propose_probs(), all_probs_cpu);
+        QueryConverter::transTensorPB(generate_request.mutable_propose_hidden(), hidden_states_cpu);
+    }
 
     generate_request.set_stage(RemoteStage::GENERATE);
 
