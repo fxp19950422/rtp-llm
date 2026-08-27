@@ -170,7 +170,7 @@ class PpuGroupedFP4SourceContractTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             derive(_cfg(tp_size=1), *_shapes(2048))
 
-    def test_hidden_dim_rejects_ep_gather_incompatible_alignment(self):
+    def test_hidden_dim_rejects_exact_gather_incompatible_alignment(self):
         derive = self.helpers["_derive_inter_local_and_tp"]
 
         for dim in (64, 128, 384):
@@ -212,8 +212,8 @@ class PpuGroupedFP4SourceContractTest(unittest.TestCase):
             "m_grouped_gemm_fp4_fp4_bf16_nt_nopad",
             "compact_mxfp4_routes_nopad",
             "self.routed_tp_size = routed_tp_size",
-            "PPU rtp_llm_ops lacks ppu_silu_and_mul_post_quant_mxfp4",
-            "ppu_grouped_fp4 operators were not bound by setup",
+            "ppu_grouped_fp4 grouped GEMM was not bound by setup",
+            "gather_local_loop_compatible",
         )
         for fragment in required_fragments:
             self.assertIn(fragment, self.source)
@@ -250,19 +250,16 @@ class PpuGroupedFP4SourceContractTest(unittest.TestCase):
             "DSV4_PPU_GROUPED_OPERATOR_PATH",
             "strategy=ppu_grouped_fp4",
             "operator_module=%s",
-            "fused_module=%s",
-            "fused_mode=%s",
+            "activation_mode=%s",
+            "exact_gather=%s",
         ):
             self.assertIn(field, log_source)
 
         setup_source = ast.unparse(setup)
         self.assertIn("self._grouped_gemm = grouped_gemm", setup_source)
-        self.assertIn("self._fused_swiglu_quant = fused_swiglu_quant", setup_source)
+        self.assertNotIn("_fused_swiglu_quant", setup_source)
+        self.assertNotIn("rtp_llm_ops", setup_source)
         self.assertIn("_log_operator_path_once", setup_source)
-        self.assertLess(
-            setup_source.index("self._fused_swiglu_quant = fused_swiglu_quant"),
-            setup_source.index("_log_operator_path_once"),
-        )
 
         forward_source = ast.unparse(forward)
         self.assertNotIn("_log_operator_path_once", forward_source)
@@ -271,7 +268,7 @@ class PpuGroupedFP4SourceContractTest(unittest.TestCase):
         for host_sync in (".cpu()", ".tolist()", ".item()", "cuda.synchronize"):
             self.assertNotIn(host_sync, forward_source)
 
-    def test_forward_uses_single_fused_swiglu_quant_without_fallback(self) -> None:
+    def test_forward_uses_local_compatible_grouped_chain_without_fallback(self) -> None:
         tree = ast.parse(self.source)
         strategy = next(
             node
@@ -286,16 +283,18 @@ class PpuGroupedFP4SourceContractTest(unittest.TestCase):
         )
         calls = [node for node in ast.walk(forward) if isinstance(node, ast.Call)]
 
-        fused_calls = [
+        split_require_calls = [
             node
             for node in calls
-            if isinstance(node.func, ast.Attribute)
-            and node.func.attr == "_fused_swiglu_quant"
+            if isinstance(node.func, ast.Name)
+            and node.func.id == "require_silu_mul_split"
         ]
-        self.assertEqual(len(fused_calls), 1)
-        self.assertEqual(ast.unparse(fused_calls[0].args[0]), "gate_up")
-        self.assertEqual(ast.unparse(fused_calls[0].args[1]), "limit")
-        self.assertNotIn("require_silu_mul_split", ast.unparse(forward))
+        self.assertEqual(len(split_require_calls), 1)
+        forward_source = ast.unparse(forward)
+        self.assertIn("gate_up[:, :self.inter_local].float().contiguous()", forward_source)
+        self.assertIn("gate_up[:, self.inter_local:].float().contiguous()", forward_source)
+        self.assertIn(".to(torch.bfloat16).contiguous()", forward_source)
+        self.assertNotIn("_fused_swiglu_quant", forward_source)
 
         downcast_calls = [
             node
@@ -303,8 +302,9 @@ class PpuGroupedFP4SourceContractTest(unittest.TestCase):
             if isinstance(node.func, ast.Name)
             and node.func.id == "downcast_to_mxfp4"
         ]
-        self.assertEqual(len(downcast_calls), 1)
+        self.assertEqual(len(downcast_calls), 2)
         self.assertEqual(ast.unparse(downcast_calls[0].args[0]), "x.contiguous()")
+        self.assertEqual(ast.unparse(downcast_calls[1].args[0]), "hidden")
 
         grouped_calls = [
             node
@@ -317,14 +317,15 @@ class PpuGroupedFP4SourceContractTest(unittest.TestCase):
         self.assertIn("self._ppu_w2", ast.unparse(grouped_calls[1]))
         self.assertIn("(hidden_fp4, hidden_scale)", ast.unparse(grouped_calls[1]))
 
-        gather_calls = [
+        exact_gather_calls = [
             node
             for node in calls
-            if isinstance(node.func, ast.Name) and node.func.id == "ep_gather"
+            if isinstance(node.func, ast.Name)
+            and node.func.id == "gather_local_loop_compatible"
         ]
-        self.assertEqual(len(gather_calls), 1)
+        self.assertEqual(len(exact_gather_calls), 1)
         self.assertEqual(
-            [ast.unparse(arg) for arg in gather_calls[0].args],
+            [ast.unparse(arg) for arg in exact_gather_calls[0].args],
             [
                 "down",
                 "adjusted_ids",
@@ -333,10 +334,9 @@ class PpuGroupedFP4SourceContractTest(unittest.TestCase):
                 "gathered",
             ],
         )
-        self.assertIn(
-            "limit = self.cfg.swiglu_limit if self.cfg.swiglu_limit > 0 else None",
-            ast.unparse(forward),
-        )
+        self.assertNotIn("ep_gather", forward_source)
+        self.assertNotIn("LocalLoopStrategy", forward_source)
+        self.assertNotIn("except", forward_source)
 
 
 if __name__ == "__main__":
