@@ -3,9 +3,12 @@
 import ast
 import math
 from pathlib import Path
+import sys
 from types import SimpleNamespace
+from types import ModuleType
 from typing import Sequence, Tuple
 import unittest
+from unittest.mock import patch
 
 
 _SOURCE_PATH = (
@@ -20,6 +23,7 @@ def _load_helpers():
     tree = ast.parse(_SOURCE_PATH.read_text())
     wanted = {
         "_supports_topology",
+        "_runtime_eligible",
         "_derive_inter_local_and_tp",
         "_select_capacity",
     }
@@ -33,6 +37,7 @@ def _load_helpers():
         "Sequence": Sequence,
         "Tuple": Tuple,
         "MoeCfg": object,
+        "torch": SimpleNamespace(),
         "_GROUPED_M_ALIGNMENT": 128,
     }
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(_SOURCE_PATH), "exec"), namespace)
@@ -91,6 +96,52 @@ class PpuGroupedFP4SourceContractTest(unittest.TestCase):
             if isinstance(node, ast.FunctionDef) and node.name == "can_handle"
         )
         self.assertIn("_supports_topology(cfg)", ast.unparse(can_handle))
+        self.assertIn("_runtime_eligible()", ast.unparse(can_handle))
+
+    def test_runtime_eligibility_rejects_generic_gpu_and_missing_symbol(self):
+        runtime_eligible = self.helpers["_runtime_eligible"]
+
+        class FakeCuda:
+            def __init__(self, *, available, name):
+                self.available = available
+                self.name = name
+
+            def is_available(self):
+                return self.available
+
+            def current_device(self):
+                return 0
+
+            def get_device_name(self, device):
+                self.test_case.assertEqual(device, 0)
+                return self.name
+
+        def set_cuda(*, available, name):
+            cuda = FakeCuda(available=available, name=name)
+            cuda.test_case = self
+            self.helpers["torch"] = SimpleNamespace(cuda=cuda)
+
+        deep_gemm = ModuleType("deep_gemm")
+        deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked = lambda *args: None
+
+        set_cuda(available=False, name="ZW-M890P")
+        with patch.dict(sys.modules, {"deep_gemm": deep_gemm}):
+            self.assertFalse(runtime_eligible())
+
+        set_cuda(available=True, name="NVIDIA H100")
+        with patch.dict(sys.modules, {"deep_gemm": deep_gemm}):
+            self.assertFalse(runtime_eligible())
+
+        set_cuda(available=True, name="ZW-M890P")
+        with patch.dict(sys.modules, {"deep_gemm": deep_gemm}):
+            self.assertTrue(runtime_eligible())
+
+        missing_symbol = ModuleType("deep_gemm")
+        with patch.dict(sys.modules, {"deep_gemm": missing_symbol}):
+            self.assertFalse(runtime_eligible())
+
+        with patch.dict(sys.modules, {"deep_gemm": None}):
+            self.assertFalse(runtime_eligible())
 
     def test_packed_geometry_detects_pure_tp_preshard(self):
         derive = self.helpers["_derive_inter_local_and_tp"]
@@ -151,7 +202,6 @@ class PpuGroupedFP4SourceContractTest(unittest.TestCase):
         )
         for fragment in required_fragments:
             self.assertIn(fragment, self.source)
-        self.assertNotIn("except ImportError", self.source)
         self.assertNotIn("except Exception", self.source)
 
 

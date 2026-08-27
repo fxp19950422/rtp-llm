@@ -31,6 +31,23 @@ def _supports_topology(cfg: MoeCfg) -> bool:
     return int(cfg.tp_size) == 4 and int(cfg.ep_size) == 1
 
 
+def _runtime_eligible() -> bool:
+    """Probe the PPU-only leaf without making generic GPU TP4 select it."""
+
+    if not torch.cuda.is_available():
+        return False
+    try:
+        current_device = torch.cuda.current_device()
+        if torch.cuda.get_device_name(current_device) != "ZW-M890P":
+            return False
+        import deep_gemm
+    except (ImportError, RuntimeError):
+        return False
+    return callable(
+        getattr(deep_gemm, "m_grouped_gemm_fp4_fp4_bf16_nt_masked", None)
+    )
+
+
 def _derive_inter_local_and_tp(
     cfg: MoeCfg,
     w1_shape: Tuple[int, ...],
@@ -155,7 +172,7 @@ class PpuGroupedFP4Strategy(RoutedExpertsStrategy):
 
     @classmethod
     def can_handle(cls, cfg: MoeCfg) -> bool:
-        return _supports_topology(cfg)
+        return _supports_topology(cfg) and _runtime_eligible()
 
     def setup_weights(self, layer_weights: Dict) -> None:
         """Bind packed routed tensors and prepare their PPU scale layout once."""
