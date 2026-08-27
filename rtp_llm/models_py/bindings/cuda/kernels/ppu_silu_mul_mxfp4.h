@@ -17,4 +17,3 @@ void invokePpuSiluMulMxfp4(const void* input,
                            float swiglu_limit,
                            cudaStream_t stream);
 }  // namespace rtp_llm
-

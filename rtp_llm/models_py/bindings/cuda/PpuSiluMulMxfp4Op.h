@@ -8,4 +8,3 @@ std::tuple<torch::Tensor, torch::Tensor> PpuSiluAndMulPostQuantMxfp4(
     torch::Tensor gate_up, double swiglu_limit, bool apply_swiglu_limit);
 }  // namespace rtp_llm
 #endif
-

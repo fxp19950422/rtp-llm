@@ -10,4 +10,3 @@ Upstream project: https://github.com/sgl-project/sglang
 Upstream license: Apache License 2.0
 Local modifications: removed the TVM/JIT wrapper, retained the PPU device
 algorithm, and exposed an RTP-LLM AOT launcher using the caller's current stream.
-
