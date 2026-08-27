@@ -50,8 +50,11 @@ class PpuSiluMulMxfp4SourceTest(unittest.TestCase):
     def test_layout_contract(self):
         op = OP.read_text()
         for token in ("torch::kBFloat16", "torch::kUInt8", "torch::kUInt16",
-                      ".transpose(0, 1)", "hidden / 2", "(hidden + 31) / 32"):
+                      ".transpose(0, 1)", "hidden / 2", "(hidden + 63) / 64"):
             self.assertIn(token, op)
+        self.assertIn("hidden_padded / 64", op)
+        self.assertNotIn("(hidden + 31) / 32", op)
+        self.assertNotIn("hidden_padded / 32", op)
 
     def test_no_consumer_dependency(self):
         self.assertNotIn("ppu_grouped_fp4", KERNEL.read_text() + OP.read_text())

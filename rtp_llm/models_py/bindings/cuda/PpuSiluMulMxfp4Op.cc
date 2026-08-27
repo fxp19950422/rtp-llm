@@ -22,8 +22,8 @@ std::tuple<torch::Tensor, torch::Tensor> PpuSiluAndMulPostQuantMxfp4(
                 "shape exceeds PPU launcher limits");
     const int block_n = hidden % 512 == 0 ? 512 : (hidden % 256 == 0 ? 256 : 128);
     const int64_t hidden_padded = (hidden + block_n - 1) / block_n * block_n;
-    const int64_t scale_alloc = hidden_padded / 32;
-    const int64_t scale_valid = (hidden + 31) / 32;
+    const int64_t scale_alloc = hidden_padded / 64;
+    const int64_t scale_valid = (hidden + 63) / 64;
     auto packed = torch::empty({num_tokens, hidden / 2},
                                gate_up.options().dtype(torch::kUInt8));
     auto scale_storage = torch::empty({scale_alloc, num_tokens},
