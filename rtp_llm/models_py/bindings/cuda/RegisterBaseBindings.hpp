@@ -72,11 +72,15 @@ void registerBasicCudaOps(py::module& rtp_ops_m) {
 
 #ifdef USE_PPU
     rtp_ops_m.def("ppu_silu_and_mul_post_quant_mxfp4",
-                  &rtp_llm::PpuSiluAndMulPostQuantMxfp4,
+                  [](torch::Tensor gate_up, py::object swiglu_limit) {
+                      const bool apply_swiglu_limit = !swiglu_limit.is_none();
+                      const double limit = apply_swiglu_limit ? swiglu_limit.cast<double>() : 0.0;
+                      return rtp_llm::PpuSiluAndMulPostQuantMxfp4(
+                          gate_up, limit, apply_swiglu_limit);
+                  },
                   "PPU fused SwiGLU and compact MXFP4 quantization",
                   py::arg("gate_up"),
-                  py::arg("swiglu_limit"),
-                  py::arg("apply_swiglu_limit"));
+                  py::arg("swiglu_limit") = py::none());
 #endif
 
     rtp_ops_m.def("fused_qk_rmsnorm",

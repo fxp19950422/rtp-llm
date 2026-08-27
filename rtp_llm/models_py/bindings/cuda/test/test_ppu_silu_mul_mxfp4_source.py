@@ -44,6 +44,11 @@ class PpuSiluMulMxfp4SourceTest(unittest.TestCase):
         self.assertIn("#ifdef USE_PPU", op)
         self.assertIn("#ifdef USE_PPU", register)
         self.assertIn("PpuSiluAndMulPostQuantMxfp4", register)
+        self.assertIn("py::object swiglu_limit", register)
+        self.assertIn("!swiglu_limit.is_none()", register)
+        self.assertIn("swiglu_limit.cast<double>()", register)
+        self.assertIn('py::arg("swiglu_limit") = py::none()', register)
+        self.assertNotIn('py::arg("apply_swiglu_limit")', register)
         self.assertIn('"@platforms//:incompatible"', kernel_build)
         self.assertNotIn("fallback", op.lower())
 
