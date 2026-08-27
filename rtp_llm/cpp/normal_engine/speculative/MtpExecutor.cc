@@ -2046,7 +2046,6 @@ absl::Status MtpExecutor::normalStep(const std::list<GenerateStreamPtr>& streams
     auto& executor_collector = metrics_collector.executor_collector;
     auto& tps_collector      = metrics_collector.tps_collector;
     StreamGroups stream_groups(streams);
-    prepareGrpcNormalDeviceStateShared(stream_groups, useDeviceInput(), role_type_);
     GptModelInputs model_input;
 
     {
@@ -2110,9 +2109,6 @@ absl::Status MtpExecutor::normalStep(const std::list<GenerateStreamPtr>& streams
         CHECK_AND_RETURN_REF(sampler_input,
                              normal_batch_stream_processor_->gatherSamplerInput(
                                  stream_groups, model_input, model_output));
-        if (model_output.numerical_status.defined()) {
-            normal_numerical_status_gate_.apply(stream_groups, sampler_input, model_output.numerical_status);
-        }
         holdSamplerInputHostBuffers(buffer_holder_, sampler_input);
         sampler_output = sampler_->forward(sampler_input);
         executor_collector.sample_input_us +=
@@ -2124,9 +2120,6 @@ absl::Status MtpExecutor::normalStep(const std::list<GenerateStreamPtr>& streams
         RTP_LLM_PROFILE_SCOPE("executor.mtp.normal_step(dispatch_output)");
         const int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
         MergedOutput merge_output{std::move(model_output), std::move(sampler_output)};
-        if (useDeviceInput()) {
-            publishNormalDeviceStateShared(stream_groups, merge_output.sampler_output);
-        }
         auto status = normal_batch_stream_processor_->dispatch(stream_groups, merge_output);
         executor_collector.dispatch_output_us +=
             autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;

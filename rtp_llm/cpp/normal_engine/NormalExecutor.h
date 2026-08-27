@@ -23,27 +23,6 @@ class KVCacheManager;
 class ModelInputsLogger;
 struct GptModelInitParams;
 
-// Shared ordinary-generation semantic helpers. MtpExecutor's request-level
-// target-only path uses the same implementations instead of maintaining a
-// subtly divergent copy.
-class NormalNumericalStatusGate {
-public:
-    void apply(const StreamGroups& stream_groups, SamplerInputs& sampler_inputs, const NumericalStatusView& status);
-
-private:
-    struct Slot;
-    struct Lease;
-    torch::Tensor ensureFailureWorkspace(int64_t rows);
-    torch::Tensor ensureRowMap(const StreamGroups& stream_groups);
-
-    std::vector<std::shared_ptr<Slot>> slots_;
-    std::shared_ptr<Slot>              active_slot_;
-    int64_t                            active_model_rows_ = 0;
-};
-
-void prepareGrpcNormalDeviceStateShared(const StreamGroups& stream_groups, bool use_device_input, RoleType role_type);
-void publishNormalDeviceStateShared(const StreamGroups& stream_groups, const SamplerOutput& sampler_output);
-
 class NormalExecutor: public Executor {
 public:
     explicit NormalExecutor(const EngineInitParams&                params,
@@ -112,6 +91,13 @@ protected:
     bool checkDeviceInput() const;
     void ensureModelInputsOnCuda(GptModelInputs& model_input, const char* tag);
     void checkModelInputsOnCuda(const GptModelInputs& model_input, const char* tag) const;
+    torch::Tensor ensureNumericalFailureWorkspace(int64_t rows);
+    torch::Tensor ensureNumericalRowMap(const StreamGroups& stream_groups);
+    void applyNumericalStatusGate(const StreamGroups& stream_groups,
+                                  SamplerInputs& sampler_inputs,
+                                  const NumericalStatusView& status);
+    struct NumericalGateSlot;
+    struct NumericalGateLease;
 
 private:
     std::unique_ptr<ModelBase>                                               model_;
@@ -144,7 +130,9 @@ private:
     // Keeps async copy source tensors alive across release points. NormalExecutor
     // uses this for model-input H2D staging and sampler-input staging.
     TensorHolder buffer_holder_;
-    NormalNumericalStatusGate numerical_status_gate_;
+    std::vector<std::shared_ptr<NumericalGateSlot>> numerical_gate_slots_;
+    std::shared_ptr<NumericalGateSlot> active_numerical_gate_slot_;
+    int64_t active_numerical_model_rows_ = 0;
 };
 
 }  // namespace rtp_llm

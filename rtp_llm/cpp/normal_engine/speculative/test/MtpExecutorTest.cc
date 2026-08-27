@@ -333,17 +333,7 @@ public:
             inputs.logits_processor_states_ptr->batchProcess(inputs);
         }
         checkInputs(inputs);
-        auto output = output_holder.get();
-        if (inputs.numerical_failure_mask.defined()) {
-            output.numerical_failure_mask  = inputs.numerical_failure_mask;
-            output.numerical_failure_lease = inputs.numerical_failure_lease;
-            output.success = torch::ones(inputs.numerical_failure_mask.sizes(),
-                                         torch::TensorOptions()
-                                             .dtype(torch::kBool)
-                                             .device(inputs.numerical_failure_mask.device()));
-            output.success.masked_fill_(inputs.numerical_failure_mask, false);
-        }
-        return output;
+        return output_holder.get();
     }
 
     void checkInputs(const SamplerInputs& inputs) {
@@ -766,43 +756,6 @@ TEST_F(MtpExecutorTest, testForceDisableSpRunUsesTargetOnlyNormalPath) {
     EXPECT_EQ(draft_model->forwardCount(), 0u);
     EXPECT_EQ(stream->getSPOutputBuffer(), nullptr);
     EXPECT_EQ(stream->getCompleteTokenIds()->completeTokenIdsVec(0), (std::vector<int>{0, 1, 2, 3, 2}));
-}
-
-TEST_F(MtpExecutorTest, testForceDisableNumericalFailureDoesNotAcceptToken) {
-    MtpExecutorTestConfig test_config;
-    auto components = createMtpExecutorComponents(test_config);
-    auto stream = createContextStream(
-        components.model_config, components.runtime_config, components.resource_context, {0, 1, 2, 3});
-    stream->generateConfig()->force_disable_sp_run = true;
-
-    GptModelInputs target_input;
-    target_input.combo_tokens      = torch::tensor({0, 1, 2, 3}, torch::kInt32);
-    target_input.input_lengths     = torch::tensor({4}, torch::kInt32);
-    target_input.prefix_lengths    = torch::tensor({0}, torch::kInt32);
-    target_input.lm_output_indexes = torch::tensor({3}, torch::kInt32);
-    GptModelOutputs target_output;
-    target_output.logits = torch::tensor({0.1f, 0.2f, 0.3f, 0.4f}).reshape({1, 4});
-    target_output.numerical_status.values =
-        torch::ones({1}, torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA));
-    target_output.numerical_status.live_rows = 1;
-    target_output.numerical_status.scope     = NumericalStatusScope::ORIGIN_ROW;
-    components.fake_target_model->setInputs({target_input});
-    components.fake_target_model->setOutputs({target_output});
-
-    components.fake_sampler->setInputs({SamplerInputs{target_output.logits}});
-    components.fake_sampler->setOutputs(
-        {SamplerOutput{torch::tensor({2}, torch::kInt32).reshape({1, 1})}});
-    setupFakeModels(components.executor.get(),
-                    std::move(components.fake_target_model),
-                    std::move(components.fake_draft_model),
-                    std::move(components.fake_fast_topk_sampler),
-                    std::move(components.fake_speculative_sampler),
-                    std::move(components.fake_sampler));
-
-    auto status = components.executor->process({stream});
-    ASSERT_TRUE(status.ok()) << status;
-    EXPECT_EQ(stream->getCompleteTokenIds()->completeTokenIdsVec(0), (std::vector<int>{0, 1, 2, 3}));
-    EXPECT_TRUE(stream->stopped());
 }
 
 TEST_F(MtpExecutorTest, testForceDisableSpRunMixedBatchFailsClosed) {
