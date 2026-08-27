@@ -132,7 +132,7 @@ class PpuGroupedFP4SourceContractTest(unittest.TestCase):
             self.helpers["torch"] = SimpleNamespace(cuda=cuda)
 
         deep_gemm = ModuleType("deep_gemm")
-        deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked = lambda *args: None
+        deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_nopad = lambda *args: None
 
         set_cuda(available=False, name="ZW-M890P")
         with patch.dict(sys.modules, {"deep_gemm": deep_gemm}):
@@ -184,22 +184,11 @@ class PpuGroupedFP4SourceContractTest(unittest.TestCase):
         inter_local, routed_tp = derive(_cfg(dim=7168), *_shapes(512, dim=7168))
         self.assertEqual((inter_local, routed_tp), (512, 4))
 
-    def test_capacity_is_lossless_aligned_and_graph_fails_closed(self):
-        select = self.helpers["_select_capacity"]
-        self.assertEqual(
-            select(128, [1, 137, 4], 256, fixed_shape=False),
-            137,
-        )
-        selected = select(128, [129, 4, 2], 3, fixed_shape=False)
-        self.assertEqual(selected, 256)
-        self.assertEqual((3 * selected) % 128, 0)
-
-        with self.assertRaises(RuntimeError):
-            select(128, (), 256, fixed_shape=True, fixed_required=129)
-        with self.assertRaises(RuntimeError):
-            select(128, (), 256, fixed_shape=True)
-        with self.assertRaises(ValueError):
-            select(129, (), 3, fixed_shape=True, fixed_required=128)
+    def test_compact_nopad_has_no_host_capacity_path(self):
+        self.assertNotIn("_select_capacity", self.helpers)
+        self.assertIn("compact_mxfp4_routes_nopad", self.source)
+        self.assertNotIn(".cpu()", self.source)
+        self.assertNotIn(".tolist()", self.source)
 
     def test_no_count_clamp_or_cuda_grouped_fallback(self):
         calls = [node for node in ast.walk(self.tree) if isinstance(node, ast.Call)]
@@ -220,13 +209,78 @@ class PpuGroupedFP4SourceContractTest(unittest.TestCase):
             "packed int8/uint8 MXFP4 weights",
             "float8_e8m0fnu checkpoint scales",
             "ZW-M890P",
-            "m_grouped_gemm_fp4_fp4_bf16_nt_masked",
-            "expert_counts.to(torch.int32).contiguous()",
+            "m_grouped_gemm_fp4_fp4_bf16_nt_nopad",
+            "compact_mxfp4_routes_nopad",
             "self.routed_tp_size = routed_tp_size",
         )
         for fragment in required_fragments:
             self.assertIn(fragment, self.source)
         self.assertNotIn("except Exception", self.source)
+    def test_forward_uses_single_fused_swiglu_quant_without_fallback(self) -> None:
+        tree = ast.parse(self.source)
+        strategy = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "PpuGroupedFP4Strategy"
+        )
+        forward = next(
+            node
+            for node in strategy.body
+            if isinstance(node, ast.FunctionDef) and node.name == "forward"
+        )
+        calls = [node for node in ast.walk(forward) if isinstance(node, ast.Call)]
+
+        fused_calls = [
+            node
+            for node in calls
+            if isinstance(node.func, ast.Attribute)
+            and node.func.attr == "ppu_silu_and_mul_post_quant_mxfp4"
+        ]
+        self.assertEqual(len(fused_calls), 1)
+        self.assertEqual(ast.unparse(fused_calls[0].args[0]), "gate_up")
+        self.assertEqual(ast.unparse(fused_calls[0].args[1]), "limit")
+        self.assertNotIn("require_silu_mul_split", ast.unparse(forward))
+
+        downcast_calls = [
+            node
+            for node in calls
+            if isinstance(node.func, ast.Name)
+            and node.func.id == "downcast_to_mxfp4"
+        ]
+        self.assertEqual(len(downcast_calls), 1)
+        self.assertEqual(ast.unparse(downcast_calls[0].args[0]), "x.contiguous()")
+
+        grouped_calls = [
+            node
+            for node in calls
+            if isinstance(node.func, ast.Name) and node.func.id == "grouped_gemm"
+        ]
+        self.assertEqual(len(grouped_calls), 2)
+        self.assertIn("self._ppu_w13", ast.unparse(grouped_calls[0]))
+        self.assertIn("self._ppu_w2", ast.unparse(grouped_calls[1]))
+        self.assertIn("(hidden_fp4, hidden_scale)", ast.unparse(grouped_calls[1]))
+
+        gather_calls = [
+            node
+            for node in calls
+            if isinstance(node.func, ast.Name) and node.func.id == "ep_gather"
+        ]
+        self.assertEqual(len(gather_calls), 1)
+        self.assertEqual(
+            [ast.unparse(arg) for arg in gather_calls[0].args],
+            [
+                "down",
+                "adjusted_ids",
+                "weights.contiguous()",
+                "output_index",
+                "gathered",
+            ],
+        )
+        self.assertIn(
+            "limit = self.cfg.swiglu_limit if self.cfg.swiglu_limit > 0 else None",
+            ast.unparse(forward),
+        )
 
 
 if __name__ == "__main__":

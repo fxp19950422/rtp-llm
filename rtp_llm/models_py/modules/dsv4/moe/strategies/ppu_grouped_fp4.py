@@ -255,7 +255,7 @@ class PpuGroupedFP4Strategy(RoutedExpertsStrategy):
         from internal_source.rtp_llm.models_py.kernels.ppu_mxfp4 import (
             downcast_to_mxfp4,
         )
-        from rtp_llm.models_py.modules.dsv4.moe.expert import require_silu_mul_split
+        from rtp_llm.ops.compute_ops import rtp_llm_ops
         from rtp_llm.models_py.triton_kernels.moe.ep_kernels import (
             ep_gather,
         )
@@ -287,12 +287,10 @@ class PpuGroupedFP4Strategy(RoutedExpertsStrategy):
             expert_counts,
         )
 
-        hidden = require_silu_mul_split()(
-            gate_up[:, : self.inter_local].float().contiguous(),
-            gate_up[:, self.inter_local :].float().contiguous(),
-            clamp_limit=self.cfg.swiglu_limit,
-        ).to(torch.bfloat16).contiguous()
-        hidden_fp4, hidden_scale = downcast_to_mxfp4(hidden)
+        limit = self.cfg.swiglu_limit if self.cfg.swiglu_limit > 0 else None
+        hidden_fp4, hidden_scale = (
+            rtp_llm_ops.ppu_silu_and_mul_post_quant_mxfp4(gate_up, limit)
+        )
         down = torch.empty((total, dim), dtype=torch.bfloat16, device=x.device)
         grouped_gemm(
             (hidden_fp4, hidden_scale),
