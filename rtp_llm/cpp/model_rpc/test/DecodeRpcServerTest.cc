@@ -6,6 +6,14 @@
 
 namespace rtp_llm {
 
+namespace model_rpc_internal {
+bool initializeDecodeRpcHandoff(bool  has_propose_params,
+                                bool  force_disable_sp_run,
+                                void* context,
+                                void (*mark_normal)(void*),
+                                void (*init_speculative)(void*));
+}
+
 namespace {
 
 DecodeRpcServer::LoadKVCacheContext makeLoadContext(const std::string&               request_key,
@@ -209,6 +217,60 @@ TEST(DecodeRpcServerTest, MtpLoadPlanIgnoresInactiveModules) {
 
     ASSERT_EQ(plan.size(), 1);
     EXPECT_EQ(plan[0].engine_init_params, propose_params.mtp_model_params_->at(0).get());
+}
+
+TEST(DecodeRpcServerTest, DisabledMtpRequestUsesExactlyOneNormalHandoff) {
+    struct Calls {
+        int normal      = 0;
+        int speculative = 0;
+    } calls;
+
+    const bool use_speculative = model_rpc_internal::initializeDecodeRpcHandoff(
+        /*has_propose_params=*/true,
+        /*force_disable_sp_run=*/true,
+        &calls,
+        [](void* context) { ++static_cast<Calls*>(context)->normal; },
+        [](void* context) { ++static_cast<Calls*>(context)->speculative; });
+
+    EXPECT_FALSE(use_speculative);
+    EXPECT_EQ(calls.normal, 1);
+    EXPECT_EQ(calls.speculative, 0);
+}
+
+TEST(DecodeRpcServerTest, EnabledMtpRequestPreservesSpeculativeHandoff) {
+    struct Calls {
+        int normal      = 0;
+        int speculative = 0;
+    } calls;
+
+    const bool use_speculative = model_rpc_internal::initializeDecodeRpcHandoff(
+        /*has_propose_params=*/true,
+        /*force_disable_sp_run=*/false,
+        &calls,
+        [](void* context) { ++static_cast<Calls*>(context)->normal; },
+        [](void* context) { ++static_cast<Calls*>(context)->speculative; });
+
+    EXPECT_TRUE(use_speculative);
+    EXPECT_EQ(calls.normal, 0);
+    EXPECT_EQ(calls.speculative, 1);
+}
+
+TEST(DecodeRpcServerTest, DecodeWithoutMtpParamsPreservesNormalHandoff) {
+    struct Calls {
+        int normal      = 0;
+        int speculative = 0;
+    } calls;
+
+    const bool use_speculative = model_rpc_internal::initializeDecodeRpcHandoff(
+        /*has_propose_params=*/false,
+        /*force_disable_sp_run=*/false,
+        &calls,
+        [](void* context) { ++static_cast<Calls*>(context)->normal; },
+        [](void* context) { ++static_cast<Calls*>(context)->speculative; });
+
+    EXPECT_FALSE(use_speculative);
+    EXPECT_EQ(calls.normal, 1);
+    EXPECT_EQ(calls.speculative, 0);
 }
 
 TEST(DecodeRpcServerTest, ReadFailureLogContainsPeerErrorAndEveryBlockKey) {
