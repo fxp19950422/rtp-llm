@@ -16,10 +16,10 @@ namespace rtp_llm {
 class DecodeCycleObserver {
 public:
     struct RankInfo {
-        int tp_rank{0};
-        int ep_rank{0};
-        int dp_rank{0};
-        int world_rank{0};
+        int64_t tp_rank{0};
+        int64_t ep_rank{0};
+        int64_t dp_rank{0};
+        int64_t world_rank{0};
     };
 
     static DecodeCycleObserver& instance();
@@ -77,13 +77,16 @@ private:
 
     static int64_t monotonicNs();
     static std::string escapeJson(const std::string& value);
+    static std::string rankedPath(const std::string& prefix, int64_t world_rank);
     bool               shouldSample(uint64_t cycle_seq) const;
+    void               openLocked(const std::string& path);
     void               writeCycleLocked(int64_t end_ns);
 
     bool                    enabled_{false};
     size_t                  max_records_{2048};
     mutable std::mutex      mutex_;
     RankInfo                ranks_;
+    std::string             output_prefix_;
     std::ofstream           output_;
     std::array<char, 65536> output_buffer_{};
     uint64_t                cycle_seq_{0};

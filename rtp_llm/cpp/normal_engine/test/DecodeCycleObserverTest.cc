@@ -62,7 +62,7 @@ void testDefaultDisabled() {
 void testSampling() {
     const auto path = tempPath("sampling");
     std::remove(path.c_str());
-    DecodeCycleObserver observer(true, path);
+    DecodeCycleObserver observer(true, path, DecodeCycleObserver::RankInfo{});
     runCycles(observer, 80);
     observer.flushForTest();
     const auto output = readAll(path);
@@ -74,10 +74,41 @@ void testSampling() {
     std::remove(path.c_str());
 }
 
+void testDeferredOpenAndRankPath() {
+    const auto prefix = tempPath("deferred-prefix");
+    const auto path   = prefix + ".pid" + std::to_string(::getpid()) + ".rank7.jsonl";
+    std::remove(prefix.c_str());
+    std::remove(path.c_str());
+    DecodeCycleObserver observer(true, prefix);
+    expect(observer.enabled(), "deferred observer must retain the enabled setting");
+    expect(::access(prefix.c_str(), F_OK) != 0, "singleton-style constructor must not open the prefix directly");
+    expect(::access(path.c_str(), F_OK) != 0, "ranked output must not open before configureRanks");
+    observer.configureRanks({1, 2, 3, 7});
+    expect(::access(path.c_str(), F_OK) == 0, "configureRanks must open a pid-and-rank-specific JSONL path");
+    observer.beginCycle();
+    observer.finishCycle();
+    observer.flushForTest();
+    expect(readAll(path).find("\"tp\":1,\"ep\":2,\"dp\":3,\"world_rank\":7") != std::string::npos,
+           "deferred output must use configured direct ranks");
+    std::remove(path.c_str());
+}
+
+void testDefaultPrefixRankPath() {
+    const auto path = "/tmp/rtp_llm_decode_observe.pid" + std::to_string(::getpid()) + ".rank9.jsonl";
+    std::remove(path.c_str());
+    DecodeCycleObserver observer(true, std::string());
+    observer.configureRanks({4, 5, 6, 9});
+    observer.beginCycle();
+    observer.finishCycle();
+    observer.flushForTest();
+    expect(::access(path.c_str(), F_OK) == 0, "empty/default prefix must still create a pid-and-rank path");
+    std::remove(path.c_str());
+}
+
 void testMax2048() {
     const auto path = tempPath("max");
     std::remove(path.c_str());
-    DecodeCycleObserver observer(true, path);
+    DecodeCycleObserver observer(true, path, DecodeCycleObserver::RankInfo{});
     runCycles(observer, 20000);
     observer.flushForTest();
     expect(lineCount(readAll(path)) == 2048, "observer must cap output at 2048 records per rank");
@@ -131,6 +162,8 @@ void testRecordAndBufferedOutput() {
 int main() {
     testDefaultDisabled();
     testSampling();
+    testDeferredOpenAndRankPath();
+    testDefaultPrefixRankPath();
     testMax2048();
     testRecordAndBufferedOutput();
     if (failures != 0) {

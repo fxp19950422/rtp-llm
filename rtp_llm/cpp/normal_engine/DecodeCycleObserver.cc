@@ -9,7 +9,7 @@
 namespace rtp_llm {
 namespace {
 
-std::string observerPath(const char* setting, int world_rank) {
+std::string observerPrefix(const char* setting) {
     const char* explicit_path = std::getenv("RTP_LLM_DECODE_OBSERVE_PATH");
     if (explicit_path != nullptr && *explicit_path != '\0') {
         return explicit_path;
@@ -17,8 +17,7 @@ std::string observerPath(const char* setting, int world_rank) {
     if (setting != nullptr && std::string(setting) != "1") {
         return setting;
     }
-    return "/tmp/rtp_llm_decode_observe." + std::to_string(::getpid()) + ".rank" + std::to_string(world_rank)
-           + ".jsonl";
+    return "/tmp/rtp_llm_decode_observe";
 }
 
 }  // namespace
@@ -27,22 +26,31 @@ DecodeCycleObserver& DecodeCycleObserver::instance() {
     static DecodeCycleObserver observer = []() {
         const char* setting = std::getenv("RTP_LLM_DECODE_OBSERVE");
         const bool enabled = setting != nullptr && *setting != '\0' && std::string(setting) != "0";
-        return DecodeCycleObserver(enabled, enabled ? observerPath(setting, 0) : std::string());
+        return DecodeCycleObserver(enabled, enabled ? observerPrefix(setting) : std::string());
     }();
     return observer;
 }
 
 DecodeCycleObserver::DecodeCycleObserver(bool enabled, std::string output_path, size_t max_records):
-    DecodeCycleObserver(enabled, std::move(output_path), RankInfo{}, max_records) {}
+    enabled_(enabled), max_records_(max_records), output_prefix_(std::move(output_path)) {}
 
 DecodeCycleObserver::DecodeCycleObserver(bool enabled, std::string output_path, RankInfo ranks, size_t max_records):
     enabled_(enabled), max_records_(max_records), ranks_(ranks) {
     if (!enabled_) {
         return;
     }
+    openLocked(output_path);
+}
+
+void DecodeCycleObserver::openLocked(const std::string& path) {
     output_.rdbuf()->pubsetbuf(output_buffer_.data(), output_buffer_.size());
-    output_.open(output_path, std::ios::out | std::ios::app);
+    output_.open(path, std::ios::out | std::ios::app);
     enabled_ = output_.is_open();
+}
+
+std::string DecodeCycleObserver::rankedPath(const std::string& prefix, int64_t world_rank) {
+    const std::string effective_prefix = prefix.empty() ? "/tmp/rtp_llm_decode_observe" : prefix;
+    return effective_prefix + ".pid" + std::to_string(::getpid()) + ".rank" + std::to_string(world_rank) + ".jsonl";
 }
 
 DecodeCycleObserver::~DecodeCycleObserver() {
@@ -74,10 +82,13 @@ void DecodeCycleObserver::configureRanks(RankInfo ranks) {
     }
     std::lock_guard<std::mutex> lock(mutex_);
     ranks_ = ranks;
+    if (!output_.is_open()) {
+        openLocked(rankedPath(output_prefix_, ranks.world_rank));
+    }
 }
 
 void DecodeCycleObserver::beginCycle() {
-    if (!enabled_) {
+    if (!enabled_ || !output_.is_open()) {
         return;
     }
     const int64_t now = monotonicNs();

@@ -2,6 +2,7 @@
 #include "rtp_llm/cpp/engine_base/EngineBase.h"
 #include "rtp_llm/cpp/normal_engine/NormalExecutor.h"
 #include "rtp_llm/cpp/normal_engine/NormalEngine.h"
+#include "rtp_llm/cpp/normal_engine/DecodeCycleObserver.h"
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
 #include "rtp_llm/cpp/utils/StatusUtil.h"
 #include "rtp_llm/cpp/engine_base/schedulers/FIFOScheduler.h"
@@ -510,6 +511,10 @@ KVCacheInfo NormalEngine::getCacheStatusInfo(int64_t latest_version, bool need_c
 }
 
 absl::Status NormalEngine::startLoop() {
+    DecodeCycleObserver::instance().configureRanks({parallelism_config.tp_rank,
+                                                    parallelism_config.ep_rank,
+                                                    parallelism_config.dp_rank,
+                                                    parallelism_config.world_rank});
     if (parallelism_config.tp_rank == 0) {
         RTP_LLM_LOG_INFO("start init system prompt");
         THROW_IF_STATUS_ERROR(initSystemPrompt());
@@ -586,8 +591,15 @@ absl::Status NormalEngine::step() {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
+    auto& observer = DecodeCycleObserver::instance();
+    const bool observe_decode_cycle =
+        observer.enabled() && pd_sep_config.role_type == RoleType::DECODE && isMTPEagle();
+    if (observe_decode_cycle) {
+        observer.beginCycle();
+    }
     int64_t                 tps_schedule_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
     list<GenerateStreamPtr> streams;
+    size_t                  scheduled_real_batch = 0;
     if (parallelism_config.tp_rank == 0 && !ffn_disaggregate_config.is_ffn_service()) {
         // Output bookkeeping owns the authoritative finished/batch state.  If
         // the executor is configured to retain the broad synchronization, do
@@ -601,6 +613,10 @@ absl::Status NormalEngine::step() {
             RTP_LLM_PROFILE_SCOPE_DYNAMIC("engine.normal.schedule(reserve_step=%d)", reserve_step_);
             CHECK_AND_ASSIGN(streams, scheduler_->schedule());
         }
+        scheduled_real_batch = streams.size();
+        if (observe_decode_cycle) {
+            observer.recordPadding(scheduled_real_batch, scheduled_real_batch, 0, false, "before_padding");
+        }
         if (parallelism_config.dp_size > 1) {
             RTP_LLM_PROFILE_SCOPE("engine.normal.may_add_fake_stream_work");
             mayAddFakeStream(streams);
@@ -609,8 +625,26 @@ absl::Status NormalEngine::step() {
         // tpSyncModelInputs (collective broadcast) does not deadlock.
         // The skip_run flag inside process() handles the "no work" case.
         if (streams.empty() && parallelism_config.tp_size <= 1) {
+            if (observe_decode_cycle) {
+                observer.recordPadding(0, 0, 0, false, "no_work");
+                observer.finishCycle();
+            }
             return absl::OkStatus();
         }
+    }
+
+    const size_t fake_batch = streams.size() > scheduled_real_batch ? streams.size() - scheduled_real_batch : 0;
+    const char*  ep_pad_env = std::getenv("RTP_LLM_EP_DECODE_PAD_TO_MAX_BATCH");
+    const bool ep_pad_enabled = ep_pad_env != nullptr && std::string(ep_pad_env) == "1"
+                                && parallelism_config.dp_size > 1 && pd_sep_config.role_type == RoleType::DECODE;
+    if (observe_decode_cycle) {
+        observer.recordPadding(scheduled_real_batch,
+                               streams.size(),
+                               fake_batch,
+                               ep_pad_enabled,
+                               fake_batch == 0 ? (ep_pad_enabled ? "not_applied" : "disabled")
+                                               : (scheduled_real_batch == 0 ? "idle_collective"
+                                                                            : "high_load_pad_to_max"));
     }
 
     RTP_LLM_LOG_DEBUG(__PRETTY_FUNCTION__);
@@ -640,6 +674,9 @@ absl::Status NormalEngine::step() {
         RTP_LLM_PROFILE_SCOPE_DYNAMIC("engine.normal.execute(stream_size=%zu)", streams.size());
         const bool refresh_cache_status_snapshot =
             resource_context_.cache_manager && shouldRefreshCacheStatusSnapshot(pd_sep_config.role_type, streams);
+        if (observe_decode_cycle) {
+            observer.recordProcessSubmit();
+        }
         status = executor_->process(streams, tps_schedule_time_us);
         if (status.ok() && refresh_cache_status_snapshot) {
             RTP_LLM_PROFILE_SCOPE("engine.normal.refresh_cache_status_snapshot");
@@ -648,6 +685,10 @@ absl::Status NormalEngine::step() {
         if (propose_params_) {
             step_profiler_.finishStep();
         }
+    }
+
+    if (observe_decode_cycle) {
+        observer.finishCycle();
     }
 
     // report step metrics
