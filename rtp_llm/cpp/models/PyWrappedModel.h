@@ -123,6 +123,9 @@ private:
     void                            recordNumericalStatusSourceFence(bool used_cuda_graph);
     void                            waitEagerNumericalStatusSourceFence();
     void                            recordEagerNumericalStatusSourceFence();
+    static DecodeGraphRole          decodeGraphRole(const GptModelInitParams& params,
+                                                    bool                      is_prefill_cuda_graph_mode,
+                                                    DSparkModelRole           dspark_model_role);
 
     // Methods absorbed from GptModel
     torch::Tensor   tpSyncEmbeddingOrLogits(const torch::Tensor& input);
@@ -195,6 +198,21 @@ private:
     CudaGraphState                  graph_state_;
 };
 
+inline DecodeGraphRole PyWrappedModel::decodeGraphRole(const GptModelInitParams& params,
+                                                       bool                      is_prefill_cuda_graph_mode,
+                                                       DSparkModelRole           dspark_model_role) {
+    if (is_prefill_cuda_graph_mode) {
+        return DecodeGraphRole::PREFILL;
+    }
+    if (params.sp_config.type == SP_TYPE_NONE) {
+        return DecodeGraphRole::DECODE;
+    }
+    if (!params.model_id && dspark_model_role == DSparkModelRole::NONE) {
+        return DecodeGraphRole::TARGET_VERIFY;
+    }
+    return DecodeGraphRole::MTP_DRAFT;
+}
+
 // NOTE(wangyin): constructor can not be compiled correctly when placed in cc file.
 inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
                                       py::object                py_instance,
@@ -221,11 +239,7 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
     use_spec_decoding_(use_spec_decoding),
     enable_device_perf_(params.profile_debug_logging_config.enable_device_perf),
     check_nan_(params.profile_debug_logging_config.check_nan),
-    decode_graph_role_(is_prefill_cuda_graph_mode ? DecodeGraphRole::PREFILL :
-                       params.sp_config.type != SP_TYPE_NONE && !params.model_id ? DecodeGraphRole::TARGET_VERIFY :
-                       params.sp_config.type != SP_TYPE_NONE || dspark_model_role != DSparkModelRole::NONE ?
-                           DecodeGraphRole::MTP_DRAFT :
-                           DecodeGraphRole::DECODE) {
+    decode_graph_role_(decodeGraphRole(params, is_prefill_cuda_graph_mode, dspark_model_role)) {
 
     c10::InferenceMode inference_guard(true);
 

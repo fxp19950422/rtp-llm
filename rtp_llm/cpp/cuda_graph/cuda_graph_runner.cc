@@ -846,22 +846,22 @@ bool CudaGraphRunner::tryGetRealGraphDecodeBatchSize(const PyModelInputs& inputs
     state.current_batch_size = cuda_graph_bs;
     RTP_LLM_LOG_DEBUG("canRun judge for batch size: %d", cuda_graph_bs);
     if (capture_range_.empty()) {
-        last_decision_.fallback_reason = DecodeGraphFallbackReason::CAPTURE_EMPTY;
+        state.decode_graph_decision.fallback_reason = DecodeGraphFallbackReason::CAPTURE_EMPTY;
         RTP_LLM_LOG_WARNING("decode cuda graph: capture_range_ is empty, cannot run");
         return false;
     }
     auto it = std::lower_bound(capture_range_.begin(), capture_range_.end(), state.current_batch_size);
     // No captured graph for batch >= current (all captures smaller)
     if (it == capture_range_.end()) {
-        last_decision_.fallback_reason = DecodeGraphFallbackReason::BATCH_EXCEEDS;
+        state.decode_graph_decision.fallback_reason = DecodeGraphFallbackReason::BATCH_EXCEEDS;
         RTP_LLM_LOG_WARNING("decode batch size %d exceeds max captured %d, fallback to normal run",
                             state.current_batch_size,
                             capture_range_.back());
         return false;
     }
     state.current_real_graph_bs = *it;
-    last_decision_.graph_key    = state.current_real_graph_bs;
-    last_decision_.padding_rows = state.current_real_graph_bs - state.current_batch_size;
+    state.decode_graph_decision.graph_key    = state.current_real_graph_bs;
+    state.decode_graph_decision.padding_rows = state.current_real_graph_bs - state.current_batch_size;
     const auto diagnostic_mode = mtpCudaGraphDiagnosticMode();
     if (diagnostic_mode != MtpCudaGraphDiagnosticMode::OFF) {
         const bool rounded = state.current_batch_size != state.current_real_graph_bs;
@@ -940,12 +940,12 @@ bool CudaGraphRunner::canReplaySelectedGraph(const PyModelInputs& inputs, const 
 
 bool CudaGraphRunner::canRun(const PyModelInputs& inputs, CudaGraphState& state) {
     RTP_LLM_PROFILE_SCOPE("cuda_graph.canRun");
-    last_decision_ = DecodeGraphDecision{};
-    last_decision_.role            = decode_graph_role_;
-    last_decision_.is_decode_graph = !is_prefill_cuda_graph_mode_;
-    last_decision_.actual_batch    = static_cast<int>(inputs.attention_inputs.input_lengths.size(0));
+    state.decode_graph_decision                 = DecodeGraphDecision{};
+    state.decode_graph_decision.role            = decode_graph_role_;
+    state.decode_graph_decision.is_decode_graph = !is_prefill_cuda_graph_mode_;
+    state.decode_graph_decision.actual_batch = static_cast<int>(inputs.attention_inputs.input_lengths.size(0));
     if (!enable_cuda_graph_) {
-        last_decision_.fallback_reason = DecodeGraphFallbackReason::GRAPH_DISABLED;
+        state.decode_graph_decision.fallback_reason = DecodeGraphFallbackReason::GRAPH_DISABLED;
         return false;
     }
     if (kv_cache_group_tags_.size() > 1) {
@@ -989,8 +989,8 @@ bool CudaGraphRunner::canRun(const PyModelInputs& inputs, CudaGraphState& state)
         if (!canReplaySelectedGraph(inputs, state)) {
             return false;
         }
-        last_decision_.replay          = true;
-        last_decision_.fallback_reason = DecodeGraphFallbackReason::NONE;
+        state.decode_graph_decision.replay          = true;
+        state.decode_graph_decision.fallback_reason = DecodeGraphFallbackReason::NONE;
         return true;
     }
 
@@ -1010,8 +1010,8 @@ bool CudaGraphRunner::canRun(const PyModelInputs& inputs, CudaGraphState& state)
     if (!canReplaySelectedGraph(inputs, state)) {
         return false;
     }
-    last_decision_.replay          = true;
-    last_decision_.fallback_reason = DecodeGraphFallbackReason::NONE;
+    state.decode_graph_decision.replay          = true;
+    state.decode_graph_decision.fallback_reason = DecodeGraphFallbackReason::NONE;
     return true;
 }
 

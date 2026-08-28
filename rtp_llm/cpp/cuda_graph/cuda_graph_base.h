@@ -8,15 +8,6 @@ namespace rtp_llm {
 
 using namespace torch_ext;
 
-// Current state of CUDA graph execution (used when calling canRun/forward with graph runner)
-struct CudaGraphState {
-    int current_batch_size{1};
-    int current_seq_len{1};
-    int current_real_graph_bs{1};       // for decode
-    int current_real_graph_seq_len{1};  // for prefill
-    int seq_len_sum{0};
-};
-
 enum class DecodeGraphRole : uint8_t {
     PREFILL,
     DECODE,
@@ -42,6 +33,18 @@ struct DecodeGraphDecision {
     int                       actual_batch{0};
     int                       graph_key{0};
     int                       padding_rows{0};
+};
+
+// Per-invocation CUDA graph state owned by the caller. Keeping the decision
+// here prevents asynchronous prepare/update probes from overwriting another
+// forward call's final replay/fallback facts.
+struct CudaGraphState {
+    int                 current_batch_size{1};
+    int                 current_seq_len{1};
+    int                 current_real_graph_bs{1};       // for decode
+    int                 current_real_graph_seq_len{1};  // for prefill
+    int                 seq_len_sum{0};
+    DecodeGraphDecision decode_graph_decision;
 };
 
 struct GraphParams {
@@ -94,13 +97,6 @@ public:
     // buffers after page-table changes. Other captured fields stay untouched.
     virtual void updateKVCacheKernelBlockId(const PyModelInputs& inputs, CudaGraphState& state) {}
 
-    const DecodeGraphDecision& lastDecision() const {
-        return last_decision_;
-    }
-
     py::object py_instance_;
-
-protected:
-    DecodeGraphDecision last_decision_;
 };
 }  // namespace rtp_llm

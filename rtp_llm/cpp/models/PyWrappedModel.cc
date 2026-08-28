@@ -1256,22 +1256,21 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         NumericalStatusSourceFenceGuard status_fence(this);
         NumericalStatusView             numerical_status_source;
         bool                            used_cuda_graph = false;
+        CudaGraphState forward_graph_state;
+        forward_graph_state.decode_graph_decision                 = DecodeGraphDecision{};
+        forward_graph_state.decode_graph_decision.role            = decode_graph_role_;
+        forward_graph_state.decode_graph_decision.is_decode_graph = decode_graph_role_ != DecodeGraphRole::PREFILL;
+        forward_graph_state.decode_graph_decision.actual_batch =
+            static_cast<int>(py_model_inputs.attention_inputs.input_lengths.size(0));
+        forward_graph_state.decode_graph_decision.fallback_reason = DecodeGraphFallbackReason::GRAPH_DISABLED;
         const bool can_replay_cuda_graph =
-            enable_cuda_graph_ && graph_runner_->canRun(py_model_inputs, graph_state_);
+            enable_cuda_graph_ && graph_runner_->canRun(py_model_inputs, forward_graph_state);
         auto record_decode_graph_decision = [&](bool replay) {
             auto& observer = DecodeCycleObserver::instance();
             if (!observer.enabled() || decode_graph_role_ == DecodeGraphRole::PREFILL) {
                 return;
             }
-            DecodeGraphDecision decision;
-            if (graph_runner_ != nullptr) {
-                decision = graph_runner_->lastDecision();
-            } else {
-                decision.role            = decode_graph_role_;
-                decision.is_decode_graph = true;
-                decision.actual_batch = static_cast<int>(py_model_inputs.attention_inputs.input_lengths.size(0));
-                decision.fallback_reason = DecodeGraphFallbackReason::GRAPH_DISABLED;
-            }
+            const auto& decision = forward_graph_state.decode_graph_decision;
             const auto reason = replay ? DecodeGraphFallbackReason::NONE : decision.fallback_reason;
             observer.recordGraphCall(decodeGraphRoleName(decision.role),
                                      decision.actual_batch,
@@ -1294,9 +1293,9 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
                 "[PyWrappedModel] using CUDA graph forward, is_target_verify=%d, is_prefill=%d, graph_bs=%d",
                 py_model_inputs.attention_inputs.is_target_verify,
                 py_model_inputs.attention_inputs.is_prefill,
-                graph_state_.current_real_graph_bs);
+                forward_graph_state.current_real_graph_bs);
             py_model_inputs.attention_inputs.is_s_padded = true;
-            py_model_outputs                             = graph_runner_->forward(py_model_inputs, graph_state_);
+            py_model_outputs = graph_runner_->forward(py_model_inputs, forward_graph_state);
             record_decode_graph_decision(/*replay=*/true);
             if (numerical_status_scope_ != NumericalStatusScope::NONE) {
                 numerical_status_source = py_model_outputs.numerical_status;
