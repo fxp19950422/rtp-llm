@@ -17,11 +17,39 @@ struct CudaGraphState {
     int seq_len_sum{0};
 };
 
+enum class DecodeGraphRole : uint8_t {
+    PREFILL,
+    DECODE,
+    MTP_DRAFT,
+    TARGET_VERIFY,
+};
+
+enum class DecodeGraphFallbackReason : uint8_t {
+    NONE,
+    GRAPH_DISABLED,
+    CAPTURE_EMPTY,
+    BATCH_EXCEEDS,
+    CAN_REPLAY_REJECTED,
+};
+
+// Host-only result of the most recent canRun decision. Consumers record it
+// only at the final forward branch; prepare/update probes intentionally do not.
+struct DecodeGraphDecision {
+    DecodeGraphRole           role{DecodeGraphRole::DECODE};
+    DecodeGraphFallbackReason fallback_reason{DecodeGraphFallbackReason::CAN_REPLAY_REJECTED};
+    bool                      is_decode_graph{true};
+    bool                      replay{false};
+    int                       actual_batch{0};
+    int                       graph_key{0};
+    int                       padding_rows{0};
+};
+
 struct GraphParams {
     bool             enable_cuda_graph            = false;
     bool             enable_cuda_graph_debug_mode = false;
     bool             is_prefill_cuda_graph_mode   = false;
     bool             is_target_verify             = false;
+    DecodeGraphRole  decode_graph_role             = DecodeGraphRole::DECODE;
     int              max_seq_len                  = 0;
     int              tokens_per_block             = 0;  // physical kv block size
     int              kernel_tokens_per_block      = 0;  // must be explicitly configured
@@ -66,6 +94,13 @@ public:
     // buffers after page-table changes. Other captured fields stay untouched.
     virtual void updateKVCacheKernelBlockId(const PyModelInputs& inputs, CudaGraphState& state) {}
 
+    const DecodeGraphDecision& lastDecision() const {
+        return last_decision_;
+    }
+
     py::object py_instance_;
+
+protected:
+    DecodeGraphDecision last_decision_;
 };
 }  // namespace rtp_llm

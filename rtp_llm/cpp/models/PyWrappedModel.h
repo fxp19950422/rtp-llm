@@ -169,6 +169,7 @@ private:
     bool       has_mtp_hidden_buffer_{false};
     bool       enable_device_perf_{false};
     bool       check_nan_{false};
+    DecodeGraphRole decode_graph_role_{DecodeGraphRole::DECODE};
 
     NumericalStatusScope                           numerical_status_scope_{NumericalStatusScope::NONE};
     torch::Tensor                                  eager_numerical_status_;
@@ -219,7 +220,12 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
     is_prefill_cuda_graph_mode_(is_prefill_cuda_graph_mode),
     use_spec_decoding_(use_spec_decoding),
     enable_device_perf_(params.profile_debug_logging_config.enable_device_perf),
-    check_nan_(params.profile_debug_logging_config.check_nan) {
+    check_nan_(params.profile_debug_logging_config.check_nan),
+    decode_graph_role_(is_prefill_cuda_graph_mode ? DecodeGraphRole::PREFILL :
+                       params.sp_config.type != SP_TYPE_NONE && !params.model_id ? DecodeGraphRole::TARGET_VERIFY :
+                       params.sp_config.type != SP_TYPE_NONE || dspark_model_role != DSparkModelRole::NONE ?
+                           DecodeGraphRole::MTP_DRAFT :
+                           DecodeGraphRole::DECODE) {
 
     c10::InferenceMode inference_guard(true);
 
@@ -310,6 +316,7 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
         graph_params.enable_cuda_graph            = params.hw_kernel_config.enable_cuda_graph;
         graph_params.enable_cuda_graph_debug_mode = params.hw_kernel_config.enable_cuda_graph_debug_mode;
         graph_params.is_prefill_cuda_graph_mode   = is_prefill_cuda_graph_mode;
+        graph_params.decode_graph_role            = decode_graph_role_;
         graph_params.max_seq_len                  = params.max_seq_len;
         graph_params.tokens_per_block             = params.tokens_per_block;
         graph_params.kernel_tokens_per_block      = params.kernel_tokens_per_block;

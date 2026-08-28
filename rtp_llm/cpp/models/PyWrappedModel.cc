@@ -1,4 +1,5 @@
 #include "rtp_llm/cpp/models/PyWrappedModel.h"
+#include "rtp_llm/cpp/normal_engine/DecodeCycleObserver.h"
 #include "rtp_llm/cpp/cache/KVCacheManager.h"
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
 #include "rtp_llm/cpp/utils/DebugUtils.h"
@@ -29,6 +30,27 @@ using namespace std;
 namespace rtp_llm {
 
 namespace {
+
+const char* decodeGraphRoleName(DecodeGraphRole role) {
+    switch (role) {
+        case DecodeGraphRole::MTP_DRAFT: return "mtp_draft";
+        case DecodeGraphRole::TARGET_VERIFY: return "target_verify";
+        case DecodeGraphRole::DECODE: return "decode";
+        case DecodeGraphRole::PREFILL: return "prefill";
+    }
+    return "decode";
+}
+
+const char* decodeGraphFallbackReasonName(DecodeGraphFallbackReason reason) {
+    switch (reason) {
+        case DecodeGraphFallbackReason::GRAPH_DISABLED: return "graph_disabled";
+        case DecodeGraphFallbackReason::CAPTURE_EMPTY: return "capture_empty";
+        case DecodeGraphFallbackReason::BATCH_EXCEEDS: return "batch_exceeds";
+        case DecodeGraphFallbackReason::CAN_REPLAY_REJECTED: return "can_replay_rejected";
+        case DecodeGraphFallbackReason::NONE: return "none";
+    }
+    return "can_replay_rejected";
+}
 
 struct NumericalStatusIdentity {
     const c10::TensorImpl* impl{nullptr};
@@ -1234,9 +1256,33 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
         NumericalStatusSourceFenceGuard status_fence(this);
         NumericalStatusView             numerical_status_source;
         bool                            used_cuda_graph = false;
+        const bool can_replay_cuda_graph =
+            enable_cuda_graph_ && graph_runner_->canRun(py_model_inputs, graph_state_);
+        auto record_decode_graph_decision = [&](bool replay) {
+            auto& observer = DecodeCycleObserver::instance();
+            if (!observer.enabled() || decode_graph_role_ == DecodeGraphRole::PREFILL) {
+                return;
+            }
+            DecodeGraphDecision decision;
+            if (graph_runner_ != nullptr) {
+                decision = graph_runner_->lastDecision();
+            } else {
+                decision.role            = decode_graph_role_;
+                decision.is_decode_graph = true;
+                decision.actual_batch = static_cast<int>(py_model_inputs.attention_inputs.input_lengths.size(0));
+                decision.fallback_reason = DecodeGraphFallbackReason::GRAPH_DISABLED;
+            }
+            const auto reason = replay ? DecodeGraphFallbackReason::NONE : decision.fallback_reason;
+            observer.recordGraphCall(decodeGraphRoleName(decision.role),
+                                     decision.actual_batch,
+                                     decision.graph_key,
+                                     decision.padding_rows,
+                                     replay,
+                                     replay ? "" : decodeGraphFallbackReasonName(reason));
+        };
 
         // Cast the Python object to PyModelOutputs and extract hidden states
-        if (enable_cuda_graph_ && graph_runner_->canRun(py_model_inputs, graph_state_)) {
+        if (can_replay_cuda_graph) {
             used_cuda_graph = true;
             if (numerical_status_scope_ != NumericalStatusScope::NONE) {
                 status_fence.arm(/*used_cuda_graph=*/true);
@@ -1251,12 +1297,14 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
                 graph_state_.current_real_graph_bs);
             py_model_inputs.attention_inputs.is_s_padded = true;
             py_model_outputs                             = graph_runner_->forward(py_model_inputs, graph_state_);
+            record_decode_graph_decision(/*replay=*/true);
             if (numerical_status_scope_ != NumericalStatusScope::NONE) {
                 numerical_status_source = py_model_outputs.numerical_status;
             }
             RTP_LLM_LOG_DEBUG("[PyWrappedModel] CUDA graph forward completed");
             hidden_states = py_model_outputs.hidden_states.clone();
         } else {
+            record_decode_graph_decision(/*replay=*/false);
             py::gil_scoped_acquire gil;
             RTP_LLM_PROFILE_SCOPE("py_model.forward(normal)");
             DevicePerfWrapper wrapper(enable_device_perf_, "normal forward");
