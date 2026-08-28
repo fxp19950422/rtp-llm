@@ -511,10 +511,17 @@ KVCacheInfo NormalEngine::getCacheStatusInfo(int64_t latest_version, bool need_c
 }
 
 absl::Status NormalEngine::startLoop() {
-    DecodeCycleObserver::instance().configureRanks({parallelism_config.tp_rank,
-                                                    parallelism_config.ep_rank,
-                                                    parallelism_config.dp_rank,
-                                                    parallelism_config.world_rank});
+    auto& observer = DecodeCycleObserver::instance();
+    if (observer.enabled()) {
+        if (pd_sep_config.role_type != RoleType::DECODE || parallelism_config.tp_size != 1 || !isMTPEagle()) {
+            return absl::InvalidArgumentError(
+                "DecodeCycleObserver supports only DECODE TP1 with MTP/Eagle; refusing an ambiguous trace");
+        }
+        observer.configureRanks({parallelism_config.tp_rank,
+                                 parallelism_config.ep_rank,
+                                 parallelism_config.dp_rank,
+                                 parallelism_config.world_rank});
+    }
     if (parallelism_config.tp_rank == 0) {
         RTP_LLM_LOG_INFO("start init system prompt");
         THROW_IF_STATUS_ERROR(initSystemPrompt());
