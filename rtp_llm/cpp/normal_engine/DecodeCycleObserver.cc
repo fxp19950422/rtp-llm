@@ -262,6 +262,12 @@ void DecodeCycleObserver::finishCycle() {
     if (active_) {
         writeCycleLocked(monotonicNs());
         ++records_written_;
+        // Keep the service resident while still making a bounded observation
+        // window readable. This is one host flush per 64 sampled records, not
+        // a per-cycle device or filesystem synchronization.
+        if (records_written_ % 64 == 0) {
+            output_.flush();
+        }
     }
     cycle_open_ = false;
     active_     = false;

@@ -78,6 +78,9 @@ void testSampling() {
     std::remove(path.c_str());
     DecodeCycleObserver observer(true, path, DecodeCycleObserver::RankInfo{});
     runCycles(observer, 80);
+    struct stat stat_buffer {};
+    expect(::stat(path.c_str(), &stat_buffer) == 0 && stat_buffer.st_size > 0,
+           "64 sampled records must trigger a bounded host flush for resident-service inspection");
     observer.flushForTest();
     const auto output = readAll(path);
     expect(lineCount(output) == 66, "cycles 1..64 plus 72 and 80 must be sampled");
