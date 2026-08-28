@@ -1,4 +1,5 @@
 #include "rtp_llm/cpp/normal_engine/speculative/MtpExecutor.h"
+#include "rtp_llm/cpp/normal_engine/DecodeCycleObserver.h"
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateStream.h"
 #include "rtp_llm/cpp/engine_base/EngineBase.h"
@@ -341,6 +342,28 @@ MtpExecutor::AcceptLenMetricsSnapshot MtpExecutor::consumePendingAcceptLenMetric
             }
             snapshot.accept_len_by_priority[priority] += rows[i];
         }
+        auto& observer = DecodeCycleObserver::instance();
+        if (observer.enabled()) {
+            std::array<int64_t, 3> accepted_draft_per_pos{{0, 0, 0}};
+            // accept_len is the number of emitted tokens and includes the
+            // mandatory target token. Consequently accepted_draft_tokens is
+            // max(0, accept_len - 1) (the same contract used by
+            // MtpBatchStreamProcessor), and draft position pos was accepted iff
+            // accept_len - 1 > pos, equivalently accept_len > pos + 1.
+            for (int64_t i = 0; i < num_rows; ++i) {
+                for (size_t pos = 0; pos < accepted_draft_per_pos.size(); ++pos) {
+                    accepted_draft_per_pos[pos] += rows[i] > static_cast<int64_t>(pos + 1) ? 1 : 0;
+                }
+            }
+            // These host rows belong to the cycle saved when they were staged;
+            // recordAcceptance attaches them to the currently active observer
+            // cycle without another device read or wait.
+            observer.recordAcceptance(metrics_accept_source_cycle_seq_,
+                                      snapshot.total_stream_num,
+                                      snapshot.total_accept_len,
+                                      accepted_draft_per_pos,
+                                      snapshot.total_propose_token_num);
+        }
     }
     snapshot.valid = true;
 
@@ -352,6 +375,7 @@ MtpExecutor::AcceptLenMetricsSnapshot MtpExecutor::consumePendingAcceptLenMetric
     metrics_accept_len_ready_event_.reset();
     metrics_accept_len_stream_num_        = 0;
     metrics_accept_len_propose_token_num_ = 0;
+    metrics_accept_source_cycle_seq_      = 0;
     return snapshot;
 }
 
@@ -366,6 +390,8 @@ void MtpExecutor::stageAcceptLenMetrics(const torch::Tensor& accept_len,
     RTP_LLM_PROFILE_SCOPE("executor.mtp.decode_step(stage_accept_len_metrics)");
     metrics_accept_len_stream_num_        = static_cast<int64_t>(stream_count);
     metrics_accept_len_propose_token_num_ = static_cast<int64_t>(stream_count * propose_step_);
+    auto& observer = DecodeCycleObserver::instance();
+    metrics_accept_source_cycle_seq_ = observer.enabled() ? observer.currentCycleSeq() : 0;
     metrics_accept_len_row_priorities_    = std::move(row_priorities);
 
     if (!accept_len.is_cuda()) {

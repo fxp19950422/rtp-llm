@@ -274,6 +274,9 @@ private:
     std::shared_ptr<torch::Event> metrics_accept_len_ready_event_;
     int64_t                       metrics_accept_len_stream_num_        = 0;
     int64_t                       metrics_accept_len_propose_token_num_ = 0;
+    // Cycle that staged the pending acceptance rows. They are consumed during
+    // the next engine cycle after the existing metrics event becomes ready.
+    uint64_t metrics_accept_source_cycle_seq_ = 0;
 
     AsyncRunner target_verify_prepare_runner_;
     AsyncRunner draft_prefill_prepare_runner_;
