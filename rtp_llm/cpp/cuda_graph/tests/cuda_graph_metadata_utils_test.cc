@@ -24,5 +24,24 @@ TEST(CudaGraphMetadataUtilsTest, SupportsEmptyBatchAndInt64Accumulation) {
               2LL * std::numeric_limits<int32_t>::max());
 }
 
+TEST(CudaGraphMetadataUtilsTest, ParsesMtpCudaGraphDiagnosticModeFailClosed) {
+    EXPECT_EQ(parseMtpCudaGraphDiagnosticMode(nullptr), MtpCudaGraphDiagnosticMode::OFF);
+    EXPECT_EQ(parseMtpCudaGraphDiagnosticMode(""), MtpCudaGraphDiagnosticMode::OFF);
+    EXPECT_EQ(parseMtpCudaGraphDiagnosticMode("0"), MtpCudaGraphDiagnosticMode::OFF);
+    EXPECT_EQ(parseMtpCudaGraphDiagnosticMode("log"), MtpCudaGraphDiagnosticMode::LOG);
+    EXPECT_EQ(parseMtpCudaGraphDiagnosticMode("exact"), MtpCudaGraphDiagnosticMode::EXACT_TARGET_VERIFY);
+    EXPECT_EQ(parseMtpCudaGraphDiagnosticMode("1"), MtpCudaGraphDiagnosticMode::INVALID);
+    EXPECT_EQ(parseMtpCudaGraphDiagnosticMode("EXACT"), MtpCudaGraphDiagnosticMode::INVALID);
+}
+
+TEST(CudaGraphMetadataUtilsTest, ExactDiagnosticRejectsOnlyRoundedTargetVerify) {
+    EXPECT_FALSE(shouldRejectRoundedMtpTargetVerify(MtpCudaGraphDiagnosticMode::OFF, true, 2, 4));
+    EXPECT_FALSE(shouldRejectRoundedMtpTargetVerify(MtpCudaGraphDiagnosticMode::LOG, true, 2, 4));
+    EXPECT_FALSE(shouldRejectRoundedMtpTargetVerify(MtpCudaGraphDiagnosticMode::INVALID, true, 2, 4));
+    EXPECT_FALSE(shouldRejectRoundedMtpTargetVerify(MtpCudaGraphDiagnosticMode::EXACT_TARGET_VERIFY, false, 2, 4));
+    EXPECT_FALSE(shouldRejectRoundedMtpTargetVerify(MtpCudaGraphDiagnosticMode::EXACT_TARGET_VERIFY, true, 4, 4));
+    EXPECT_TRUE(shouldRejectRoundedMtpTargetVerify(MtpCudaGraphDiagnosticMode::EXACT_TARGET_VERIFY, true, 2, 4));
+}
+
 }  // namespace
 }  // namespace rtp_llm

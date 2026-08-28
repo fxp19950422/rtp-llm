@@ -20,6 +20,27 @@ namespace rtp_llm {
 
 namespace {
 
+MtpCudaGraphDiagnosticMode mtpCudaGraphDiagnosticMode() {
+    static const MtpCudaGraphDiagnosticMode mode = []() {
+        const char* value  = std::getenv("RTP_LLM_MTP_CUDA_GRAPH_DIAGNOSTIC");
+        const auto  parsed = parseMtpCudaGraphDiagnosticMode(value);
+        if (parsed == MtpCudaGraphDiagnosticMode::INVALID) {
+            RTP_LLM_LOG_WARNING(
+                "unknown RTP_LLM_MTP_CUDA_GRAPH_DIAGNOSTIC=%s; expected log|exact, diagnostic disabled",
+                value == nullptr ? "<unset>" : value);
+            return MtpCudaGraphDiagnosticMode::OFF;
+        }
+        return parsed;
+    }();
+    return mode;
+}
+
+std::atomic<uint64_t> g_decode_graph_diagnostic_count{0};
+
+bool shouldLogDecodeGraphDiagnostic(uint64_t count) {
+    return count <= 128 || (count & (count - 1)) == 0;
+}
+
 struct NumericalStatusIdentity {
     const c10::TensorImpl* impl{nullptr};
     const void*            data{nullptr};
@@ -821,6 +842,28 @@ bool CudaGraphRunner::tryGetRealGraphDecodeBatchSize(const PyModelInputs& inputs
         return false;
     }
     state.current_real_graph_bs = *it;
+    const auto diagnostic_mode = mtpCudaGraphDiagnosticMode();
+    if (diagnostic_mode != MtpCudaGraphDiagnosticMode::OFF) {
+        const bool rounded = state.current_batch_size != state.current_real_graph_bs;
+        const bool reject_rounded_target = shouldRejectRoundedMtpTargetVerify(
+            diagnostic_mode, is_target_verify_, state.current_batch_size, state.current_real_graph_bs);
+        const uint64_t count = g_decode_graph_diagnostic_count.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (shouldLogDecodeGraphDiagnostic(count)) {
+            RTP_LLM_LOG_INFO(
+                "CUDA_GRAPH_MAP role=%s real_bs=%d graph_bs=%d rounded=%d tokens_per_bs=%d mode=%s action=%s count=%llu",
+                is_target_verify_ ? "mtp_target_verify" : "decode",
+                state.current_batch_size,
+                state.current_real_graph_bs,
+                rounded,
+                num_tokens_per_bs_,
+                diagnostic_mode == MtpCudaGraphDiagnosticMode::EXACT_TARGET_VERIFY ? "exact" : "log",
+                reject_rounded_target ? "fallback_eager" : "replay_candidate",
+                static_cast<unsigned long long>(count));
+        }
+        if (reject_rounded_target) {
+            return false;
+        }
+    }
     RTP_LLM_LOG_DEBUG(
         "batch size used in replay: %d (graph key %d)", state.current_batch_size, state.current_real_graph_bs);
 
