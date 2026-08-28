@@ -49,6 +49,18 @@ class TaggedSequenceLengthModel:
         return PyModelOutputs(inputs.input_hiddens + signature)
 
 
+class TargetVerifyTailSensitiveModel:
+    """Make stale fixed-capacity token rows observable in live output rows."""
+
+    def prepare_fmha_impl(self, inputs: PyModelInputs, is_cuda_graph: bool = False):
+        return None
+
+    def forward(self, inputs: PyModelInputs, fmha_impl=None) -> PyModelOutputs:
+        hidden_signature = inputs.input_hiddens.sum()
+        token_signature = inputs.input_ids.sum().to(inputs.input_hiddens.dtype)
+        return PyModelOutputs(inputs.input_hiddens + hidden_signature + token_signature)
+
+
 class NumericalStatusModel:
     numerical_status_scope = "origin_row"
 
@@ -438,6 +450,61 @@ class TestCudaGraphTaggedCache(unittest.TestCase):
                     output.hidden_states,
                     expected_signature.unsqueeze(0).expand_as(output.hidden_states),
                 )
+
+    def test_target_verify_clears_token_tail_across_a_b_b_replays(self) -> None:
+        query_len = 4
+        runner = CudaGraphRunner()
+        runner.init_decode(
+            TargetVerifyTailSensitiveModel(),
+            HIDDEN_SIZE,
+            64,
+            TOKENS_PER_BLOCK,
+            TOKENS_PER_BLOCK,
+            [8],
+            GROUP_TAGS,
+            True,
+            query_len,
+        )
+
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            poison = _build_target_verify_inputs(
+                GROUP_TAGS,
+                {"full": 7, "aux": 11},
+                batch_size=8,
+                query_len=query_len,
+                prefix_len=11,
+            )
+            poison.input_ids.fill_(3)
+            poison.input_hiddens.fill_(5)
+            self.assertTrue(runner.canRun(poison))
+            self.assertEqual(runner.getCurrentRealGraphSize(), 8)
+            poison_output = runner.forward(poison).hidden_states.clone()
+
+            replay_outputs = []
+            for _ in range(2):
+                clean = _build_target_verify_inputs(
+                    GROUP_TAGS,
+                    {"full": 13, "aux": 17},
+                    batch_size=2,
+                    query_len=query_len,
+                    prefix_len=5,
+                )
+                clean.input_ids.zero_()
+                clean.input_hiddens.zero_()
+                self.assertTrue(runner.canRun(clean))
+                self.assertEqual(runner.getCurrentRealGraphSize(), 8)
+                replay_outputs.append(runner.forward(clean).hidden_states.clone())
+
+        stream.synchronize()
+        self.assertTrue(torch.isfinite(poison_output).all().item())
+        self.assertTrue(torch.all(poison_output != 0).item())
+        expected = torch.zeros(
+            (2 * query_len, HIDDEN_SIZE), dtype=torch.bfloat16, device="cuda"
+        )
+        torch.testing.assert_close(replay_outputs[0], expected, rtol=0, atol=0)
+        torch.testing.assert_close(replay_outputs[1], expected, rtol=0, atol=0)
+        torch.testing.assert_close(replay_outputs[0], replay_outputs[1], rtol=0, atol=0)
 
     def test_numerical_status_uses_fixed_per_graph_storage_and_replay_reset(self) -> None:
         runner = CudaGraphRunner()

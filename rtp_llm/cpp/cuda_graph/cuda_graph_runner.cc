@@ -258,6 +258,19 @@ void CudaGraphRunner::prepareInputData(const PyModelInputs& inputs, CudaGraphSta
     auto& py_model_inputs = graph_instances_[graph_idx].mem_hold_.py_model_inputs_;
     const int token_num   = is_prefill_cuda_graph_mode_ ? state.current_seq_len : inputs.input_ids.size(0);
 
+    RTP_LLM_CHECK_WITH_INFO(token_num <= py_model_inputs.input_ids.size(0),
+                            "input_ids token count exceeds graph capacity: input=%d capture=%ld",
+                            token_num,
+                            py_model_inputs.input_ids.size(0));
+    // A target-verify graph executes its fixed capture width before live-output
+    // slicing. If a smaller logical batch follows a larger replay, stale token
+    // rows can participate in batch-wide work (for example router/MoE) even
+    // though they are outside the returned slice. Clear only the rounded tail;
+    // exact-key and all non-target paths keep their existing hot path.
+    if (is_target_verify_ && token_num < py_model_inputs.input_ids.size(0)) {
+        py_model_inputs.input_ids.slice(0, token_num).zero_();
+    }
+
     optimizedCopyAsync(inputs.input_ids, py_model_inputs.input_ids, token_num * sizeof(int));
 
     // check size and dtype. The copy below is a raw byte memcpy into the captured
@@ -284,6 +297,9 @@ void CudaGraphRunner::prepareInputData(const PyModelInputs& inputs, CudaGraphSta
                                 "input_hiddens dtype mismatch: %s != %s",
                                 inputs.input_hiddens.dtype().name(),
                                 py_model_inputs.input_hiddens.dtype().name());
+        if (is_target_verify_ && inputs.input_hiddens.size(0) < py_model_inputs.input_hiddens.size(0)) {
+            py_model_inputs.input_hiddens.slice(0, inputs.input_hiddens.size(0)).zero_();
+        }
         optimizedCopyAsync(inputs.input_hiddens,
                            py_model_inputs.input_hiddens,
                            inputs.input_hiddens.numel() * inputs.input_hiddens.element_size());
