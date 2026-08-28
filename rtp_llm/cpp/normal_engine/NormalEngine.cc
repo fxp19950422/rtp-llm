@@ -521,6 +521,9 @@ absl::Status NormalEngine::startLoop() {
                                  parallelism_config.ep_rank,
                                  parallelism_config.dp_rank,
                                  parallelism_config.world_rank});
+        if (!observer.enabled()) {
+            return absl::InternalError("DecodeCycleObserver failed to open its rank-local JSONL output");
+        }
     }
     if (parallelism_config.tp_rank == 0) {
         RTP_LLM_LOG_INFO("start init system prompt");
