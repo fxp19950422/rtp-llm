@@ -205,7 +205,10 @@ class FallbackHCUnit(HCUnitBase):
             y = torch.matmul(
                 _comb.float().transpose(-1, -2), _res.float()
             )
-            y.add_(_post_b.float().unsqueeze(-1) * _x.float().unsqueeze(-2))
+            # Keep the accepted FP32 matmul reduction tree, but let the PPU
+            # pointwise backend consume post/x directly instead of materialising
+            # a second FP32 outer-product tensor before the add.
+            y.addcmul_(_post_b.float().unsqueeze(-1), _x.float().unsqueeze(-2))
             return y.to(x.dtype)
 
         if residual.dim() == 3 and T > chunk:
