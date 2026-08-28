@@ -493,6 +493,52 @@ class TestHCImpl(unittest.TestCase):
         tilelang_pre.assert_called_once_with(cuda_x, dbg_tag="eager")
         fallback_pre.assert_not_called()
 
+    def test_fallback_deepgemm_backend_replaces_only_linear_projection(self) -> None:
+        hc, dim = 4, 16
+        fn, base, scale = _weights(hc, dim)
+        unit = FallbackHCUnit(
+            fn,
+            base,
+            scale,
+            dim=dim,
+            hc_mult=hc,
+            hc_sinkhorn_iters=3,
+            norm_eps=1e-6,
+            hc_eps=1e-6,
+        )
+        x_flat = object()
+        expected = object()
+        with _env("DSV4_MHC_PRE_GEMM_BACKEND", "deepgemm"), mock.patch(
+            "rtp_llm.models_py.modules.dsv4.hc.fallback_impl."
+            "_ppu_deepgemm_linear_mixes",
+            return_value=expected,
+        ) as deepgemm, mock.patch(
+            "rtp_llm.models_py.modules.dsv4.hc.fallback_impl._tp_linear_mixes"
+        ) as aten:
+            actual = unit._linear_mixes(x_flat)
+
+        self.assertIs(actual, expected)
+        deepgemm.assert_called_once_with(unit, x_flat)
+        aten.assert_not_called()
+
+    def test_fallback_pre_backend_is_fail_closed(self) -> None:
+        hc, dim = 4, 16
+        fn, base, scale = _weights(hc, dim)
+        unit = FallbackHCUnit(
+            fn,
+            base,
+            scale,
+            dim=dim,
+            hc_mult=hc,
+            hc_sinkhorn_iters=3,
+            norm_eps=1e-6,
+            hc_eps=1e-6,
+        )
+        with _env("DSV4_MHC_PRE_GEMM_BACKEND", "tilelang"), self.assertRaisesRegex(
+            ValueError, "fallback mHC supports"
+        ):
+            unit._linear_mixes(object())
+
     def test_hybrid_unknown_backends_fail_closed_before_leaf_selection(self) -> None:
         hc, dim = 4, 16
         fn, base, scale = _weights(hc, dim)
