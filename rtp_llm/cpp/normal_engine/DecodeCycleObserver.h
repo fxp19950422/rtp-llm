@@ -54,6 +54,7 @@ public:
                               int64_t                        accepted_output_tokens,
                               const std::array<int64_t, 3>& accepted_draft_per_pos,
                               int64_t                        proposed_draft_tokens);
+    void     cancelCycle();
     void     finishCycle();
     void     flushForTest();
 
@@ -102,6 +103,7 @@ private:
     std::string             ep_pad_reason_{"disabled"};
     std::vector<GraphCall>  graph_calls_;
     Acceptance              acceptance_;
+    bool                    cycle_open_{false};
     bool                    active_{false};
 };
 

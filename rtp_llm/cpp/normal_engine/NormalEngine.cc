@@ -624,12 +624,13 @@ absl::Status NormalEngine::step() {
         // When TP > 1, all ranks must enter process() together so that
         // tpSyncModelInputs (collective broadcast) does not deadlock.
         // The skip_run flag inside process() handles the "no work" case.
-        if (streams.empty() && parallelism_config.tp_size <= 1) {
+        if (streams.empty()) {
             if (observe_decode_cycle) {
-                observer.recordPadding(0, 0, 0, false, "no_work");
-                observer.finishCycle();
+                observer.cancelCycle();
             }
-            return absl::OkStatus();
+            if (parallelism_config.tp_size <= 1) {
+                return absl::OkStatus();
+            }
         }
     }
 

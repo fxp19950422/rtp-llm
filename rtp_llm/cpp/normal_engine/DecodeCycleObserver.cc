@@ -73,7 +73,7 @@ uint64_t DecodeCycleObserver::currentCycleSeq() const {
         return 0;
     }
     std::lock_guard<std::mutex> lock(mutex_);
-    return cycle_seq_;
+    return cycle_open_ ? cycle_seq_ + 1 : cycle_seq_;
 }
 
 void DecodeCycleObserver::configureRanks(RankInfo ranks) {
@@ -93,14 +93,16 @@ void DecodeCycleObserver::beginCycle() {
     }
     const int64_t now = monotonicNs();
     std::lock_guard<std::mutex> lock(mutex_);
-    ++cycle_seq_;
+    if (cycle_open_) {
+        return;
+    }
+    cycle_open_ = true;
+    cycle_start_ns_ = now;
     cycle_period_us_ = previous_cycle_start_ns_ == 0 ? 0 : (now - previous_cycle_start_ns_) / 1000;
-    previous_cycle_start_ns_ = now;
-    active_ = records_written_ < max_records_ && shouldSample(cycle_seq_);
+    active_ = records_written_ < max_records_ && shouldSample(cycle_seq_ + 1);
     if (!active_) {
         return;
     }
-    cycle_start_ns_         = now;
     process_submit_us_      = 0;
     scheduled_real_batch_   = 0;
     effective_batch_        = 0;
@@ -252,12 +254,26 @@ void DecodeCycleObserver::finishCycle() {
         return;
     }
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!active_) {
+    if (!cycle_open_) {
         return;
     }
-    writeCycleLocked(monotonicNs());
-    ++records_written_;
-    active_ = false;
+    ++cycle_seq_;
+    previous_cycle_start_ns_ = cycle_start_ns_;
+    if (active_) {
+        writeCycleLocked(monotonicNs());
+        ++records_written_;
+    }
+    cycle_open_ = false;
+    active_     = false;
+}
+
+void DecodeCycleObserver::cancelCycle() {
+    if (!enabled_) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    cycle_open_ = false;
+    active_     = false;
 }
 
 void DecodeCycleObserver::flushForTest() {

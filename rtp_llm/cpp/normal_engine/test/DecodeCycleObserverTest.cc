@@ -6,6 +6,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -40,6 +41,19 @@ size_t lineCount(const std::string& text) {
     return count;
 }
 
+int64_t jsonIntField(const std::string& text, const std::string& field, size_t occurrence = 0) {
+    const std::string marker = "\"" + field + "\":";
+    size_t            pos    = 0;
+    for (size_t i = 0; i <= occurrence; ++i) {
+        pos = text.find(marker, pos);
+        if (pos == std::string::npos) {
+            return -1;
+        }
+        pos += marker.size();
+    }
+    return std::strtoll(text.c_str() + pos, nullptr, 10);
+}
+
 void runCycles(DecodeCycleObserver& observer, size_t count) {
     for (size_t i = 0; i < count; ++i) {
         observer.beginCycle();
@@ -71,6 +85,67 @@ void testSampling() {
     expect(output.find("\"cycle_seq\":65") == std::string::npos, "cycle 65 must not be present");
     expect(output.find("\"cycle_seq\":72") != std::string::npos, "cycle 72 must be present");
     expect(output.find("\"cycle_seq\":80") != std::string::npos, "cycle 80 must be present");
+    std::remove(path.c_str());
+}
+
+void testCancelledIdleDoesNotConsumeCycle() {
+    const auto path = tempPath("cancel-idle");
+    std::remove(path.c_str());
+    DecodeCycleObserver observer(true, path, DecodeCycleObserver::RankInfo{});
+    for (size_t i = 0; i < 10000; ++i) {
+        observer.beginCycle();
+        expect(observer.currentCycleSeq() == 1, "cancelled idle cycle must expose but not consume candidate seq 1");
+        observer.cancelCycle();
+    }
+    observer.beginCycle();
+    expect(observer.currentCycleSeq() == 1, "first work after idle must still use cycle seq 1");
+    observer.finishCycle();
+    observer.flushForTest();
+    const auto output = readAll(path);
+    expect(lineCount(output) == 1, "cancelled idle cycles must not emit records");
+    expect(jsonIntField(output, "cycle_seq") == 1, "first work after idle must serialize cycle seq 1");
+    expect(jsonIntField(output, "cycle_period_us") == 0, "first valid work cycle period must be zero");
+    std::remove(path.c_str());
+}
+
+void testCancelledCycleDoesNotResetPeriod() {
+    const auto path = tempPath("cancel-period");
+    std::remove(path.c_str());
+    DecodeCycleObserver observer(true, path, DecodeCycleObserver::RankInfo{});
+    observer.beginCycle();
+    observer.finishCycle();
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    observer.beginCycle();
+    observer.cancelCycle();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    observer.beginCycle();
+    observer.finishCycle();
+    observer.flushForTest();
+    const auto output = readAll(path);
+    expect(jsonIntField(output, "cycle_period_us", 0) == 0, "first valid cycle period must be zero");
+    expect(jsonIntField(output, "cycle_period_us", 1) >= 8000,
+           "cancelled cycle must not replace the previous valid cycle start");
+    std::remove(path.c_str());
+}
+
+void testUnsampledWorkAdvancesPeriod() {
+    const auto path = tempPath("unsampled-period");
+    std::remove(path.c_str());
+    DecodeCycleObserver observer(true, path, DecodeCycleObserver::RankInfo{});
+    runCycles(observer, 70);
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    observer.beginCycle();  // valid but unsampled cycle 71
+    expect(observer.currentCycleSeq() == 71, "unsampled valid work must expose candidate seq 71");
+    observer.finishCycle();
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    observer.beginCycle();  // sampled cycle 72
+    observer.finishCycle();
+    observer.flushForTest();
+    const auto output = readAll(path);
+    expect(output.find("\"cycle_seq\":71") == std::string::npos, "valid cycle 71 must remain unsampled");
+    expect(output.find("\"cycle_seq\":72") != std::string::npos, "valid cycle 72 must be sampled");
+    expect(jsonIntField(output, "cycle_period_us", 64) < 10000,
+           "sampled cycle 72 period must use unsampled valid cycle 71 as its previous start");
     std::remove(path.c_str());
 }
 
@@ -162,6 +237,9 @@ void testRecordAndBufferedOutput() {
 int main() {
     testDefaultDisabled();
     testSampling();
+    testCancelledIdleDoesNotConsumeCycle();
+    testCancelledCycleDoesNotResetPeriod();
+    testUnsampledWorkAdvancesPeriod();
     testDeferredOpenAndRankPath();
     testDefaultPrefixRankPath();
     testMax2048();
