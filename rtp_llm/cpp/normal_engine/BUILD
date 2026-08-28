@@ -2,6 +2,13 @@ load("//:def.bzl", "copts")
 load("@arch_config//:arch_select.bzl", "torch_deps")
 
 cc_library(
+    name = "decode_cycle_observer",
+    hdrs = ["DecodeCycleObserver.h"],
+    srcs = ["DecodeCycleObserver.cc"],
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
     name = "normal_engine",
     hdrs = glob([
         "*.h",

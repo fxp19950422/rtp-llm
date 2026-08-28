@@ -19,6 +19,12 @@ cuda13_torch_link_deps = select({
     "//conditions:default": [],
 })
 
+cc_test(
+    name = "decode_cycle_observer_test",
+    srcs = ["DecodeCycleObserverTest.cc"],
+    deps = ["//rtp_llm/cpp/normal_engine:decode_cycle_observer"],
+)
+
 cc_library(
     name = "mock_engine",
     hdrs = [
