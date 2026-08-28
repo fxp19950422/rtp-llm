@@ -1,5 +1,7 @@
+import ast
 import os
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -235,6 +237,48 @@ class DeepEPGraphDispatchTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "requires the M890P grouped-FP4"):
             _strategy()(self.x, self.weights, self.indices)
+
+    def test_low_latency_grouped_leaf_uses_fused_ppu_swiglu_quant(self) -> None:
+        source_path = (
+            Path(__file__).resolve().parents[1]
+            / "moe"
+            / "strategies"
+            / "deepep.py"
+        )
+        tree = ast.parse(source_path.read_text())
+        strategy = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "DeepEPStrategy"
+        )
+        compute = next(
+            node
+            for node in strategy.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_compute_ppu_grouped_fp4_packed"
+        )
+        rendered = ast.unparse(compute)
+        calls = [node for node in ast.walk(compute) if isinstance(node, ast.Call)]
+        fused = [
+            node
+            for node in calls
+            if isinstance(node.func, ast.Attribute)
+            and node.func.attr == "ppu_silu_and_mul_post_quant_mxfp4"
+        ]
+
+        self.assertEqual(len(fused), 1)
+        self.assertEqual(
+            [ast.unparse(arg) for arg in fused[0].args],
+            ["gate_up", "swiglu_limit"],
+        )
+        self.assertIn(
+            "swiglu_limit = cfg.swiglu_limit if cfg.swiglu_limit > 0 else None",
+            rendered,
+        )
+        self.assertNotIn("require_silu_mul_split", rendered)
+        self.assertNotIn("downcast_to_mxfp4(hidden)", rendered)
+        self.assertNotIn("gate_up[:, :inter].float()", rendered)
+        self.assertNotIn("gate_up[:, inter:].float()", rendered)
 
 
 if __name__ == "__main__":

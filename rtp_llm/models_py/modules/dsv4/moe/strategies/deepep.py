@@ -311,7 +311,7 @@ class DeepEPStrategy(RoutedExpertsStrategy):
         from internal_source.rtp_llm.models_py.kernels.ppu_mxfp4 import (
             downcast_to_mxfp4,
         )
-        from rtp_llm.models_py.modules.dsv4.moe.expert import require_silu_mul_split
+        from rtp_llm.ops.compute_ops import rtp_llm_ops
 
         cfg = self.cfg
         packed_dispatch = isinstance(expert_x, tuple)
@@ -414,12 +414,16 @@ class DeepEPStrategy(RoutedExpertsStrategy):
             expected_m,
         )
         gate_up = gate_up_grouped.view(total, 2 * inter)
-        hidden = require_silu_mul_split()(
-            gate_up[:, :inter].float().contiguous(),
-            gate_up[:, inter:].float().contiguous(),
-            clamp_limit=cfg.swiglu_limit,
-        ).to(torch.bfloat16).contiguous()
-        hidden_fp4, hidden_scale = downcast_to_mxfp4(hidden)
+        # Match the SGLang PPU runner: consume the grouped GEMM's BF16 gate/up
+        # output directly and fuse SwiGLU with MXFP4 packing.  The old chain
+        # materialized two FP32 halves, an FP32 activation, and a BF16 tensor
+        # before launching a separate quantizer on every routed layer.
+        swiglu_limit = cfg.swiglu_limit if cfg.swiglu_limit > 0 else None
+        hidden_fp4, hidden_scale = (
+            rtp_llm_ops.ppu_silu_and_mul_post_quant_mxfp4(
+                gate_up, swiglu_limit
+            )
+        )
         hidden_fp4_grouped = hidden_fp4.view(E, compute_capacity, -1)
         hidden_scale_grouped = hidden_scale.as_strided(
             (E, compute_capacity, hidden_scale.size(1)),
