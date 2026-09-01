@@ -211,6 +211,41 @@ def _select_ppu_grouped_fp4_capacity(
     return ((selected + alignment - 1) // alignment) * alignment
 
 
+# Spend the whole DeepEP LL slot on compute instead of compacting a prefix out of
+# it.  0 = compact (current behaviour).  The slot's geometry already covers the
+# worst case -- every token routed to one expert -- so the clamp that guards the
+# compact path can no longer bind and no route can be dropped, at the cost of
+# running the experts over rows the dispatch never filled.
+_LL_NO_COMPACT = os.environ.get("DSV4_MOE_LL_NO_COMPACT", "0").strip().lower() in (
+    "1",
+    "true",
+    "on",
+    "yes",
+)
+_LL_NO_COMPACT_LOGGED = [False]
+
+
+def _tensor_byte_span(t) -> Tuple[int, int]:
+    """Exact ``[start, end)`` byte range a strided tensor can touch.
+
+    ``nbytes`` would understate a non-contiguous view and overstate a narrowed
+    one; the aliasing check below needs the real reach, so walk the strides.
+    """
+    if t.numel() == 0:
+        return (0, 0)
+    start = t.data_ptr()
+    last = sum((s - 1) * st for s, st in zip(t.shape, t.stride()))
+    return (start, start + (last + 1) * t.element_size())
+
+
+def _spans_overlap(a, b) -> bool:
+    a0, a1 = _tensor_byte_span(a)
+    b0, b1 = _tensor_byte_span(b)
+    if a1 == 0 or b1 == 0:
+        return False
+    return a0 < b1 and b0 < a1
+
+
 # ACCL-EP's intranode dispatch kernel has a compile-time switch over
 # ``num_topk`` that only covers {2, 4, 8, 16} (asserts false on others —
 # intranode.cu:2237 "Unsupported num_topk"). V4-Flash uses
@@ -450,8 +485,15 @@ class DeepEPStrategy(RoutedExpertsStrategy):
         self,
         expert_x,
         expert_num_tokens: torch.Tensor,
+        out: "Optional[torch.Tensor]" = None,
     ) -> torch.Tensor:
-        """Run grouped MXFP4 experts on DeepEP LL's compact payload."""
+        """Run grouped MXFP4 experts on DeepEP LL's compact payload.
+
+        ``out``, when its geometry matches exactly, receives the down-projection
+        directly so the caller can skip a full-slot copy.  A mismatch is not an
+        error: it just means the compact path is active and the buffer is the
+        wrong shape, so allocate as before.
+        """
         import deep_gemm
 
         from internal_source.rtp_llm.models_py.kernels.ppu_mxfp4 import (
@@ -485,6 +527,21 @@ class DeepEPStrategy(RoutedExpertsStrategy):
         compute_capacity = int(
             os.environ.get("DSV4_PPU_GROUPED_FP4_CAPACITY", "128")
         )
+        if _LL_NO_COMPACT:
+            # Take the slot as-is.  ``safe_counts`` below then clamps against a
+            # bound the counts cannot exceed, so the overflow the monitor watches
+            # for becomes unreachable rather than merely rare.  The validation
+            # below still applies: an LL geometry that breaks the kernel's
+            # alignment must fail loudly, not silently fall back to compacting.
+            compute_capacity = ll_capacity
+            if not _LL_NO_COMPACT_LOGGED[0]:
+                _LL_NO_COMPACT_LOGGED[0] = True
+                logging.info(
+                    "[LL_NO_COMPACT] on: E=%d ll_capacity=%d -> compute_capacity=%d",
+                    E,
+                    ll_capacity,
+                    compute_capacity,
+                )
         if (
             compute_capacity <= 0
             or compute_capacity > ll_capacity
@@ -582,11 +639,19 @@ class DeepEPStrategy(RoutedExpertsStrategy):
             .contiguous()
             .permute(0, 2, 1)
         )
-        compact_down = torch.empty(
-            (E, compute_capacity, D),
-            dtype=torch.bfloat16,
-            device=device,
-        )
+        if (
+            out is not None
+            and out.dtype == torch.bfloat16
+            and tuple(out.shape) == (E, compute_capacity, D)
+            and out.is_contiguous()
+        ):
+            compact_down = out
+        else:
+            compact_down = torch.empty(
+                (E, compute_capacity, D),
+                dtype=torch.bfloat16,
+                device=device,
+            )
         deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(
             (hidden_fp4_grouped, hidden_scale_grouped),
             (self._ppu_w2, self._ppu_s2),
@@ -622,15 +687,39 @@ class DeepEPStrategy(RoutedExpertsStrategy):
         )
         if not isinstance(expert_x, tuple) or len(expert_x) != 2:
             raise RuntimeError("DeepEP LL MXFP4 dispatch must return (data, scale)")
+        # Claim the combine buffer BEFORE the experts run so the down-projection
+        # GEMM can write into it directly -- DeepEP documents this buffer as one
+        # the caller fills itself, precisely to avoid a staging copy.  Only under
+        # no-compact, where the compute shape equals the slot shape; and only
+        # when its bytes are disjoint from the dispatch payload the first GEMM
+        # still reads, since the two can share one RDMA arena.
+        expert_y_pre = None
+        if _LL_NO_COMPACT:
+            candidate = wrapper.buffer.get_next_low_latency_combine_buffer(handle)
+            payload, scale = expert_x
+            if _spans_overlap(candidate, payload) or _spans_overlap(candidate, scale):
+                logging.warning(
+                    "[LL_NO_COMPACT] combine buffer overlaps the dispatch payload; "
+                    "falling back to the compacting copy"
+                )
+            else:
+                expert_y_pre = candidate
         compact_expert_y = self._compute_ppu_grouped_fp4_packed(
-            expert_x, expert_num_tokens
+            expert_x, expert_num_tokens, out=expert_y_pre
         )
         # The LL RDMA buffer already owns the required full slot geometry.  Do
         # not allocate another [E, ll_capacity, D] tensor (768 MiB for V4 at
         # gamma3); copy only the compact valid prefix into the next combine
         # buffer and let the handle's receive counts delimit the rows consumed.
-        expert_y = wrapper.buffer.get_next_low_latency_combine_buffer(handle)
-        expert_y[:, : compact_expert_y.size(1), :].copy_(compact_expert_y)
+        expert_y = (
+            expert_y_pre
+            if expert_y_pre is not None
+            else wrapper.buffer.get_next_low_latency_combine_buffer(handle)
+        )
+        # Equal pointers mean the GEMM already landed in place; copying a tensor
+        # onto itself is not merely wasteful here, it is an aliased overlap.
+        if compact_expert_y.data_ptr() != expert_y.data_ptr():
+            expert_y[:, : compact_expert_y.size(1), :].copy_(compact_expert_y)
         combine_args = {
             "x": expert_y,
             "topk_idx": dispatch_args["topk_idx"],
