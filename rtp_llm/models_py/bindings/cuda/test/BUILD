@@ -3,6 +3,25 @@ load("@arch_config//:arch_select.bzl", "torch_deps")
 
 cc_test = cc_test_wrapper
 
+ppu_silu_mul_mxfp4_sources = [
+    "//rtp_llm/models_py/bindings/cuda:ppu_silu_mul_mxfp4_op_source",
+    "//rtp_llm/models_py/bindings/cuda/kernels:ppu_silu_mul_mxfp4_kernel_source",
+]
+
+py_test(
+    name = "test_ppu_silu_mul_mxfp4_source",
+    srcs = ["test_ppu_silu_mul_mxfp4_source.py"],
+    data = ppu_silu_mul_mxfp4_sources,
+    tags = ["source-only"],
+)
+
+py_test(
+    name = "test_ppu_silu_mul_masked_mxfp4_source",
+    srcs = ["test_ppu_silu_mul_masked_mxfp4_source.py"],
+    data = ppu_silu_mul_mxfp4_sources,
+    tags = ["source-only"],
+)
+
 cc_import(
     name = "cuda13_torch_nvshmem",
     shared_library = "@pip_gpu_cuda13_torch_torch//:site-packages/torch/lib/libtorch_nvshmem.so",

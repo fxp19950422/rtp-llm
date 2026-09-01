@@ -1,0 +1,15 @@
+Apache-2.0 third-party source notice
+
+This AOT PPU kernel is adapted from SGLang v0.5.14_release:
+  python/sglang/jit_kernel/csrc/elementwise/silu_and_mul_masked_post_quant_mxfp4.cuh
+
+Frozen source SHA256:
+  093f2e2cfd2a63a8bb495760a8ce83a847635355fd0093fa506bc02d6a6995f5
+
+Upstream project: https://github.com/sgl-project/sglang
+Upstream license: Apache License 2.0
+Local modifications: removed the TVM/JIT wrapper (which is what dragged in the
+C++20 <concepts> headers that crash the PPU SDK 2.1.0 clang), retained the PPU
+device algorithm unchanged, pinned the template parameters to the measured arm
+(kBlockN=256, kStages=2, kSwizzle=true), and exposed an RTP-LLM AOT launcher
+using the caller's current stream.

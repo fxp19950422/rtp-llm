@@ -3,6 +3,18 @@ load("@arch_config//:arch_select.bzl", "torch_deps")
 
 package(default_visibility=["//rtp_llm:__subpackages__"])
 
+filegroup(
+    name = "ppu_silu_mul_mxfp4_op_source",
+    srcs = [
+        "PpuSiluMulMaskedMxfp4Op.cc",
+        "PpuSiluMulMaskedMxfp4Op.h",
+        "PpuSiluMulMxfp4Op.cc",
+        "PpuSiluMulMxfp4Op.h",
+        "RegisterBaseBindings.hpp",
+    ],
+    visibility = ["//visibility:public"],
+)
+
 cc_library(
     name = "cuda_host_utils",
     srcs = [
@@ -182,6 +194,7 @@ cc_library(
     ] + select({
         "@//:using_ppu": [
             "//rtp_llm/models_py/bindings/cuda/kernels:ppu_silu_mul_mxfp4",
+            "//rtp_llm/models_py/bindings/cuda/kernels:ppu_silu_mul_masked_mxfp4",
         ],
         "//conditions:default": [],
     }) + select({

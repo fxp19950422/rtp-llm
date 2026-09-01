@@ -27,6 +27,24 @@ cuda_deps = [
     "@local_config_cuda//cuda:cudart",
 ]
 
+# The cc_library targets below are PPU-only, so a source-reading test cannot
+# depend on them without inheriting that constraint.  This filegroup carries the
+# same files with no platform gate, so the contract tests re-run whenever the
+# kernels or their build wiring drift.
+filegroup(
+    name = "ppu_silu_mul_mxfp4_kernel_source",
+    srcs = [
+        "BUILD",
+        "ppu_silu_mul_masked_mxfp4.NOTICE",
+        "ppu_silu_mul_masked_mxfp4.cu",
+        "ppu_silu_mul_masked_mxfp4.h",
+        "ppu_silu_mul_mxfp4.NOTICE",
+        "ppu_silu_mul_mxfp4.cu",
+        "ppu_silu_mul_mxfp4.h",
+    ],
+    visibility = ["//visibility:public"],
+)
+
 # Apache-2.0 PPU AOT port from SGLang v0.5.14_release. This target is
 # reachable only through the @//:using_ppu select in cuda_bindings.
 cc_library(
@@ -34,6 +52,23 @@ cc_library(
     srcs = ["ppu_silu_mul_mxfp4.cu"],
     hdrs = ["ppu_silu_mul_mxfp4.h"],
     data = ["ppu_silu_mul_mxfp4.NOTICE"],
+    deps = [
+        "@local_config_cuda//cuda:cuda_headers",
+        "@local_config_cuda//cuda:cudart",
+    ],
+    copts = cuda_copts(),
+    target_compatible_with = select({
+        "@//:using_ppu": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    visibility = ["//visibility:public"],
+)
+
+cc_library(
+    name = "ppu_silu_mul_masked_mxfp4",
+    srcs = ["ppu_silu_mul_masked_mxfp4.cu"],
+    hdrs = ["ppu_silu_mul_masked_mxfp4.h"],
+    data = ["ppu_silu_mul_masked_mxfp4.NOTICE"],
     deps = [
         "@local_config_cuda//cuda:cuda_headers",
         "@local_config_cuda//cuda:cudart",
