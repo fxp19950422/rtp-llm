@@ -57,6 +57,19 @@ py_test(
 )
 
 py_test(
+    name = "test_capacity_overflow_monitor",
+    srcs = ["test_capacity_overflow_monitor.py"],
+    deps = [
+        "//rtp_llm/models_py:modules",
+        "//rtp_llm:testlib",
+    ],
+    target_compatible_with = select({
+        "@//:using_ppu": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)
+
+py_test(
     name = "test_t24_dp_contract",
     srcs = ["test_t24_dp_contract.py"],
     deps = [

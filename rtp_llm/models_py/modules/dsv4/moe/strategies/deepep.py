@@ -12,6 +12,7 @@ Direct port of the pre-refactor ``_routed_experts_deepep`` +
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 from typing import Dict, Optional, Sequence, Tuple
@@ -72,10 +73,14 @@ class _CapacityOverflowMonitor:
     def read(self, reset: bool = True):
         """Return ``(dropped_routes, max_count_seen)`` or ``None``.
 
-        Performs a device-to-host sync: **never call during graph capture or
-        replay.**
+        Performs a device-to-host sync, which a CUDA graph capture forbids.
+        Callers guard too, but guard here as well: this is a debug reader and a
+        future caller reaching it from inside a capture would abort the engine,
+        not just lose a statistic.
         """
         if self._stats is None:
+            return None
+        if _graph_capture_active():
             return None
         vals = self._stats.tolist()
         if reset:
@@ -101,6 +106,67 @@ def read_capacity_overflow_stats(reset: bool = True):
     if not seen_any:
         return None
     return dropped, max_seen
+
+
+# 0 disables the log.  N>0 emits one line every N eager calls.
+_OVF_LOG_EVERY = int(os.environ.get("DSV4_MOE_CAPACITY_OVERFLOW_LOG_EVERY", "0"))
+_OVF_LOG_CALLS = [0]
+
+
+def _graph_capture_active() -> bool:
+    """True while a CUDA graph capture is in flight on the current stream.
+
+    Reading the monitor syncs device->host, which the capture forbids.  Ask the
+    runtime rather than trusting the caller to only enable the log on eager
+    runs: production decode captures graphs, so a caller-side rule is one
+    forgotten export away from aborting the engine during warmup.
+    """
+    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+
+
+def _maybe_log_capacity_overflow(capacity, counts=None):
+    """Emit overflow stats every ``_OVF_LOG_EVERY`` eager calls.
+
+    Sits on the forward path, so it must be a no-op during graph capture; the
+    call counter only advances on calls that could actually log, otherwise the
+    period would depend on how many capture passes ran first.
+    """
+    if _OVF_LOG_EVERY <= 0:
+        return
+    if _graph_capture_active():
+        return
+    _OVF_LOG_CALLS[0] += 1
+    if _OVF_LOG_CALLS[0] % _OVF_LOG_EVERY:
+        return
+    got = read_capacity_overflow_stats(reset=False)
+    if got is None:
+        return
+    dist = ""
+    if counts is not None and counts.numel() > 0:
+        c64 = counts.to(torch.int64)
+        # One sync for the whole tuple; capture already ruled out above.
+        vals = torch.stack(
+            [
+                c64.sum(),
+                c64.max(),
+                c64.argmax().to(torch.int64),
+                (c64 > 0).sum(),
+                c64.min(),
+            ]
+        ).tolist()
+        dist = (
+            " n_local_experts=%d routes_sum=%d step_max=%d step_argmax=%d"
+            " active_experts=%d step_min=%d"
+            % (counts.numel(), vals[0], vals[1], vals[2], vals[3], vals[4])
+        )
+    logging.info(
+        "[CAPACITY_OVERFLOW] calls=%d capacity=%d dropped_routes=%d max_count_seen=%d%s",
+        _OVF_LOG_CALLS[0],
+        capacity,
+        got[0],
+        got[1],
+        dist,
+    )
 
 
 def _ppu_grouped_fp4_enabled() -> bool:
@@ -436,6 +502,7 @@ class DeepEPStrategy(RoutedExpertsStrategy):
                 f"got {expert_num_tokens.numel()}"
             )
         self._ovf.record(expert_num_tokens, compute_capacity)
+        _maybe_log_capacity_overflow(compute_capacity, expert_num_tokens)
         safe_counts = (
             expert_num_tokens.clamp(min=0, max=compute_capacity)
             .to(torch.int32)
