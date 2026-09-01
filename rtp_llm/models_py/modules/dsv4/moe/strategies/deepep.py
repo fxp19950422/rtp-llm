@@ -234,6 +234,27 @@ _LL_NO_COMPACT = os.environ.get("DSV4_MOE_LL_NO_COMPACT", "0").strip().lower() i
 _LL_NO_COMPACT_LOGGED = [False]
 
 
+# The masked SwiGLU+MXFP4 kernel computes only the rows below each expert's
+# count, so the activation stops scaling with the compute slot.  It is wired next
+# to ``_LL_NO_COMPACT`` because the two are one candidate, not two: in one
+# in-situ decode measurement the activation is 27.8 us compacted, 436.1 us with
+# no-compact alone, and 13.8 us with no-compact plus this kernel.  Enabling only
+# the former is a net loss.
+_MASKED_SILU = os.environ.get("DSV4_MOE_MASKED_SILU", "0").strip().lower() in (
+    "1",
+    "true",
+    "on",
+    "yes",
+)
+_MASKED_SILU_LOGGED = [False]
+_MASKED_SILU_SKIP_LOGGED = [False]
+# The kernel emits scale bytes for the block-padded hidden width.  When the width
+# is a multiple of the block the padding is empty and the returned view carries
+# the same strides the compact path materializes; otherwise the expert stride
+# grows, and no masked GEMM has been run against that stride.
+_MASKED_SILU_BLOCK_N = 256
+
+
 def _tensor_byte_span(t) -> Tuple[int, int]:
     """Exact ``[start, end)`` byte range a strided tensor can touch.
 
@@ -634,27 +655,67 @@ class DeepEPStrategy(RoutedExpertsStrategy):
             safe_counts,
             expected_m,
         )
-        gate_up = gate_up_grouped.view(total, 2 * inter)
-        # Match the SGLang PPU runner: consume the grouped GEMM's BF16 gate/up
-        # output directly and fuse SwiGLU with MXFP4 packing.  The old chain
-        # materialized two FP32 halves, an FP32 activation, and a BF16 tensor
-        # before launching a separate quantizer on every routed layer.
         swiglu_limit = cfg.swiglu_limit if cfg.swiglu_limit > 0 else None
-        hidden_fp4, hidden_scale = (
-            rtp_llm_ops.ppu_silu_and_mul_post_quant_mxfp4(
-                gate_up, swiglu_limit
+        use_masked_silu = _MASKED_SILU
+        if use_masked_silu and inter % _MASKED_SILU_BLOCK_N:
+            if not _MASKED_SILU_SKIP_LOGGED[0]:
+                _MASKED_SILU_SKIP_LOGGED[0] = True
+                logging.warning(
+                    "[MASKED_SILU] inter=%d is not a multiple of %d, so the "
+                    "scale view's expert stride would differ from the compact "
+                    "path's; keeping the unmasked kernel",
+                    inter,
+                    _MASKED_SILU_BLOCK_N,
+                )
+            use_masked_silu = False
+        if use_masked_silu:
+            if not _MASKED_SILU_LOGGED[0]:
+                _MASKED_SILU_LOGGED[0] = True
+                logging.info(
+                    "[MASKED_SILU] on: E=%d capacity=%d inter=%d",
+                    E,
+                    compute_capacity,
+                    inter,
+                )
+            # Only the rows below ``safe_counts[e]`` are written; the rest keep
+            # whatever the allocator left there.  That is already true of
+            # ``gate_up_grouped`` above, and the masked GEMM below does not read
+            # past an expert's count.  ``compute_capacity`` as the row hint means
+            # "do not cap blocks per expert" -- it only trades occupancy.
+            #
+            # The scale comes back as the mn-major [E, M, S] view the GEMM wants,
+            # because [E, S, M] is this kernel's native layout.  The unmasked
+            # branch below has to pay a contiguous transpose to get there.
+            hidden_fp4_grouped, hidden_scale_grouped = (
+                rtp_llm_ops.ppu_silu_and_mul_masked_post_quant_mxfp4(
+                    gate_up_grouped,
+                    safe_counts,
+                    swiglu_limit,
+                    compute_capacity,
+                )
             )
-        )
-        hidden_fp4_grouped = hidden_fp4.view(E, compute_capacity, -1)
-        hidden_scale_grouped = hidden_scale.as_strided(
-            (E, compute_capacity, hidden_scale.size(1)),
-            (compute_capacity, 1, total),
-        )
-        hidden_scale_grouped = (
-            hidden_scale_grouped.permute(0, 2, 1)
-            .contiguous()
-            .permute(0, 2, 1)
-        )
+        else:
+            gate_up = gate_up_grouped.view(total, 2 * inter)
+            # Match the SGLang PPU runner: consume the grouped GEMM's BF16
+            # gate/up output directly and fuse SwiGLU with MXFP4 packing.  The
+            # old chain materialized two FP32 halves, an FP32 activation, and a
+            # BF16 tensor before launching a separate quantizer on every routed
+            # layer.
+            hidden_fp4, hidden_scale = (
+                rtp_llm_ops.ppu_silu_and_mul_post_quant_mxfp4(
+                    gate_up, swiglu_limit
+                )
+            )
+            hidden_fp4_grouped = hidden_fp4.view(E, compute_capacity, -1)
+            hidden_scale_grouped = hidden_scale.as_strided(
+                (E, compute_capacity, hidden_scale.size(1)),
+                (compute_capacity, 1, total),
+            )
+            hidden_scale_grouped = (
+                hidden_scale_grouped.permute(0, 2, 1)
+                .contiguous()
+                .permute(0, 2, 1)
+            )
         if (
             out is not None
             and out.dtype == torch.bfloat16

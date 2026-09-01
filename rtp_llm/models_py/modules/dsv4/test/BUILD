@@ -96,6 +96,15 @@ py_test(
 )
 
 py_test(
+    name = "test_masked_silu_wiring",
+    srcs = ["test_masked_silu_wiring.py"],
+    # Source-only: inspects the strategy's AST without importing torch, so the
+    # wiring is checked on every platform, not just where PPU is present.
+    data = ["//rtp_llm/models_py:modules"],
+    tags = ["source-only"],
+)
+
+py_test(
     name = "test_t24_dp_contract",
     srcs = ["test_t24_dp_contract.py"],
     deps = [
