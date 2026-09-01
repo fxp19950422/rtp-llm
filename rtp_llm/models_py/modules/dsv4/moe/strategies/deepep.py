@@ -169,6 +169,15 @@ def _maybe_log_capacity_overflow(capacity, counts=None):
     )
 
 
+def _ppu_deepep_compact_copy_2d_enabled() -> bool:
+    return os.environ.get("DSV4_PPU_DEEPEP_COMPACT_COPY_2D", "0").strip().lower() in (
+        "1",
+        "true",
+        "on",
+        "yes",
+    )
+
+
 def _ppu_grouped_fp4_enabled() -> bool:
     return os.environ.get("DSV4_PPU_GROUPED_FP4", "0").strip().lower() in (
         "1",
@@ -271,6 +280,13 @@ class DeepEPStrategy(RoutedExpertsStrategy):
         # Fixed-capacity overflow observability; see _CapacityOverflowMonitor.
         self._ovf = _CapacityOverflowMonitor()
         _CAPACITY_OVERFLOW_INSTANCES.append(self._ovf)
+        self._ppu_deepep_compact_copy_2d = _ppu_deepep_compact_copy_2d_enabled()
+        if self._ppu_deepep_compact_copy_2d:
+            from ._compact_prefix_copy import prepare_compact_prefix_copy
+
+            # Resolve the cudart entry points now: doing it lazily would put a
+            # dlopen on the first captured forward.
+            prepare_compact_prefix_copy()
 
     @classmethod
     def can_handle(cls, cfg: MoeCfg) -> bool:
@@ -718,8 +734,14 @@ class DeepEPStrategy(RoutedExpertsStrategy):
         )
         # Equal pointers mean the GEMM already landed in place; copying a tensor
         # onto itself is not merely wasteful here, it is an aliased overlap.
+        # Whether to copy is decided here; how to copy is the flag below.
         if compact_expert_y.data_ptr() != expert_y.data_ptr():
-            expert_y[:, : compact_expert_y.size(1), :].copy_(compact_expert_y)
+            if self._ppu_deepep_compact_copy_2d:
+                from ._compact_prefix_copy import compact_to_strided_prefix
+
+                compact_to_strided_prefix(compact_expert_y, expert_y)
+            else:
+                expert_y[:, : compact_expert_y.size(1), :].copy_(compact_expert_y)
         combine_args = {
             "x": expert_y,
             "topk_idx": dispatch_args["topk_idx"],

@@ -104,6 +104,7 @@ def _strategy(max_tokens_per_rank=1):
         max_tokens_per_rank=max_tokens_per_rank,
     )
     strategy._local = _FakeLocal()
+    strategy._ppu_deepep_compact_copy_2d = False
     return strategy
 
 
@@ -237,6 +238,30 @@ class DeepEPGraphDispatchTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "requires the M890P grouped-FP4"):
             _strategy()(self.x, self.weights, self.indices)
+
+    def test_low_latency_can_use_compact_prefix_copy_2d(self) -> None:
+        buffer = _FakeLowLatencyBuffer()
+        DeepEPWrapper._instance = SimpleNamespace(
+            mode=DeepEPMode.LOW_LATENCY,
+            buffer=buffer,
+            ll_num_max_token_per_rank=4,
+            use_accl_ep=True,
+        )
+        strategy = _strategy(max_tokens_per_rank=4)
+        strategy._ppu_grouped_fp4 = True
+        strategy._ppu_deepep_compact_copy_2d = True
+        packed_y = torch.ones(32, 128, 4, dtype=torch.bfloat16)
+        with patch.object(
+            strategy, "_compute_ppu_grouped_fp4_packed", return_value=packed_y
+        ), patch(
+            "rtp_llm.models_py.modules.dsv4.moe.strategies._compact_prefix_copy.compact_to_strided_prefix"
+        ) as prefix_copy:
+            out = strategy(self.x, self.weights, self.indices)
+
+        self.assertEqual(tuple(out.shape), (1, 4))
+        prefix_copy.assert_called_once_with(packed_y, buffer.combine_buffer)
+        self.assertIs(buffer.combine_args["x"], buffer.combine_buffer)
+        self.assertTrue(buffer.combine_args["zero_copy"])
 
     def test_low_latency_grouped_leaf_uses_fused_ppu_swiglu_quant(self) -> None:
         source_path = (

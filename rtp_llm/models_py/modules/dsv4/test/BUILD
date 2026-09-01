@@ -70,6 +70,19 @@ py_test(
 )
 
 py_test(
+    name = "test_compact_prefix_copy_ppu",
+    srcs = ["test_compact_prefix_copy_ppu.py"],
+    deps = [
+        "//rtp_llm/models_py:modules",
+        "//rtp_llm:testlib",
+    ],
+    target_compatible_with = select({
+        "@//:using_ppu": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)
+
+py_test(
     name = "test_ll_no_compact",
     srcs = ["test_ll_no_compact.py"],
     deps = [
