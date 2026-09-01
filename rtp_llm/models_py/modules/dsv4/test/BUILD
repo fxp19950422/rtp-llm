@@ -537,3 +537,16 @@ py_test(
     exec_properties = {"gpu": "SM100_ARM", "gpu_count": "1"},
     target_compatible_with = _DSV4_CUDA13_ONLY,
 )
+
+py_test(
+    name = "test_silu_mul_split",
+    srcs = ["test_silu_mul_split.py"],
+    deps = [
+        "//rtp_llm/models_py:modules",
+        "//rtp_llm:testlib",
+    ],
+    target_compatible_with = select({
+        "@//:using_ppu": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)

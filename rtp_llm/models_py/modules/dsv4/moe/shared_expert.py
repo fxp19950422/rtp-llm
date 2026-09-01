@@ -27,6 +27,20 @@ def _mode() -> str:
     return os.environ.get("DSV4_SHARED_EXPERT_MODE", "sequential").strip().lower()
 
 
+def shared_expert_bf16_path_enabled() -> bool:
+    """The FP32 round trip is the deployed default; ``1`` keeps everything BF16."""
+
+    requested = os.environ.get("DSV4_SHARED_EXPERT_BF16_PATH", "").strip().lower()
+    if requested in ("", "0", "off", "false", "no"):
+        return False
+    if requested in ("1", "on", "true", "yes"):
+        return True
+    raise ValueError(
+        "invalid DSV4_SHARED_EXPERT_BF16_PATH="
+        f"{requested!r}; expected 1 (bf16) or 0 (fp32)"
+    )
+
+
 def strict_fused_moe_enabled() -> bool:
     return os.environ.get("DSV4_MOE_STRICT_FUSED", "1") != "0"
 
@@ -129,6 +143,29 @@ class W13SharedExpert(nn.Module):
         self, x: torch.Tensor, weights: torch.Tensor | None = None
     ) -> torch.Tensor:
         dtype = x.dtype
+        if shared_expert_bf16_path_enabled():
+            # One kernel over the packed gate/up tensor: no FP32 copy of the
+            # GEMM output, no two contiguous copies of the halves, no cast back.
+            # The arithmetic is unchanged -- the kernel widens the BF16 rows in
+            # registers and clamps/silus/multiplies in FP32 exactly as before --
+            # but the rounding back to BF16 moves from the trailing ``.to(dtype)``
+            # to the kernel's store.  With ``weights is None``, the only form the
+            # production caller uses, that is the same single rounding and the two
+            # paths agree bitwise (test/test_silu_mul_split.py).  Passing
+            # ``weights`` rounds before the multiply instead of after, so there
+            # the paths are close rather than identical.
+            with record_function_range("dsv4.shared_expert.w13"):
+                gate_up = self._apply_layer(self.w13, x)
+            with record_function_range("dsv4.shared_expert.silu_mul"):
+                from .._silu_mul_split_triton import silu_mul_split_packed
+
+                hidden = silu_mul_split_packed(
+                    gate_up.contiguous(), clamp_limit=self.swiglu_limit
+                )
+            if weights is not None:
+                hidden = weights * hidden
+            with record_function_range("dsv4.shared_expert.w2"):
+                return self._apply_layer(self.w2, hidden.to(dtype))
         with record_function_range("dsv4.shared_expert.w13"):
             gate_up = self._apply_layer(self.w13, x).float()
             gate, up = gate_up.chunk(2, dim=-1)
@@ -536,6 +573,10 @@ def _run_shared_expert(
         raise RuntimeError(
             "DSV4_MOE_STRICT_FUSED=1 forbids generic Expert.forward shared path"
         )
+    if shared_expert_bf16_path_enabled():
+        # The epilogue kernel widens both operands to FP32 itself, so an FP32
+        # copy of these BF16 values buys nothing and costs a full pass.
+        return shared_experts(x)
     return shared_experts(x).float()
 
 

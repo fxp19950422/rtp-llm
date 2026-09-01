@@ -125,3 +125,92 @@ def silu_mul_split(
         num_stages=2,
     )
     return out
+
+
+@triton.jit
+def _silu_mul_packed_kernel(
+    gate_up_ptr,  # [N, 2D] contiguous, any float dtype
+    out_ptr,  # [N, D] same dtype as gate_up
+    N: tl.int32,
+    D: tl.int32,
+    in_row_stride: tl.int32,
+    out_row_stride: tl.int32,
+    CLAMP_LIMIT: tl.constexpr,
+    APPLY_CLAMP: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Same arithmetic as ``_silu_mul_split_kernel`` on a packed gate/up row.
+
+    The two halves are read in place, widened to FP32 for the clamp/silu/mul,
+    and rounded once on store -- so the caller needs neither an FP32 copy of
+    the GEMM output nor two ``contiguous`` copies of the halves.
+    """
+    pid_n = tl.program_id(axis=0).to(tl.int64)
+    pid_d = tl.program_id(axis=1).to(tl.int64)
+    if pid_n >= N:
+        return
+
+    d_off = pid_d * BLOCK_D + tl.arange(0, BLOCK_D).to(tl.int64)
+    mask = d_off < D
+    in_base = pid_n * in_row_stride
+
+    g = tl.load(gate_up_ptr + in_base + d_off, mask=mask, other=0.0).to(tl.float32)
+    u = tl.load(gate_up_ptr + in_base + D + d_off, mask=mask, other=0.0).to(tl.float32)
+
+    if APPLY_CLAMP:
+        u = tl.where(u > CLAMP_LIMIT, CLAMP_LIMIT, u)
+        u = tl.where(u < -CLAMP_LIMIT, -CLAMP_LIMIT, u)
+        g = tl.where(g > CLAMP_LIMIT, CLAMP_LIMIT, g)
+
+    s = g * tl.sigmoid(g)
+    tl.store(out_ptr + pid_n * out_row_stride + d_off, s * u, mask=mask)
+
+
+def silu_mul_split_packed(
+    gate_up: torch.Tensor,  # [..., 2D] contiguous
+    clamp_limit: float = 0.0,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Fused SiLU + optional SwiGLU clamp + multiply over a packed gate/up tensor.
+
+    Equivalent to ``silu_mul_split(*gate_up.chunk(2, dim=-1), clamp_limit)`` but
+    without materialising FP32 copies of the input or the result.
+    """
+    assert gate_up.is_contiguous(), "gate_up must be contiguous"
+    assert gate_up.shape[-1] % 2 == 0, f"gate_up last dim must be even, got {gate_up.shape}"
+
+    orig_shape = gate_up.shape
+    packed = orig_shape[-1]
+    D = packed // 2
+    N = gate_up.numel() // packed
+
+    if out is None:
+        out = torch.empty(
+            tuple(orig_shape[:-1]) + (D,), dtype=gate_up.dtype, device=gate_up.device
+        )
+    else:
+        assert out.dtype == gate_up.dtype and out.is_contiguous()
+        assert tuple(out.shape) == tuple(orig_shape[:-1]) + (D,)
+
+    if N == 0 or D == 0:
+        return out
+
+    flat_in = gate_up.reshape(N, packed)
+    flat_out = out.reshape(N, D)
+    BLOCK_D = 1024 if D >= 1024 else triton.next_power_of_2(D)
+    grid = (N, triton.cdiv(D, BLOCK_D))
+
+    _silu_mul_packed_kernel[grid](
+        flat_in,
+        flat_out,
+        N=N,
+        D=D,
+        in_row_stride=flat_in.stride(0),
+        out_row_stride=flat_out.stride(0),
+        CLAMP_LIMIT=float(clamp_limit) if clamp_limit > 0 else 0.0,
+        APPLY_CLAMP=clamp_limit > 0,
+        BLOCK_D=BLOCK_D,
+        num_warps=4,
+        num_stages=2,
+    )
+    return out

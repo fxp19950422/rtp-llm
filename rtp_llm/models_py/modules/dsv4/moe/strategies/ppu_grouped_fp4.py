@@ -297,9 +297,7 @@ class PpuGroupedFP4Strategy(RoutedExpertsStrategy):
         from internal_source.rtp_llm.models_py.kernels.ppu_moe_exact_gather import (
             gather_local_loop_compatible,
         )
-        from rtp_llm.models_py.modules.dsv4.moe.expert import (
-            require_silu_mul_split,
-        )
+        from rtp_llm.ops.compute_ops import rtp_llm_ops
 
         experts = int(self.cfg.n_local_experts)
         adjusted_ids = indices.contiguous()
@@ -328,12 +326,13 @@ class PpuGroupedFP4Strategy(RoutedExpertsStrategy):
             expert_counts,
         )
 
-        hidden = require_silu_mul_split()(
-            gate_up[:, : self.inter_local].float().contiguous(),
-            gate_up[:, self.inter_local :].float().contiguous(),
-            clamp_limit=self.cfg.swiglu_limit,
-        ).to(torch.bfloat16).contiguous()
-        hidden_fp4, hidden_scale = downcast_to_mxfp4(hidden)
+        # Fused SwiGLU+clamp+mul + mxfp4 quant in one PPU kernel.  Replaces the
+        # FP32 round-trip (two fp32 copies, a bf16 copy, then a separate
+        # quantizer) that the decode strategy already retired.
+        swiglu_limit = self.cfg.swiglu_limit if self.cfg.swiglu_limit > 0 else None
+        hidden_fp4, hidden_scale = rtp_llm_ops.ppu_silu_and_mul_post_quant_mxfp4(
+            gate_up, swiglu_limit
+        )
         down = torch.empty((total, dim), dtype=torch.bfloat16, device=x.device)
         self._grouped_gemm(
             (hidden_fp4, hidden_scale),

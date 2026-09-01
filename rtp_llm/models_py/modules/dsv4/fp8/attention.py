@@ -86,6 +86,10 @@ from rtp_llm.models_py.modules.dsv4.rope import (
     apply_rotary_emb_batched,
     precompute_freqs_cis,
 )
+from internal_source.rtp_llm.models_py.modules.dsv4._inv_rope_inplace_triton import (
+    inv_rope_inplace,
+    inv_rope_inplace_enabled,
+)
 from rtp_llm.models_py.modules.factory.linear import LinearFactory
 from rtp_llm.models_py.utils.memory import dispose_tensor
 from rtp_llm.ops.compute_ops import rtp_llm_ops
@@ -2066,7 +2070,17 @@ class AttentionFP8(nn.Module):
         assert self.wo_a is not None
         o_4d = o.view(B, S, self.n_heads, self.head_dim)
         rope = o_4d[..., -self.rope_head_dim :]
-        if freqs_cis.dim() == 2 and int(freqs_cis.shape[0]) == B:
+        per_request = freqs_cis.dim() == 2 and int(freqs_cis.shape[0]) == B
+        if inv_rope_inplace_enabled():
+            # Same FP32 complex multiply, but the BF16 slice is rotated in
+            # registers instead of through an FP32 materialisation and a copy_.
+            inv_rope_inplace(
+                rope,
+                freqs_cis if per_request
+                else freqs_cis.reshape(-1, freqs_cis.shape[-1]).contiguous(),
+                per_request,
+            )
+        elif per_request:
             apply_rotary_emb_batched(rope, freqs_cis, inverse=True)
         else:
             apply_rotary_emb(

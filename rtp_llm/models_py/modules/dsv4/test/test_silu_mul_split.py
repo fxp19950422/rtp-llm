@@ -23,7 +23,7 @@ import torch
 import torch.nn.functional as F
 
 
-def _load_silu_mul_split():
+def _load_module():
     here = os.path.dirname(os.path.abspath(__file__))
     src = os.path.abspath(
         os.path.join(here, "..", "_silu_mul_split_triton.py")
@@ -31,7 +31,11 @@ def _load_silu_mul_split():
     spec = importlib.util.spec_from_file_location("_v4_silu_mul_split", src)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
-    return mod.silu_mul_split
+    return mod
+
+
+def _load_silu_mul_split():
+    return _load_module().silu_mul_split
 
 
 def _ref_silu_mul(gate: torch.Tensor, up: torch.Tensor, clamp_limit: float):
@@ -137,6 +141,144 @@ class SiluMulSplitEquivTest(unittest.TestCase):
         self.assertFalse(torch.allclose(no_clamp, clamped))
         # Clamped result matches eager clamped result.
         self.assertTrue(torch.allclose(clamped, _ref_silu_mul(gate, up, 2.0)))
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+class SiluMulSplitPackedTest(unittest.TestCase):
+    """Backs the bit-identity claim in ``moe/shared_expert.py``.
+
+    ``DSV4_SHARED_EXPERT_BF16_PATH=1`` replaces
+    ``silu_mul_split(gate.float(), up.float()).to(bf16)`` with one kernel over
+    the packed BF16 gate/up tensor.  With ``weights is None`` -- the only form
+    the production caller uses -- the rounding to BF16 just moves from the
+    trailing ``.to(dtype)`` to the kernel's store, so the two paths must agree
+    *bitwise*, not approximately.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            mod = _load_module()
+        except Exception as e:
+            raise unittest.SkipTest(f"_silu_mul_split_triton not importable: {e}")
+        if not hasattr(mod, "silu_mul_split_packed"):
+            raise unittest.SkipTest("silu_mul_split_packed not present")
+
+    def _fp32_path(self, gate_up, clamp_limit):
+        """Exactly what W13SharedExpert.forward did before the packed kernel."""
+        mod = _load_module()
+        D = gate_up.shape[-1] // 2
+        promoted = gate_up.float()
+        gate, up = promoted[..., :D], promoted[..., D:]
+        hidden = mod.silu_mul_split(
+            gate.contiguous(), up.contiguous(), clamp_limit=clamp_limit
+        )
+        return hidden.to(gate_up.dtype)
+
+    def _make_gate_up(self, N, D, clamp_limit, seed=0):
+        torch.manual_seed(seed)
+        gate_up = (
+            torch.randn(N, 2 * D, device="cuda:0", dtype=torch.bfloat16) * 2.0
+        )
+        if clamp_limit > 0:
+            # Force both clamp arms (gate upper only, up on both sides).
+            gate_up[0, :8] = clamp_limit + 1.0
+            gate_up[0, D : D + 8] = clamp_limit + 1.0
+            gate_up[-1, D : D + 8] = -(clamp_limit + 1.0)
+        return gate_up.contiguous()
+
+    def _assert_bitwise(self, *, N, D, clamp_limit):
+        mod = _load_module()
+        gate_up = self._make_gate_up(N, D, clamp_limit)
+        reference = self._fp32_path(gate_up, clamp_limit)
+        packed = mod.silu_mul_split_packed(gate_up, clamp_limit=clamp_limit)
+
+        self.assertEqual(packed.shape, reference.shape)
+        self.assertEqual(packed.dtype, torch.bfloat16)
+        mismatched = int((packed != reference).sum().item())
+        self.assertEqual(
+            mismatched,
+            0,
+            f"{mismatched}/{reference.numel()} elements differ "
+            f"(N={N},D={D},L={clamp_limit}); the paths must round once, "
+            "not twice",
+        )
+
+    def test_shared_expert_v4flash_no_clamp(self):
+        # The deployed shared-expert shape: swiglu_limit is 0 there.
+        self._assert_bitwise(N=128, D=2048, clamp_limit=0.0)
+
+    def test_clamped(self):
+        self._assert_bitwise(N=64, D=2048, clamp_limit=7.0)
+
+    def test_small_and_non_pow2_D(self):
+        self._assert_bitwise(N=16, D=384, clamp_limit=0.0)
+        self._assert_bitwise(N=8, D=1500, clamp_limit=3.0)
+
+    def test_single_token_and_large_batch(self):
+        self._assert_bitwise(N=1, D=2048, clamp_limit=5.0)
+        self._assert_bitwise(N=2048, D=2048, clamp_limit=0.0)
+
+    def test_3d_input_flattens(self):
+        mod = _load_module()
+        torch.manual_seed(42)
+        gate_up = torch.randn(
+            4, 32, 512, device="cuda:0", dtype=torch.bfloat16
+        ).contiguous()
+        out = mod.silu_mul_split_packed(gate_up, clamp_limit=0.0)
+        self.assertEqual(out.shape, (4, 32, 256))
+        self.assertEqual(
+            int((out != self._fp32_path(gate_up, 0.0)).sum().item()), 0
+        )
+
+    def test_empty_N(self):
+        mod = _load_module()
+        gate_up = torch.empty(0, 4096, device="cuda:0", dtype=torch.bfloat16)
+        out = mod.silu_mul_split_packed(gate_up, clamp_limit=0.0)
+        self.assertEqual(out.shape, (0, 2048))
+        self.assertEqual(out.dtype, torch.bfloat16)
+
+    def test_rejects_non_contiguous_and_odd_last_dim(self):
+        mod = _load_module()
+        base = torch.randn(8, 4096, device="cuda:0", dtype=torch.bfloat16)
+        with self.assertRaises(AssertionError):
+            mod.silu_mul_split_packed(base.t(), clamp_limit=0.0)
+        with self.assertRaises(AssertionError):
+            mod.silu_mul_split_packed(
+                torch.randn(8, 4097, device="cuda:0", dtype=torch.bfloat16),
+                clamp_limit=0.0,
+            )
+
+    def test_weighted_form_is_close_but_not_promised_bitwise(self):
+        """The other half of the comment: with ``weights`` the paths differ.
+
+        The BF16 arm rounds the SiLU product before multiplying by weights;
+        the FP32 arm multiplies first and rounds once.  Production never takes
+        this form, so the contract is closeness -- pinned here so the comment
+        cannot quietly become a lie.
+        """
+        mod = _load_module()
+        gate_up = self._make_gate_up(64, 2048, 0.0, seed=3)
+        weights = torch.rand(64, 1, device="cuda:0", dtype=torch.bfloat16) + 0.5
+
+        bf16_first = (weights * mod.silu_mul_split_packed(gate_up, clamp_limit=0.0))
+        D = gate_up.shape[-1] // 2
+        promoted = gate_up.float()
+        fp32_first = (
+            weights.float()
+            * mod.silu_mul_split(
+                promoted[..., :D].contiguous(),
+                promoted[..., D:].contiguous(),
+                clamp_limit=0.0,
+            )
+        ).to(torch.bfloat16)
+
+        self.assertTrue(
+            torch.allclose(
+                bf16_first.float(), fp32_first.float(), rtol=2**-7, atol=1e-3
+            ),
+            "double rounding must stay within one BF16 ULP",
+        )
 
 
 if __name__ == "__main__":
