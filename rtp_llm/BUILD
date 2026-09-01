@@ -2,6 +2,12 @@ package(default_visibility = ["//visibility:public"])
 
 exports_files([
     "ops/librtp_compute_ops/__init__.pyi",
+    # Parsed as text (not imported) by
+    # //rtp_llm/models_py/speculative/test:test_target_verify_contract, which
+    # asserts this legacy module keeps re-exporting the dsv4_contracts leaf.
+    # Depending on //rtp_llm:models instead would drag the whole torch stack
+    # into a text-only check.
+    "models/dsv4_kv_cache.py",
 ])
 
 load("@rules_python//python:packaging.bzl", "py_package", "py_wheel")

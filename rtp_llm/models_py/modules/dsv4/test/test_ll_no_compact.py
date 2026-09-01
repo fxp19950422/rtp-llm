@@ -96,3 +96,7 @@ class NoCompactDefaultTest(unittest.TestCase):
         if os.environ.get("DSV4_MOE_LL_NO_COMPACT"):
             self.skipTest("DSV4_MOE_LL_NO_COMPACT set in this environment")
         self.assertFalse(deepep._LL_NO_COMPACT)
+
+
+if __name__ == "__main__":
+    unittest.main()

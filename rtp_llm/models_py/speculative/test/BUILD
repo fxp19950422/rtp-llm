@@ -19,8 +19,21 @@ py_test(
 py_test(
     name = "test_target_verify_contract",
     srcs = ["test_target_verify_contract.py"],
+    # test_legacy_cache_module_reexports_t13_leaf reads this file off disk and
+    # AST-parses it, so it has to be a declared data input -- undeclared, it is
+    # simply absent from runfiles and the case raises FileNotFoundError.
+    data = ["//rtp_llm:models/dsv4_kv_cache.py"],
     deps = [
         "//rtp_llm:dsv4_contracts",
         "//rtp_llm/models_py:target_verify_contract",
     ],
+)
+
+# Read as text (never imported) by
+# //rtp_llm/models_py/modules/dsv4/test:test_py_test_entrypoint_guard, because
+# bazel's glob() cannot reach across a package boundary.
+filegroup(
+    name = "speculative_test_sources",
+    srcs = glob(["*.py"]),
+    visibility = ["//rtp_llm/models_py/modules/dsv4/test:__pkg__"],
 )

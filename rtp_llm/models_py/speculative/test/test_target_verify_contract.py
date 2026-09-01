@@ -1,5 +1,6 @@
 import ast
 from pathlib import Path
+import unittest
 from unittest import TestCase
 from rtp_llm.models.dsv4_contracts import Dsv4StateRingMode
 from rtp_llm.models_py.speculative.target_verify_contract import (
@@ -173,3 +174,7 @@ class TargetVerifyContractTest(TestCase):
             )
         self.assertEqual(tx.state, "rollback_failed")
         self.assertEqual(rollback_calls, ["rollback"])
+
+
+if __name__ == "__main__":
+    unittest.main()

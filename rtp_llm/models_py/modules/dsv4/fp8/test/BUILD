@@ -178,3 +178,12 @@ py_test(
     exec_properties = {"gpu": "H20"},
     target_compatible_with = _DSV4_CUDA13_ONLY,
 )
+
+# Read as text (never imported) by
+# //rtp_llm/models_py/modules/dsv4/test:test_py_test_entrypoint_guard, because
+# bazel's glob() cannot reach across a package boundary.
+filegroup(
+    name = "fp8_test_sources",
+    srcs = glob(["*.py"]),
+    visibility = ["//rtp_llm/models_py/modules/dsv4/test:__pkg__"],
+)

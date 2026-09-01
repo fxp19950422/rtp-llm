@@ -166,3 +166,18 @@ def test_full_v4_prefill_b4_mixed_sp() -> None:
     """Full-stack: 4 requests, mix of cold and continuation, all 3 ratios."""
     model = _build_v4_fp8_test_model()
     del model
+
+
+if __name__ == "__main__":
+    # This module holds bare pytest functions, and bazel runs a py_test as a
+    # script -- so importing it collected nothing and the target passed without
+    # executing a case.  Drive pytest explicitly, and treat "collected nothing"
+    # as a failure so a future rename cannot bring the silent pass back.  Every
+    # case here is xfail/skip today by the author's intent; that now shows up as
+    # skipped instead of green.
+    import sys
+
+    code = pytest.main([__file__, "-q", "-rs"])
+    if code == pytest.ExitCode.NO_TESTS_COLLECTED:
+        raise SystemExit("test_varlen_prefill_oracle collected no tests")
+    sys.exit(int(code))

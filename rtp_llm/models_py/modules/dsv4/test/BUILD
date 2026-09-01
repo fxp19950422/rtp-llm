@@ -548,6 +548,18 @@ py_test(
 )
 
 py_test(
+    name = "test_py_test_entrypoint_guard",
+    srcs = ["test_py_test_entrypoint_guard.py"],
+    # The sources under test are inputs read as text, so they belong in data,
+    # not deps.  glob() stops at this package, hence the two sibling filegroups.
+    data = glob(["*.py"]) + [
+        "//rtp_llm/models_py/modules/dsv4/fp8/test:fp8_test_sources",
+        "//rtp_llm/models_py/speculative/test:speculative_test_sources",
+    ],
+    tags = ["cpu-only", "source-only"],
+)
+
+py_test(
     name = "test_silu_mul_split",
     srcs = ["test_silu_mul_split.py"],
     deps = [
