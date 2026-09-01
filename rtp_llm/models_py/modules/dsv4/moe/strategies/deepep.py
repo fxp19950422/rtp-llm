@@ -26,6 +26,83 @@ from .base import MoeCfg, RoutedExpertsStrategy, register_strategy
 from .local_loop import LocalLoopStrategy
 
 
+_CAPACITY_OVERFLOW_MODE = (
+    os.environ.get("DSV4_MOE_CAPACITY_OVERFLOW_MONITOR", "count").strip().lower()
+)
+if _CAPACITY_OVERFLOW_MODE not in ("off", "count"):
+    raise ValueError(
+        "invalid DSV4_MOE_CAPACITY_OVERFLOW_MONITOR="
+        f"{_CAPACITY_OVERFLOW_MODE!r}; expected off|count"
+    )
+
+
+class _CapacityOverflowMonitor:
+    """Count the expert routes the fixed capacity silently discards.
+
+    Observation only: it does not change which routes are dropped.  The fixed
+    capacity (128 by default) is >8x the measured mean, but that headroom only
+    holds at the current decode batch size -- and growing that batch is exactly
+    what the decode optimisation work does.  Slot 1 (max load seen) is the
+    early-warning signal: it shows the remaining headroom while slot 0 is still
+    zero.
+
+    Graph safety is the binding constraint: ``record`` uses device ops only --
+    no ``.item()``, ``.cpu()``, ``print`` or ``assert`` -- so it is safe inside
+    a captured graph.  ``read`` syncs and must only be called from outside
+    capture/replay.
+    """
+
+    __slots__ = ("_stats",)
+
+    def __init__(self) -> None:
+        self._stats: Optional[torch.Tensor] = None
+
+    def record(self, counts: torch.Tensor, capacity: int) -> None:
+        if _CAPACITY_OVERFLOW_MODE == "off":
+            return
+        if counts.numel() == 0:
+            return
+        if self._stats is None:
+            self._stats = torch.zeros(2, dtype=torch.int64, device=counts.device)
+        c64 = counts.to(torch.int64)
+        # dropped == sum(max(0, c - capacity)), reusing the clamp the caller needs
+        self._stats[0] += c64.sum() - c64.clamp(max=capacity).sum()
+        self._stats[1] = torch.maximum(self._stats[1], c64.max())
+
+    def read(self, reset: bool = True):
+        """Return ``(dropped_routes, max_count_seen)`` or ``None``.
+
+        Performs a device-to-host sync: **never call during graph capture or
+        replay.**
+        """
+        if self._stats is None:
+            return None
+        vals = self._stats.tolist()
+        if reset:
+            self._stats.zero_()
+        return int(vals[0]), int(vals[1])
+
+
+_CAPACITY_OVERFLOW_INSTANCES: "list" = []
+
+
+def read_capacity_overflow_stats(reset: bool = True):
+    """Aggregate every live monitor.  Host-side only (syncs); see ``read``."""
+    dropped = 0
+    max_seen = 0
+    seen_any = False
+    for mon in _CAPACITY_OVERFLOW_INSTANCES:
+        got = mon.read(reset=reset)
+        if got is None:
+            continue
+        seen_any = True
+        dropped += got[0]
+        max_seen = max(max_seen, got[1])
+    if not seen_any:
+        return None
+    return dropped, max_seen
+
+
 def _ppu_grouped_fp4_enabled() -> bool:
     return os.environ.get("DSV4_PPU_GROUPED_FP4", "0").strip().lower() in (
         "1",
@@ -90,6 +167,9 @@ class DeepEPStrategy(RoutedExpertsStrategy):
         # ``MoE.to(device)`` / state_dict.
         self._local = LocalLoopStrategy(cfg)
         self._ppu_grouped_fp4 = False
+        # Fixed-capacity overflow observability; see _CapacityOverflowMonitor.
+        self._ovf = _CapacityOverflowMonitor()
+        _CAPACITY_OVERFLOW_INSTANCES.append(self._ovf)
 
     @classmethod
     def can_handle(cls, cfg: MoeCfg) -> bool:
@@ -355,6 +435,7 @@ class DeepEPStrategy(RoutedExpertsStrategy):
                 f"grouped-FP4 expert counts must have {E} elements, "
                 f"got {expert_num_tokens.numel()}"
             )
+        self._ovf.record(expert_num_tokens, compute_capacity)
         safe_counts = (
             expert_num_tokens.clamp(min=0, max=compute_capacity)
             .to(torch.int32)
