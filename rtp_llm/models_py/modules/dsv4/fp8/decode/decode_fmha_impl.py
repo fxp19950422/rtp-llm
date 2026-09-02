@@ -43,6 +43,9 @@ from rtp_llm.models_py.modules.dsv4.kv_cache_utils import (
     as_attention_inputs_by_tag,
     primary_attention_inputs,
 )
+from rtp_llm.models_py.modules.dsv4.moe.strategies.deepep import (
+    drain_capacity_overflow_outside_graph,
+)
 
 
 @dataclass
@@ -198,3 +201,8 @@ class DSv4DecodeFmhaImplFP8:
             paged_pool_entries_per_block=self._paged_entries_per_block,
             paged_pool_tokens_per_block=self._paged_tokens_per_block,
         )
+        # Outside-graph MoE overflow readout: this host seam runs between
+        # replays, where the monitor's device->host sync is legal (the
+        # captured forward itself cannot read it out).  Default
+        # (DSV4_MOE_OVERFLOW_REPLAY_LOG_EVERY=0) makes the call a no-op.
+        drain_capacity_overflow_outside_graph()

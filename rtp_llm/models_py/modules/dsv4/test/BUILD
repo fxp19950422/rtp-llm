@@ -70,6 +70,33 @@ py_test(
 )
 
 py_test(
+    name = "test_runtime_config",
+    srcs = ["test_runtime_config.py"],
+    # Source-only: loads runtime_config.py straight from its source path;
+    # stdlib only, no torch — runs on every CI platform.
+    data = ["//rtp_llm/models_py:modules"],
+    tags = ["source-only"],
+)
+
+py_test(
+    name = "test_capacity_overflow_outside_graph",
+    srcs = ["test_capacity_overflow_outside_graph.py"],
+    # Source-only: executes the checked-in deepep.py against a minimal torch
+    # stub (stdlib unittest only) — no real torch/native runtime needed.
+    data = ["//rtp_llm/models_py:modules"],
+    tags = ["source-only"],
+)
+
+py_test(
+    name = "test_shared_expert_overlap_capture",
+    srcs = ["test_shared_expert_overlap_capture.py"],
+    # Source-only: executes the checked-in shared_expert.py against a minimal
+    # torch stub (stdlib unittest only) — no real torch/native runtime needed.
+    data = ["//rtp_llm/models_py:modules"],
+    tags = ["source-only"],
+)
+
+py_test(
     name = "test_compact_prefix_copy_ppu",
     srcs = ["test_compact_prefix_copy_ppu.py"],
     deps = [

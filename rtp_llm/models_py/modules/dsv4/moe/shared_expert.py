@@ -8,6 +8,7 @@ and only fuses the final add+cast when possible.
 
 from __future__ import annotations
 
+import logging
 import os
 from abc import ABC, abstractmethod
 
@@ -15,6 +16,7 @@ import torch
 import torch.nn as nn
 
 from rtp_llm.models_py.modules.dsv4._profiler import record_function_range
+from rtp_llm.models_py.modules.dsv4.runtime_config import get_switch, parse_bool
 
 from .warmup_sync import cuda_graph_warmup_forward_enabled
 
@@ -22,9 +24,102 @@ from .warmup_sync import cuda_graph_warmup_forward_enabled
 _SHARED_EXPERT_WORKSPACE_CACHE: dict[tuple, dict[str, torch.Tensor | int | torch.device]] = {}
 _SHARED_EXPERT_STREAM_CACHE: dict[int, torch.cuda.Stream] = {}
 
+# --- Capture-safe shared-expert overlap (ROADMAP P3.1) ----------------------
+#
+# DSV4_MOE_SHARED_EXPERT_OVERLAP=1 lets the shared expert keep running on its
+# side stream WHILE a CUDA graph is being captured, so the captured decode
+# graph itself contains the cross-stream fork/join.  SGLang's
+# SGLANG_OPT_USE_MULTI_STREAM_OVERLAP lands the same way: alt streams are
+# precreated and the overlap only exists because it was recorded into the
+# graph at capture time.
+#
+# Default (0) is byte-identical to the legacy behaviour: sequential executor,
+# and the OverlapSharedExpertExecutor capture veto stays in force (overlap
+# silently degraded to sequential inside every captured graph -- under decode,
+# which always captures, that made the whole overlap path dead in production).
+#
+# Enabling it changes exactly three things:
+#   1. the executor mode becomes "overlap" (see ``_mode``);
+#   2. the capture veto in ``_can_overlap`` is lifted -- ``start`` instead runs
+#      the capture-safe fork/join (event-based ``wait_stream`` both ways, no
+#      host sync, no stream creation inside the capture);
+#   3. ``prepare`` precreates the side stream on the current device even when
+#      the module weights are not on CUDA yet, so a capture never meets a cold
+#      stream cache.
+#
+# Capture-safety precondition: the side stream MUST predate the capture --
+# a ``torch.cuda.Stream()`` created mid-capture cannot be joined into the
+# graph.  Precreation happens at MoE-layer construction (moe_layer.py calls
+# ``executor.prepare(shared_experts)`` right after get_shared_expert_executor).
+# The eager warmup forwards cannot do it: cuda_graph_runner.cc scopes them
+# with RTP_LLM_CUDA_GRAPH_WARMUP_FORWARD=1 and ``_can_overlap`` refuses
+# overlap during those.  If the cache is still cold at capture time the
+# executor degrades to sequential for that capture with one warning line per
+# process plus a periodic miss-count INFO (never a panic, never a mid-capture
+# stream creation).
+#
+# Switch matrix (effective executor selection; decode ALWAYS captures):
+#
+#   DSV4_SHARED_EXPERT_MODE   DSV4_MOE_SHARED_EXPERT_OVERLAP   behaviour
+#   -----------------------   -------------------------------   -------------------------
+#   unset / sequential        0 (default)                       sequential everywhere
+#   unset / sequential        1                                 overlap; fork/join captured in-graph
+#   overlap / auto            0                                 overlap while eager, but the legacy
+#                                                               capture veto degrades EVERY captured
+#                                                               graph to sequential -- silently, no
+#                                                               log line
+#   overlap / auto            1                                 overlap; fork/join captured in-graph
+#   anything else             any                               fail-loud ValueError in
+#                                                               get_shared_expert_executor
+#
+# MODE=overlap ALONE is therefore a trap under decode: the veto makes it
+# byte-identical to sequential inside every graph, with zero observability.
+# The new switch is the decode-facing knob -- set it ONLY in the decode
+# launcher.  DSV4_SHARED_EXPERT_STREAM_TOKEN_THRESHOLD (default 4096) bounds
+# both overlap paths by token count and never binds decode batches.
+_SHARED_EXPERT_OVERLAP_ENABLED = get_switch(
+    "DSV4_MOE_SHARED_EXPERT_OVERLAP", False, parse_bool
+)
+# Per-process one-shot/counter state backing the P3.1 log lines.  Production
+# wants exactly-once semantics per process; the unittest suites reset these
+# per test (they would otherwise create order dependencies).
+_SHARED_EXPERT_CAPTURE_MISS_COUNT = 0
+_SHARED_EXPERT_IN_GRAPH_FORK_JOIN_LOGGED = False
+_SHARED_EXPERT_PREPARE_FALLBACK_LOGGED = False
+_SHARED_EXPERT_MODE_OVERRIDE_LOGGED = False
+
 
 def _mode() -> str:
-    return os.environ.get("DSV4_SHARED_EXPERT_MODE", "sequential").strip().lower()
+    raw = os.environ.get("DSV4_SHARED_EXPERT_MODE")
+    mode = (raw if raw is not None else "sequential").strip().lower()
+    if mode == "sequential" and _SHARED_EXPERT_OVERLAP_ENABLED:
+        # P3.1 switch selects the overlap executor (the sequential default and
+        # an explicit DSV4_SHARED_EXPERT_MODE=sequential both lose to it).
+        # "overlap"/"auto" pass through untouched, and invalid values still
+        # reach the legacy fail-loud ValueError in get_shared_expert_executor.
+        if raw is not None:
+            _note_shared_expert_mode_override(raw)
+        return "overlap"
+    return mode
+
+
+def _note_shared_expert_mode_override(raw: str) -> None:
+    """One INFO when the P3.1 switch overrides an EXPLICIT legacy mode.
+
+    Keeps A/B experiments honest: with DSV4_SHARED_EXPERT_MODE explicitly set
+    to sequential but the new switch on, the effective mode is overlap, and
+    the operator must be able to see that from the logs.  One line per
+    process (``_mode`` runs once per MoE-layer construction, ~60x otherwise).
+    """
+    global _SHARED_EXPERT_MODE_OVERRIDE_LOGGED
+    if _SHARED_EXPERT_MODE_OVERRIDE_LOGGED:
+        return
+    _SHARED_EXPERT_MODE_OVERRIDE_LOGGED = True
+    logging.info(
+        "[DSV4_CONFIG] DSV4_SHARED_EXPERT_MODE=%s overridden to overlap by "
+        "DSV4_MOE_SHARED_EXPERT_OVERLAP=1",
+        raw,
+    )
 
 
 def shared_expert_bf16_path_enabled() -> bool:
@@ -81,6 +176,11 @@ def _get_shared_expert_stream(
     if stream is not None:
         return stream
     if not allow_create:
+        # P3.1 note: unreachable since the capture-safe fork/join -- a
+        # capture-time cache miss is handled by _overlap_start_stream (cache
+        # peek + warning + sequential fallback) long before this helper can
+        # run, and every current caller passes allow_create=True.  Kept
+        # rather than deleting the parameter, to minimize the diff.
         raise RuntimeError(
             "shared expert overlap stream was not created before CUDA graph "
             f"capture for device cuda:{device_index}"
@@ -88,6 +188,86 @@ def _get_shared_expert_stream(
     stream = torch.cuda.Stream(device=device)
     _SHARED_EXPERT_STREAM_CACHE[device_index] = stream
     return stream
+
+
+def _peek_shared_expert_stream(device: torch.device) -> torch.cuda.Stream | None:
+    """Cache lookup only.
+
+    Never creates a stream: capture-safe by construction, which is why the
+    capture-time ``start`` path must go through here instead of the
+    create-or-reuse helpers.
+    """
+    device = _normalize_cuda_device(device)
+    if device is None:
+        return None
+    assert device.index is not None
+    return _SHARED_EXPERT_STREAM_CACHE.get(device.index)
+
+
+def _overlap_start_stream(
+    device: torch.device, capturing: bool
+) -> torch.cuda.Stream | None:
+    """Side stream for the overlap fork/join; NEVER creates during capture.
+
+    Eager: create-or-reuse (identical to the legacy
+    ``_get_shared_expert_stream(..., allow_create=not capturing)`` call, whose
+    capture arm was unreachable while the capture veto existed).
+    Capturing: cache peek only -- a stream created mid-capture cannot be
+    joined into the graph being captured, so a miss returns ``None`` and the
+    caller degrades that capture to sequential with a warning.
+    """
+    if not capturing:
+        return _get_shared_expert_stream(device, allow_create=True)
+    return _peek_shared_expert_stream(device)
+
+
+def _warn_shared_expert_capture_stream_miss(device: torch.device) -> None:
+    """Cold-cache miss bookkeeping: warn once, then an INFO every 10th miss.
+
+    Decode captures 30+ batch-size graphs per process; with only a one-shot
+    warning, every capture after the first would degrade to sequential in
+    total silence.  The periodic INFO carries the running miss count so an
+    operator can tell from log density that the fallback is PERSISTENT
+    (prepare() never created the side stream) rather than a one-off.
+    """
+    global _SHARED_EXPERT_CAPTURE_MISS_COUNT
+    _SHARED_EXPERT_CAPTURE_MISS_COUNT += 1
+    count = _SHARED_EXPERT_CAPTURE_MISS_COUNT
+    if count == 1:
+        logging.warning(
+            "[DSV4_SHARED_EXPERT_OVERLAP] CUDA graph capture found no precreated "
+            "shared-expert side stream for device %s; falling back to sequential "
+            "shared expert inside the captured graph. Overlap is INERT for this "
+            "process: the stream must be created before capture (executor "
+            "prepare() at MoE-layer construction).",
+            device,
+        )
+        return
+    if count % 10 == 0:
+        logging.info(
+            "[DSV4_SHARED_EXPERT_OVERLAP] capture stream miss count=%d on "
+            "device %s -- the shared expert is STILL degrading to sequential "
+            "inside captured graphs",
+            count,
+            device,
+        )
+
+
+def _note_shared_expert_in_graph_fork_join(device: torch.device) -> None:
+    """One INFO per process when the fork/join is first captured in-graph.
+
+    Arm-acceptance evidence: this line is the log-level proof that a captured
+    decode graph really contains the cross-stream dependency (the capture-time
+    counterpart of the implementation-selected log convention).
+    """
+    global _SHARED_EXPERT_IN_GRAPH_FORK_JOIN_LOGGED
+    if _SHARED_EXPERT_IN_GRAPH_FORK_JOIN_LOGGED:
+        return
+    _SHARED_EXPERT_IN_GRAPH_FORK_JOIN_LOGGED = True
+    logging.info(
+        "[DSV4_SHARED_EXPERT_OVERLAP] captured in-graph fork/join on %s",
+        device,
+    )
 
 
 def _find_module_cuda_device(module: nn.Module) -> torch.device | None:
@@ -492,14 +672,30 @@ class SequentialSharedExpertExecutor(SharedExpertExecutor):
             self._out = _run_shared_expert(shared_experts, x, self._fast_path)
 
     def finish(self) -> torch.Tensor:
-        assert self._out is not None
+        if self._out is None:
+            # moe_layer's except blocks call finish() after a failed start();
+            # a bare assert here would REPLACE the original start() exception
+            # with an AssertionError -- or, under python -O, strip the check
+            # entirely and hand None to the combine, blowing up as a
+            # TypeError two frames later.
+            raise RuntimeError(
+                "SequentialSharedExpertExecutor.finish() called with no "
+                "output: start() did not complete -- the original exception "
+                "is earlier in this traceback chain"
+            )
         out = self._out
         self._out = None
         return out
 
 
 class OverlapSharedExpertExecutor(SharedExpertExecutor):
-    """Run shared expert on an aux stream while routed MoE runs on current stream."""
+    """Run shared expert on an aux stream while routed MoE runs on current stream.
+
+    With DSV4_MOE_SHARED_EXPERT_OVERLAP=1 the fork/join is capture-safe and is
+    recorded into the CUDA graph itself (see ``start``/``finish`` for the two
+    dependency edges); with the switch off the legacy capture veto in
+    ``_can_overlap`` keeps every captured graph sequential.
+    """
 
     name = "overlap"
 
@@ -515,15 +711,48 @@ class OverlapSharedExpertExecutor(SharedExpertExecutor):
         if self._fast_path is not None:
             self._fast_path.prepare(shared_experts)
         device = _find_module_cuda_device(shared_experts)
+        if (
+            device is None
+            and _SHARED_EXPERT_OVERLAP_ENABLED
+            and torch.cuda.is_available()
+        ):
+            # Capture-safety precondition insurance (P3.1): the side stream
+            # must exist before ANY capture starts.  Normally the loader puts
+            # the weights on CUDA before layer construction and the branch
+            # above already found them; when it did not, precreate on the
+            # current device rather than leaving the cache cold.  Switch off
+            # keeps prepare() byte-identical.
+            global _SHARED_EXPERT_PREPARE_FALLBACK_LOGGED
+            device = torch.device("cuda", torch.cuda.current_device())
+            if not _SHARED_EXPERT_PREPARE_FALLBACK_LOGGED:
+                # One line per process saying WHICH card the fallback stream
+                # was created on (prepare runs once per MoE layer).
+                _SHARED_EXPERT_PREPARE_FALLBACK_LOGGED = True
+                logging.info(
+                    "[DSV4_SHARED_EXPERT_OVERLAP] prepare(): no CUDA weights "
+                    "found yet, precreating the side stream on %s",
+                    device,
+                )
         if device is not None:
             _ensure_shared_expert_stream(device)
 
     def _can_overlap(self, x: torch.Tensor) -> bool:
         if not (x.is_cuda and torch.cuda.is_available()):
             return False
-        if torch.cuda.is_current_stream_capturing():
+        if (
+            torch.cuda.is_current_stream_capturing()
+            and not _SHARED_EXPERT_OVERLAP_ENABLED
+        ):
+            # Legacy capture veto, byte-identical while the P3.1 switch is
+            # off: overlap degraded to sequential inside every captured
+            # graph (decode always captures, so the overlap path was dead in
+            # production).  With the switch on, capture is allowed and
+            # start() records the capture-safe fork/join instead.
             return False
         if cuda_graph_warmup_forward_enabled():
+            # Eager warmup forwards run under the scoped
+            # RTP_LLM_CUDA_GRAPH_WARMUP_FORWARD=1 (cuda_graph_runner.cc) and
+            # may rendezvous across ranks; the shared expert stays inline.
             return False
         if os.environ.get("MOEDBG", "0") != "0":
             return False
@@ -533,24 +762,83 @@ class OverlapSharedExpertExecutor(SharedExpertExecutor):
         return x.shape[0] <= threshold
 
     def start(self, shared_experts: nn.Module, x: torch.Tensor) -> None:
+        """Fork the shared expert onto the side stream (capture-safe).
+
+        Dependency edges -- the CUDA-graph correctness contract.  A missing or
+        reordered edge does NOT raise: the captured graph replays happily with
+        silently wrong numbers.  Both edges are cudaEvent waits under the hood
+        (``Stream.wait_stream``), which CUDA graph capture records as real
+        cross-stream dependency nodes; there is no ``.item()``,
+        ``.synchronize()`` or any other host sync on this path.
+
+        * EDGE 1 (fork, main -> side): ``stream.wait_stream(current_stream)``
+          below.  The side stream must not launch the shared-expert kernels
+          until the main stream has finished producing their input ``x``.
+        * EDGE 2 (join, side -> main): ``current_stream().wait_stream(stream)``
+          in ``finish()``.  The main stream must not consume the shared-expert
+          output until the side stream has finished writing it.
+        """
         if not self._can_overlap(x):
             self._active_stream = None
             with record_function_range("dsv4.moe.shared_expert"):
                 self._out = _run_shared_expert(shared_experts, x, self._fast_path)
             return
         capturing = torch.cuda.is_current_stream_capturing()
-        stream = _get_shared_expert_stream(x.device, allow_create=not capturing)
+        stream = _overlap_start_stream(x.device, capturing)
+        if stream is None:
+            # Capture with a cold stream cache.  Creating a stream here would
+            # not be joinable into the graph being captured; degrade THIS
+            # capture to sequential (one warning per process) instead of
+            # panicking mid-capture.
+            _warn_shared_expert_capture_stream_miss(x.device)
+            self._active_stream = None
+            with record_function_range("dsv4.moe.shared_expert"):
+                self._out = _run_shared_expert(shared_experts, x, self._fast_path)
+            return
         if not capturing:
+            # Allocator hint for the eager path: keep the block of ``x``
+            # alive while the side stream still reads it.  Inside a capture
+            # the inputs are static graph-owned allocations, and the capture
+            # path deliberately skips it.
             x.record_stream(stream)
+        # EDGE 1 (fork, main -> side): input dependency.  Must be recorded
+        # BEFORE the shared expert reads ``x`` on the side stream below.
         stream.wait_stream(torch.cuda.current_stream(x.device))
         with torch.cuda.stream(stream):
             with record_function_range("dsv4.moe.shared_expert"):
                 self._out = _run_shared_expert(shared_experts, x, self._fast_path)
+        if capturing:
+            # First successful in-graph fork/join announces itself (one INFO
+            # per process) -- log-level arm-acceptance evidence that the
+            # captured graph really carries the cross-stream dependency.
+            # Must stay BEFORE the _active_stream assignment: the AST wiring
+            # tests pin that assignment as the LAST statement of start().
+            _note_shared_expert_in_graph_fork_join(x.device)
         self._active_stream = stream
 
     def finish(self) -> torch.Tensor:
-        assert self._out is not None
+        if self._out is None:
+            # start() may have raised mid-side-stream (fast-path dim
+            # mismatch, OOM, ...); moe_layer's except blocks then call
+            # finish(), and a bare assert here would REPLACE the original
+            # exception with an AssertionError -- or, under python -O, strip
+            # the check entirely and hand None to the combine, blowing up as
+            # a TypeError two frames later (with an unjoined-capture error
+            # stacked on top in the capture scenario).
+            raise RuntimeError(
+                "OverlapSharedExpertExecutor.finish() called with no output: "
+                "start() did not complete (it may have raised on the side "
+                "stream -- the original exception is earlier in this "
+                "traceback chain)"
+            )
         if self._active_stream is not None:
+            # EDGE 2 (join, side -> main): the main stream waits for the side
+            # stream BEFORE ``self._out`` is handed back to the caller.  Every
+            # consumer (combine_routed_and_shared in moe_layer) runs after
+            # finish() returns, so the join is always recorded ahead of the
+            # first read of the shared-expert output.  Dropping this wait is
+            # the classic silent-numerics-corruption bug: the graph would
+            # replay fine while the combine reads a half-written buffer.
             torch.cuda.current_stream(self._out.device).wait_stream(self._active_stream)
         out = self._out
         self._out = None

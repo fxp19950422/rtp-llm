@@ -1,3 +1,4 @@
+import logging
 import os
 import unittest
 from contextlib import contextmanager
@@ -9,6 +10,7 @@ import torch.nn as nn
 from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import (
     is_deep_gemm_e8m0_used,
 )
+from rtp_llm.models_py.modules.dsv4.moe import shared_expert as _se
 from rtp_llm.models_py.modules.dsv4.moe.expert import Expert
 from rtp_llm.models_py.modules.dsv4.moe._shared_expert_triton import (
     quant_bf16_fp8_packed_ue8m0,
@@ -190,7 +192,46 @@ def _fake_fp8_gemm_nt(a, b, output, *args, **kwargs) -> None:
     output.copy_((a_q.float() @ b_q.float().t()).to(torch.bfloat16))
 
 
+# Env vars the dispatch/behaviour tests implicitly assume to be UNSET in the
+# outer environment; setUp() enforces that explicitly instead of letting a
+# polluted shell silently flip executor selection.
+_ENV_ASSUMPTIONS = (
+    "DSV4_SHARED_EXPERT_MODE",
+    "MOEDBG",
+    "DSV4_SHARED_EXPERT_STREAM_TOKEN_THRESHOLD",
+    "DSV4_SHARED_EXPERT_BF16_PATH",
+    "DSV4_SHARED_EXPERT_BF16_ADD",
+)
+
+
 class TestSharedExpertExecutor(unittest.TestCase):
+    def setUp(self):
+        # P3.1 module-level one-shot state is per-PROCESS in production but
+        # must be per-TEST here: without the reset, an earlier test that
+        # fired the capture-miss warning (or any one-time INFO) would
+        # silence assertLogs in a later test -- an order dependency.
+        for name, default in (
+            ("_SHARED_EXPERT_CAPTURE_MISS_COUNT", 0),
+            ("_SHARED_EXPERT_IN_GRAPH_FORK_JOIN_LOGGED", False),
+            ("_SHARED_EXPERT_PREPARE_FALLBACK_LOGGED", False),
+            ("_SHARED_EXPERT_MODE_OVERRIDE_LOGGED", False),
+        ):
+            patcher = mock.patch.object(_se, name, default)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        saved = {k: os.environ.get(k) for k in _ENV_ASSUMPTIONS}
+        for k in _ENV_ASSUMPTIONS:
+            os.environ.pop(k, None)
+
+        def _restore():
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+        self.addCleanup(_restore)
+
     def test_platform_linear_skips_cuda_fused_fast_path(self):
         class PlatformLinear(nn.Module):
             def __init__(self):
@@ -259,6 +300,17 @@ class TestSharedExpertExecutor(unittest.TestCase):
         with _env("DSV4_SHARED_EXPERT_MODE", "auto"):
             self.assertIsInstance(get_shared_expert_executor(), OverlapSharedExpertExecutor)
 
+    def test_executor_dispatch_p31_switch_forces_overlap(self):
+        # DSV4_MOE_SHARED_EXPERT_OVERLAP=1 (module-level get_switch, patched
+        # here because the one-shot env read happened at import) selects the
+        # overlap executor even when the legacy mode env says sequential.
+        with _env("DSV4_SHARED_EXPERT_MODE", "sequential"), mock.patch.object(
+            _se, "_SHARED_EXPERT_OVERLAP_ENABLED", True
+        ):
+            self.assertIsInstance(
+                get_shared_expert_executor(), OverlapSharedExpertExecutor
+            )
+
     def test_sequential_executor(self):
         x = torch.randn(3, 4, dtype=torch.bfloat16)
         executor = SequentialSharedExpertExecutor()
@@ -314,8 +366,10 @@ class TestSharedExpertExecutor(unittest.TestCase):
         self.assertIn(device_index, _SHARED_EXPERT_STREAM_CACHE)
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
-    def test_overlap_capture_requires_precreated_stream(self):
-        _SHARED_EXPERT_STREAM_CACHE.clear()
+    def test_overlap_capture_veto_stays_with_switch_off(self):
+        # Default (DSV4_MOE_SHARED_EXPERT_OVERLAP=0): the legacy capture veto
+        # keeps the shared expert inline while capturing -- byte-identical to
+        # the pre-P3.1 behaviour.
         x = torch.randn(33, 128, device="cuda", dtype=torch.bfloat16)
         shared = _Shared().cuda()
         executor = OverlapSharedExpertExecutor()
@@ -324,18 +378,57 @@ class TestSharedExpertExecutor(unittest.TestCase):
             "torch.cuda.is_current_stream_capturing",
             return_value=True,
         ):
-            with self.assertRaisesRegex(RuntimeError, "not created before CUDA graph capture"):
+            executor.start(shared, x)
+            self.assertIsNone(executor._active_stream)
+            got = executor.finish()
+
+        self.assertTrue(torch.equal(got, shared(x).float()))
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+    def test_overlap_capture_without_precreated_stream_warns_and_serializes(self):
+        # Switch on + capture + cold stream cache: degrade to sequential with
+        # one warning line; never raise, never create a stream mid-capture.
+        _SHARED_EXPERT_STREAM_CACHE.clear()
+        x = torch.randn(33, 128, device="cuda", dtype=torch.bfloat16)
+        shared = _Shared().cuda()
+        executor = OverlapSharedExpertExecutor()
+
+        with _env("DSV4_MOE_STRICT_FUSED", "0"), mock.patch.object(
+            _se, "_SHARED_EXPERT_OVERLAP_ENABLED", True
+        ), mock.patch(
+            "torch.cuda.is_current_stream_capturing",
+            return_value=True,
+        ):
+            with self.assertLogs(level=logging.WARNING) as logs:
                 executor.start(shared, x)
+                self.assertIsNone(executor._active_stream)
+                got = executor.finish()
+
+        self.assertTrue(
+            any("[DSV4_SHARED_EXPERT_OVERLAP]" in r for r in logs.output)
+        )
+        self.assertTrue(torch.equal(got, shared(x).float()))
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
     def test_overlap_executor_captures_with_precreated_stream(self):
+        # Switch on + capture + precreated stream: the fork/join itself is
+        # recorded into the graph (active stream stays the warmup stream),
+        # and the replayed graph reproduces the eager output bitwise.  This
+        # is the real in-graph multi-stream correctness gate for P3.1.
+        #
+        # Validity: requires a real GPU (or a PPU container with full
+        # multi-stream CUDA-graph capture support) -- a torch stub cannot
+        # model cudaEvent dependencies or the caching allocator.  Keep this
+        # test on the PPU-side manual regression checklist.
         _SHARED_EXPERT_STREAM_CACHE.clear()
         x = torch.randn(33, 128, device="cuda", dtype=torch.bfloat16)
         shared = _Shared().cuda()
         executor = OverlapSharedExpertExecutor()
         out = torch.empty(x.shape, device=x.device, dtype=torch.float32)
 
-        with _env("DSV4_MOE_STRICT_FUSED", "0"):
+        with _env("DSV4_MOE_STRICT_FUSED", "0"), mock.patch.object(
+            _se, "_SHARED_EXPERT_OVERLAP_ENABLED", True
+        ):
             executor.start(shared, x)
             warmup_stream = executor._active_stream
             self.assertIsNotNone(warmup_stream)
@@ -354,6 +447,107 @@ class TestSharedExpertExecutor(unittest.TestCase):
 
         ref = shared(x).float()
         self.assertTrue(torch.equal(out.cpu(), ref.cpu()))
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+    def test_capture_after_prepare_only_precreated_stream(self):
+        # Production shape: NO eager overlap run precedes the capture -- the
+        # side stream comes from executor.prepare() at MoE-layer construction
+        # (moe_layer.py), which is how the decode graph runner actually meets
+        # it.  Capture straight off the prepare-created stream and re-check
+        # the bitwise replay gate.  Same validity conditions as the main gate
+        # above (real GPU / full multi-stream-capture PPU container; keep on
+        # the PPU-side manual regression checklist).
+        _SHARED_EXPERT_STREAM_CACHE.clear()
+        x = torch.randn(33, 128, device="cuda", dtype=torch.bfloat16)
+        shared = _SharedWithCudaWeight()
+        executor = OverlapSharedExpertExecutor()
+        out = torch.empty(x.shape, device=x.device, dtype=torch.float32)
+
+        with _env("DSV4_MOE_STRICT_FUSED", "0"), mock.patch.object(
+            _se, "_SHARED_EXPERT_OVERLAP_ENABLED", True
+        ):
+            executor.prepare(shared)  # finds the CUDA weight -> precreates
+            self.assertIn(x.device.index, _SHARED_EXPERT_STREAM_CACHE)
+
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                executor.start(shared, x)
+                out.copy_(executor.finish())
+
+            x.mul_(2.0)
+            graph.replay()
+            torch.cuda.synchronize()
+
+        ref = shared(x).float()
+        self.assertTrue(torch.equal(out.cpu(), ref.cpu()))
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+    def test_capture_join_edge_mutation_breaks_the_gate(self):
+        # Mutation self-check: proves the bitwise gate above has teeth.  Drop
+        # ONLY the join edge (main waits for side, EDGE 2) and the capture
+        # must either fail outright (CUDA refuses to end a capture that
+        # forked a stream without joining it back) or replay with WRONG
+        # numbers (the racing consumer reads a half-written buffer).  If
+        # neither channel fires, the main assertion would be vacuous.
+        #
+        # Same validity conditions as the main gate (real GPU / full
+        # multi-stream-capture PPU container; PPU-side manual regression
+        # checklist).
+        class _JoinDroppedExecutor(OverlapSharedExpertExecutor):
+            def finish(self):
+                # Mutation: EDGE 2 silently missing.
+                self._active_stream = None
+                return super().finish()
+
+        class _SlowShared(nn.Module):
+            # Deep kernel chain on the side stream: with the join edge gone,
+            # the main-stream consumer (out.copy_) races a ~hundreds-of-us
+            # chain and reads a stale buffer with near certainty.
+            def __init__(self):
+                super().__init__()
+                self.weight = nn.Parameter(
+                    torch.randn(128, 128, device="cuda", dtype=torch.bfloat16)
+                )
+
+            def forward(self, x):
+                y = x
+                for _ in range(64):
+                    y = y @ self.weight
+                return y
+
+        _SHARED_EXPERT_STREAM_CACHE.clear()
+        x = torch.randn(33, 128, device="cuda", dtype=torch.bfloat16)
+        shared = _SlowShared()
+        executor = _JoinDroppedExecutor()
+        out = torch.empty(x.shape, device=x.device, dtype=torch.float32)
+
+        with _env("DSV4_MOE_STRICT_FUSED", "0"), mock.patch.object(
+            _se, "_SHARED_EXPERT_OVERLAP_ENABLED", True
+        ):
+            executor.start(shared, x)  # eager warmup: creates the side stream
+            executor.finish()
+            torch.cuda.synchronize()  # the eager join is mutated away too
+
+            captured = False
+            graph = torch.cuda.CUDAGraph()
+            try:
+                with torch.cuda.graph(graph):
+                    executor.start(shared, x)
+                    out.copy_(executor.finish())
+                captured = True
+            except RuntimeError:
+                # Channel 1: capture refuses an unjoined forked stream.
+                pass
+            if captured:
+                graph.replay()
+                torch.cuda.synchronize()
+                # Channel 2: the raced replay must NOT bitwise-match.
+                ref = shared(x).float()
+                self.assertFalse(
+                    torch.equal(out.cpu(), ref.cpu()),
+                    "join-edge mutation was NOT caught -- the bitwise gate "
+                    "would pass even with the dependency edge missing",
+                )
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
     def test_overlap_threshold_falls_back_to_sequential(self):

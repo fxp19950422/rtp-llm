@@ -15,10 +15,17 @@ from __future__ import annotations
 import logging
 import math
 import os
-from typing import Dict, Optional, Sequence, Tuple
+import threading
+import time
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 
+from ...runtime_config import (
+    get_switch,
+    parse_nonneg_int,
+    parse_percentile_list,
+)
 from ..warmup_sync import (
     cuda_graph_warmup_forward_enabled,
     sync_cuda_graph_warmup_ranks,
@@ -53,22 +60,45 @@ class _CapacityOverflowMonitor:
     capture/replay.
     """
 
-    __slots__ = ("_stats",)
+    __slots__ = ("_stats", "_per_expert")
 
     def __init__(self) -> None:
         self._stats: Optional[torch.Tensor] = None
+        # Per-expert token counts, allocated only while the outside-graph
+        # readout is enabled (DSV4_MOE_OVERFLOW_REPLAY_LOG_EVERY > 0).  Device-only
+        # accumulation, like ``_stats``: captured into the graph so replays
+        # advance it with zero host involvement.  Never synced per step.
+        self._per_expert: Optional[torch.Tensor] = None
 
     def record(self, counts: torch.Tensor, capacity: int) -> None:
         if _CAPACITY_OVERFLOW_MODE == "off":
             return
         if counts.numel() == 0:
             return
+        # Lazy allocation happens BEFORE the warmup guard on purpose: the
+        # first record must allocate OUTSIDE the capture (the eager warmup
+        # forwards run first — cuda_graph_runner.cc:1319-1343).  A zeros()
+        # fill kernel recorded inside the graph would zero these accumulators
+        # on every replay.
         if self._stats is None:
             self._stats = torch.zeros(2, dtype=torch.int64, device=counts.device)
+        if _OVF_OUTSIDE_EVERY > 0 and self._per_expert is None:
+            self._per_expert = torch.zeros(
+                counts.numel(), dtype=torch.int64, device=counts.device
+            )
+        # Warmup forwards run on dummy inputs just before each capture
+        # (RTP_LLM_CUDA_GRAPH_WARMUP_FORWARD=1).  Their routing counts can be
+        # inflated and would poison the first readout window with fake
+        # overflow warnings, so skip the accumulation — the allocation above
+        # still runs so the captured graph records only the adds.
+        if cuda_graph_warmup_forward_enabled():
+            return
         c64 = counts.to(torch.int64)
         # dropped == sum(max(0, c - capacity)), reusing the clamp the caller needs
         self._stats[0] += c64.sum() - c64.clamp(max=capacity).sum()
         self._stats[1] = torch.maximum(self._stats[1], c64.max())
+        if _OVF_OUTSIDE_EVERY > 0:
+            self._per_expert += c64
 
     def read(self, reset: bool = True):
         """Return ``(dropped_routes, max_count_seen)`` or ``None``.
@@ -86,6 +116,22 @@ class _CapacityOverflowMonitor:
         if reset:
             self._stats.zero_()
         return int(vals[0]), int(vals[1])
+
+    def read_per_expert(self, reset: bool = True) -> "Optional[List[int]]":
+        """Return per-expert accumulated counts as a host list, or ``None``.
+
+        Same capture-safety contract as ``read``: one ``.tolist()`` sync,
+        guarded against graph capture.  ``None`` when per-expert tracking is
+        off (the default) or the monitor never recorded anything.
+        """
+        if self._per_expert is None:
+            return None
+        if _graph_capture_active():
+            return None
+        vals = self._per_expert.tolist()
+        if reset:
+            self._per_expert.zero_()
+        return [int(v) for v in vals]
 
 
 _CAPACITY_OVERFLOW_INSTANCES: "list" = []
@@ -108,9 +154,162 @@ def read_capacity_overflow_stats(reset: bool = True):
     return dropped, max_seen
 
 
+def _percentiles_from_counts(values, percentiles):
+    """Nearest-rank percentiles of host-side per-expert counts.
+
+    Only called on low-frequency readout paths where the counts are already
+    on the host (one ``.tolist()``): sorting the host list avoids the second
+    device sync a ``torch.quantile`` call would need.  "p50" of [0..31] is
+    element 15 (0-based), p99 of a 32-vector is the max — the conservative
+    end of the classic nearest-rank definition.
+    """
+    if not values:
+        return []
+    ordered = sorted(values)
+    n = len(ordered)
+    out = []
+    for pct in percentiles:
+        idx = max(0, math.ceil(int(pct) * n / 100.0) - 1)
+        out.append(ordered[min(idx, n - 1)])
+    return out
+
+
+def drain_capacity_overflow_outside_graph() -> None:
+    """Outside-graph readout of the capacity-overflow monitor.
+
+    Under CUDA-graph decode the eager logger (``_maybe_log_capacity_overflow``)
+    is silent: replay re-fires kernels without executing the Python forward,
+    so its call counter never advances in production.  This hook is the
+    out-of-graph Python seam every replay still crosses — C++
+    ``CudaGraphRunner::prepareInputs`` calls the decode fmha impl's
+    ``prepare_cuda_graph`` between replays, and the impls call this function
+    from there (``decode/decode_fmha_impl.py``, ``fp8/decode/decode_fmha_impl.py``).
+
+    ``DSV4_MOE_OVERFLOW_REPLAY_LOG_EVERY=K`` (K>0) reads the aggregated stats
+    every K hook calls and logs one ``[CAPACITY_OVERFLOW]`` line covering a
+    fresh window (stats reset on readout, so each line reports the last K
+    calls).  K=1 is expensive — each readout costs 2 host syncs per monitor
+    instance (``read`` + ``read_per_expert``) — so prefer K>=50.
+    Per-expert counts are aggregated across monitor instances with an
+    elementwise max (each instance is one MoE layer; the max keeps the
+    "busiest layer" view consistent with how ``max_count_seen`` aggregates).
+    Percentile fields are controlled by ``DSV4_MOE_ROUTER_PERCENTILES``.
+
+    Default (K=0) is a no-op with zero overhead: byte-identical legacy
+    behaviour.  The isolation testbench can also call this directly (or use
+    ``read_capacity_overflow_stats``) without any graph.
+
+    Thread safety: ``prepare_cuda_graph`` may run concurrently on the engine
+    main thread and an AsyncRunner worker thread (cuda_graph_runner.cc:690-696),
+    so everything past the disabled-early-exit (count increment, window check,
+    readout, reset) happens under ``_OVF_DRAIN_LOCK``.
+    """
+    if _OVF_OUTSIDE_EVERY <= 0:
+        return
+    with _OVF_DRAIN_LOCK:
+        if _graph_capture_active():
+            return
+        _OVF_OUTSIDE_CALLS[0] += 1
+        if _OVF_OUTSIDE_CALLS[0] % _OVF_OUTSIDE_EVERY:
+            return
+        dropped = 0
+        max_seen = 0
+        seen_any = False
+        per_expert_max: Optional[List[int]] = None
+        for mon in _CAPACITY_OVERFLOW_INSTANCES:
+            got = mon.read(reset=True)
+            if got is None:
+                continue
+            seen_any = True
+            dropped += got[0]
+            max_seen = max(max_seen, got[1])
+            counts = mon.read_per_expert(reset=True)
+            if counts is None:
+                continue
+            if per_expert_max is None:
+                per_expert_max = list(counts)
+            else:
+                if len(counts) > len(per_expert_max):
+                    per_expert_max.extend([0] * (len(counts) - len(per_expert_max)))
+                for i, c in enumerate(counts):
+                    if c > per_expert_max[i]:
+                        per_expert_max[i] = c
+        if not seen_any:
+            return
+        active = sum(1 for c in (per_expert_max or ()) if c > 0)
+        pctl = ""
+        if per_expert_max is not None and _OVF_ROUTER_PERCENTILES:
+            qs = _percentiles_from_counts(per_expert_max, _OVF_ROUTER_PERCENTILES)
+            pctl = " " + " ".join(
+                "p%d=%d" % (p, q)
+                for p, q in zip(_OVF_ROUTER_PERCENTILES, qs)
+            )
+        logging.info(
+            "[CAPACITY_OVERFLOW] ts=%.3f dropped_routes=%d max_count_seen=%d "
+            "active_experts=%d%s",
+            time.time(),
+            dropped,
+            max_seen,
+            active,
+            pctl,
+        )
+
+
 # 0 disables the log.  N>0 emits one line every N eager calls.
 _OVF_LOG_EVERY = int(os.environ.get("DSV4_MOE_CAPACITY_OVERFLOW_LOG_EVERY", "0"))
 _OVF_LOG_CALLS = [0]
+
+# --- Outside-graph overflow readout (new switches; runtime_config surface) ---
+# Production decode replays CUDA graphs: the captured Python forward (and
+# with it ``_maybe_log_capacity_overflow``'s eager call counter) only runs
+# during capture, so the overflow stats stay silent under replay.  The new
+# switches below read through runtime_config (fail-loud + one [DSV4_CONFIG]
+# audit line each); defaults keep byte-identical legacy behaviour.
+#
+# DSV4_MOE_OVERFLOW_REPLAY_LOG_EVERY=K (K>0): read the aggregated monitor
+# stats every K outside-graph hook calls (``drain_capacity_overflow_outside_graph``,
+# wired into the decode fmha impls' ``prepare_cuda_graph`` — the one host
+# seam C++ ``CudaGraphRunner::prepareInputs`` crosses between replays).
+# Enabling it also makes every monitor keep a per-expert token-count vector
+# (one extra elementwise device add per layer per captured step — recorded
+# into the graph, so replays keep it advancing; never synced per step).
+#
+# Name map (do not confuse the two overflow throttles):
+#   * DSV4_MOE_CAPACITY_OVERFLOW_LOG_EVERY   (legacy)  — eager-path log
+#     throttle: only advances while Python forwards run (silently inert under
+#     graph replay).
+#   * DSV4_MOE_OVERFLOW_REPLAY_LOG_EVERY     (new)    — graph-replay-path
+#     readout throttle: counts ``prepare_cuda_graph`` seam calls, i.e. every
+#     replayed decode step.
+_OVF_OUTSIDE_EVERY = get_switch(
+    "DSV4_MOE_OVERFLOW_REPLAY_LOG_EVERY", 0, parse_nonneg_int
+)
+_OVF_OUTSIDE_CALLS = [0]
+# ``prepare_cuda_graph`` runs on both the engine main thread and an
+# AsyncRunner worker thread (cuda_graph_runner.cc:690-696), so the drain's
+# count-then-maybe-readout sequence needs a lock: the += on the list above is
+# a non-atomic read-modify-write, and an interleaving can lose an increment
+# or double-trigger a window (the latecomer reads post-reset zeros and logs
+# a fake empty window).
+_OVF_DRAIN_LOCK = threading.Lock()
+# DSV4_MOE_ROUTER_PERCENTILES="p50,p99": which per-expert routing percentiles
+# to append on readout, applied both to the eager router-stats line below and
+# to the outside-graph [CAPACITY_OVERFLOW] line.  Unset/empty == off.
+_OVF_ROUTER_PERCENTILES = get_switch(
+    "DSV4_MOE_ROUTER_PERCENTILES", (), parse_percentile_list
+)
+# DSV4_MOE_ROUTER_PERCENTILE_LOG_EVERY=K (K>0): independent throttle for the
+# eager router-stats percentiles — computing them needs a whole-vector
+# ``.tolist()`` host sync, so they can be sampled sparser than the legacy
+# 5-scalar line.  0 == never (legacy lines stay byte-identical).
+# NOTE: only takes effect when the legacy eager log itself is on, i.e.
+# DSV4_MOE_CAPACITY_OVERFLOW_LOG_EVERY > 0 — this throttle lives on the same
+# line; on a graph-replay decode arm use DSV4_MOE_OVERFLOW_REPLAY_LOG_EVERY
+# + DSV4_MOE_ROUTER_PERCENTILES instead.
+_OVF_ROUTER_PCTL_EVERY = get_switch(
+    "DSV4_MOE_ROUTER_PERCENTILE_LOG_EVERY", 0, parse_nonneg_int
+)
+_OVF_ROUTER_PCTL_CALLS = [0]
 
 
 def _graph_capture_active() -> bool:
@@ -159,6 +358,21 @@ def _maybe_log_capacity_overflow(capacity, counts=None):
             " active_experts=%d step_min=%d"
             % (counts.numel(), vals[0], vals[1], vals[2], vals[3], vals[4])
         )
+        # Per-expert routing percentiles (p50/p99 by convention): computed
+        # here — on the throttled readout only — from the current step's
+        # per-expert counts, so the percentile fields share the same window
+        # as the max/min/sum/active fields above.  Both switches default to
+        # off, keeping the legacy line byte-identical.
+        if _OVF_ROUTER_PCTL_EVERY > 0 and _OVF_ROUTER_PERCENTILES:
+            _OVF_ROUTER_PCTL_CALLS[0] += 1
+            if not _OVF_ROUTER_PCTL_CALLS[0] % _OVF_ROUTER_PCTL_EVERY:
+                qs = _percentiles_from_counts(
+                    c64.tolist(), _OVF_ROUTER_PERCENTILES
+                )
+                dist += " " + " ".join(
+                    "p%d=%d" % (p, q)
+                    for p, q in zip(_OVF_ROUTER_PERCENTILES, qs)
+                )
     logging.info(
         "[CAPACITY_OVERFLOW] calls=%d capacity=%d dropped_routes=%d max_count_seen=%d%s",
         _OVF_LOG_CALLS[0],
