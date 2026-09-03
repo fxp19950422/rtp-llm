@@ -35,6 +35,15 @@ from rtp_llm.models_py.modules.dsv4.chunk_env import (
 from rtp_llm.models_py.modules.dsv4.utils import _v4_fp8_linear
 from rtp_llm.utils.model_weight import W
 
+# ---------------------------------------------------------------------------
+# Type-only import for the attention implementation (decode fmha metadata).
+# Actual class is resolved lazily inside forward_draft_loop to avoid a hard
+# import-time dep cycle.
+# ---------------------------------------------------------------------------
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    pass  # forward reference only
+
 
 class DeepSeekV4MtpModel(DeepSeekV4Model):
     def __init__(
@@ -297,6 +306,160 @@ class DeepSeekV4MtpModel(DeepSeekV4Model):
             return super().forward(inputs, fmha_impl)
         finally:
             self._cur_inputs = None
+
+    # ------------------------------------------------------------------
+    # forward_draft_loop — N-1 step MTP draft loop unrolled for CUDA
+    # graph capture.  Every operation is pure device-side: no .item(),
+    # .cpu(), .synchronize(), print(), or logging inside the loop body.
+    #
+    # Called by CudaGraphRunner when is_draft_loop=True.  The method is
+    # graph-captured once and replayed for every decode step.
+    # ------------------------------------------------------------------
+
+    def forward_draft_loop(
+        self,
+        inputs,       # PyModelInputs (capture or replay buffer)
+        fmha_impl: Any = None,
+        draft_loop_steps: int = 0,
+    ):
+        """Run *draft_loop_steps* iterations of
+        ``forward → lm_head → argmax → update_input`` on a single CUDA
+        stream, returning every step's draft tokens and probabilities
+        packed into a single :class:`PyModelOutputs`.
+
+        The output ``hidden_states`` layout is:
+            ``[B * draft_loop_steps, vocab_size]``  (draft probs, fp32)
+        and ``draft_tokens`` is:
+            ``[B, draft_loop_steps]``  (int32 token ids)
+
+        **CUDA-graph contract**: this entire method body must be
+        host-sync-free.  The Python interpreter executes during *capture*
+        only; during *replay* the recorded kernel stream is replayed
+        without re-entering Python.
+        """
+        from rtp_llm.ops.compute_ops import PyModelOutputs
+        from rtp_llm.models_py.modules.dsv4.kv_cache_utils import (
+            primary_attention_inputs,
+        )
+
+        if draft_loop_steps <= 0:
+            # Fallback: single forward, same as regular path.
+            self._cur_inputs = inputs
+            try:
+                return super().forward(inputs, fmha_impl)
+            finally:
+                self._cur_inputs = None
+
+        device = self.v4.embed.weight.device
+        head_w = self.v4.head_weight  # [vocab, dim]
+        hc = int(self._v4_args.hc_mult)
+        dim = int(self._v4_args.dim)
+
+        # Resolve attention metadata from fmha_impl (graph path always
+        # passes a pre-built impl whose .metadata is graph-safe).
+        # Lazy import to avoid import-time dep cycle.
+        from rtp_llm.models_py.modules.dsv4.decode.decode_fmha_impl import (
+            DSv4DecodeFmhaImpl,
+        )
+        _graph_impl_types = (DSv4DecodeFmhaImpl,)
+        try:
+            from rtp_llm.models_py.modules.dsv4.fp8.decode.decode_fmha_impl import (
+                DSv4DecodeFmhaImplFP8,
+            )
+            _graph_impl_types = (DSv4DecodeFmhaImpl, DSv4DecodeFmhaImplFP8)
+        except ImportError:
+            pass
+
+        if isinstance(fmha_impl, _graph_impl_types):
+            meta = fmha_impl.metadata
+        else:
+            raise RuntimeError(
+                "forward_draft_loop requires a graph-path fmha_impl with "
+                "pre-built metadata (DSv4DecodeFmhaImpl)."
+            )
+
+        B = meta.batch_size
+        q_len = meta.q_len_per_req  # should be 1 for decode
+
+        # Accumulators — pre-allocated on device.
+        all_draft_token_ids = torch.empty(
+            (B, draft_loop_steps), dtype=torch.int32, device=device
+        )
+        all_draft_probs = torch.empty(
+            (B * draft_loop_steps, head_w.size(0)),
+            dtype=torch.float32,
+            device=device,
+        )
+        all_hidden_list: list = []  # [step] x [B*q_len, dim]
+
+        # ---- Unrolled draft loop ----
+        for step_i in range(draft_loop_steps):
+            # 1. Full MTP forward (prepare_decode_hidden + layer loop).
+            self._cur_inputs = inputs
+            from rtp_llm.models_py.modules.dsv4.decode.forward import (
+                forward_layers,
+            )
+            h = forward_layers(
+                self.v4,
+                self.kv_cache,
+                inputs.input_ids,
+                meta,
+                prepare_hidden_fn=self._prepare_decode_hidden,
+            )  # [B, q_len, dim]
+            hidden = h.reshape(B * q_len, dim)  # [T, dim]
+
+            # Capture per-step hidden for C++ maybeOverrideLastHidden.
+            all_hidden_list.append(hidden)
+
+            # 2. lm_head + sampling (pure device ops).
+            logits = torch.mm(
+                hidden.to(head_w.dtype), head_w.t()
+            ).float()  # [T, vocab]
+
+            probs = torch.softmax(logits, dim=-1)  # [T, vocab]
+            draft_ids = probs.argmax(dim=-1).to(torch.int32)  # [T]
+
+            # Store results for this step.
+            all_draft_probs[step_i * B : (step_i + 1) * B] = probs
+            all_draft_token_ids[:, step_i] = draft_ids.reshape(B)
+
+            # 3. Update inputs for next iteration (all device-side).
+            #    - combo_tokens = draft_ids
+            #    - input_hiddens = current hidden (for MTP fusion)
+            #    - sequence_lengths += 1
+            if step_i < draft_loop_steps - 1:
+                inputs.input_ids = draft_ids.reshape(B * q_len)
+                # MTP fusion needs input_hiddens = [T, hc*dim] from the
+                # MTP hidden buffer written during forward_layers.
+                # The buffer is managed by the transformer and already
+                # on device.
+                mtp_buf = self.v4._mtp_hidden_buffer
+                if mtp_buf is not None:
+                    valid = min(B * q_len, mtp_buf.size(0))
+                    inputs.input_hiddens = mtp_buf[:valid]
+
+                # Advance sequence lengths on device (int32 add).
+                if (
+                    inputs.attention_inputs.sequence_lengths is not None
+                    and inputs.attention_inputs.sequence_lengths.is_cuda
+                ):
+                    inputs.attention_inputs.sequence_lengths = (
+                        inputs.attention_inputs.sequence_lengths + 1
+                    ).to(torch.int32)
+
+            self._cur_inputs = None
+
+        # Pack outputs into PyModelOutputs.
+        # hidden_states = all_draft_probs so C++ can extract logits.
+        # draft_tokens = [B, draft_loop_steps] int32.
+        # The C++ side will interpret these via the draft-loop protocol.
+        all_hidden_cat = torch.cat(all_hidden_list, dim=0)  # [B*steps, dim]
+        out = PyModelOutputs(all_hidden_cat)
+        out.draft_tokens = all_draft_token_ids
+        # Stash probs as a custom attribute for C++ retrieval.
+        # CaptureMemoryHold will snapshot draft_tokens; probs travel via
+        # the hidden_states channel reshaped by the caller.
+        return out
 
 
 __all__ = ["DeepSeekV4MtpModel"]

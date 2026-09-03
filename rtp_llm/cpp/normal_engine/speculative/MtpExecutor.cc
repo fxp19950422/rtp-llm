@@ -756,6 +756,27 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
                                        is_dspark_ ? DSparkModelRole::COMMIT : DSparkModelRole::NONE,
                                        draft_graph_allowed));
             }
+
+            // Create draft-loop graph model when DSV4_MTP_DRAFT_LOOP_GRAPH=1.
+            // This model wraps forward_draft_loop (N-1 step unrolled) for CUDA
+            // graph capture. Only created for non-DSpARK MTP with propose_step > 1.
+            if (!is_dspark_ && enable_cuda_graph && propose_step_ > 1) {
+                static const bool draft_loop_enabled = []() {
+                    const char* env = std::getenv("DSV4_MTP_DRAFT_LOOP_GRAPH");
+                    return env != nullptr && std::string(env) == "1";
+                }();
+                if (draft_loop_enabled) {
+                    RTP_LLM_LOG_INFO("[speculative decoding] creating draft-loop CUDA graph model");
+                    draft_loop_model_.reset(
+                        new PyWrappedModel(model_params,
+                                           params.py_sp_model,
+                                           false,   // not prefill mode
+                                           false,   // not use_spec_decoding
+                                           DSparkModelRole::NONE,
+                                           true,    // allow_cuda_graph
+                                           true));  // is_draft_loop = true
+                }
+            }
         }
         break;  // NOTE: only support one mtp model now
     }
@@ -1980,6 +2001,9 @@ void MtpExecutor::releaseAllModelBuffers() {
     if (sp_prefill_draft_model_) {
         sp_prefill_draft_model_->releaseBuffers();
     }
+    if (draft_loop_model_) {
+        draft_loop_model_->releaseBuffers();
+    }
 }
 
 void MtpExecutor::prepareStreams(const std::list<GenerateStreamPtr>& streams,
@@ -2207,7 +2231,41 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
     draft_token_columns.push_back(to_cuda_i32_flat(pre_target_token_t));
     draft_token_columns.push_back(pre_propose_token_t_raw);
 
-    // n-1 steps draft model decode
+    // ====================================================================
+    // Draft-loop graph path: when DSV4_MTP_DRAFT_LOOP_GRAPH=1 and the
+    // draft_loop_model_ is available, call a single CUDA-graph-captured
+    // forward_draft_loop that contains all N-1 draft iterations.  This
+    // eliminates the per-iteration host→device round-trip (GIL, graph
+    // select, prepareInputs) that causes 52.8x bare/graph TPOT.
+    // ====================================================================
+    if (useDraftLoopGraph() && draft_loop_model_ && propose_step_ > 1) {
+        RTP_LLM_PROFILE_SCOPE("executor.mtp.draft_model_decode(draft_loop_graph)");
+        ensureModelInputsOnCuda(model_input, "draft_decode.draft_loop_graph");
+        int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
+
+        // The draft_loop_model_ wraps a Python model whose forward is
+        // actually forward_draft_loop.  Its PyModelOutputs carries:
+        //   hidden_states = [B * (propose_step_-1), dim]  (per-step hidden)
+        //   draft_tokens  = [B, propose_step_-1]  (int32 token ids)
+        auto loop_output = forwardModel(draft_loop_model_.get(), model_input, ModelInputsModelRole::DRAFT);
+        model_forward_us += autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
+
+        // Unpack draft_tokens columns.
+        if (loop_output.draft_tokens.defined()) {
+            for (int i = 0; i < propose_step_ - 1; i++) {
+                auto step_tokens = loop_output.draft_tokens.select(1, i).contiguous();
+                draft_token_columns.push_back(to_cuda_i32_flat(step_tokens));
+                // For probs, we use a unit delta (point-mass at argmax).
+                auto probs = torch::zeros({(int64_t)batch_size, 1, (int64_t)draft_vocab_size_},
+                                          torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+                probs.scatter_(-1, step_tokens.reshape({(int64_t)batch_size, 1, 1}).to(torch::kInt64), 1.0);
+                draft_probs_list.push_back(probs);
+            }
+        }
+        // Update draft_decode_model_output for the final hidden state.
+        draft_decode_model_output = std::move(loop_output);
+    } else {
+    // n-1 steps draft model decode (legacy host-loop fallback)
     for (int i = 0; i < propose_step_ - 1; i++) {
         RTP_LLM_PROFILE_SCOPE_DYNAMIC("executor.mtp.draft_model_decode(loop_iter=%d)", i);
         RTP_LLM_LOG_DEBUG("[MTP draftDecode] loop step %d/%d start, batch_size %zu", i, propose_step_ - 1, batch_size);
@@ -2240,6 +2298,7 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
                 model_input, draft_decode_model_output, draft_token_ids, buffer_holder_);
         }
     }
+    }  // end draft-loop graph vs host-loop fallback
 
     {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.draft_model_decode(build_spec_decode_input)");
@@ -2333,6 +2392,13 @@ bool MtpExecutor::useDropBroadSync() const {
 bool MtpExecutor::useAsyncPrepare() const {
     static const bool enabled = []() {
         return readEnvFlagOnce("RTP_LLM_MTP_ASYNC_PREPARE", "async-prepare", "enabled");
+    }();
+    return enabled;
+}
+
+bool MtpExecutor::useDraftLoopGraph() const {
+    static const bool enabled = []() {
+        return readEnvFlagOnce("DSV4_MTP_DRAFT_LOOP_GRAPH", "draft-loop-graph", "useDraftLoopGraph");
     }();
     return enabled;
 }

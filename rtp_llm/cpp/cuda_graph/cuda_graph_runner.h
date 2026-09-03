@@ -37,6 +37,7 @@ public:
         input_hidden_size_(graph_params.input_hidden_size),
         hc_mult_(static_cast<int>(graph_params.hc_mult)),
         sp_steps_(graph_params.sp_steps),
+        is_draft_loop_(graph_params.is_draft_loop),
         prefill_capture_seq_lens_(graph_params.prefill_capture_seq_lens),
         decode_capture_batch_sizes_(graph_params.decode_capture_batch_sizes),
         model_data_type_(graph_params.model_data_type),
@@ -53,6 +54,9 @@ public:
         max_bs_               = graph_params.max_context_batch_size;
         py_attn_pyobj_method_ = py_instance_.attr("prepare_fmha_impl");
         py_forward_method_    = py_instance_.attr(forward_method_name);
+        if (is_draft_loop_ && py::hasattr(py_instance_, "forward_draft_loop")) {
+            py_forward_draft_loop_method_ = py_instance_.attr("forward_draft_loop");
+        }
         options_cuda_int32_   = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false);
         options_cpu_int32_    = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCPU).requires_grad(false);
         options_cuda_float_ = torch::TensorOptions().dtype(model_data_type_).device(torch::kCUDA).requires_grad(false);
@@ -166,6 +170,8 @@ private:
     int                     hc_mult_{1};
     int                     sp_steps_{0};
     NumericalStatusScope    numerical_status_scope_{NumericalStatusScope::NONE};
+    bool                    is_draft_loop_{false};
+    py::object              py_forward_draft_loop_method_;  // forward_draft_loop (N-1 step unrolled)
     std::vector<int>        capture_range_;
     std::vector<int>        prefill_capture_seq_lens_;    // Pre-configured sequence lengths from Python
     std::vector<int>        decode_capture_batch_sizes_;  // Pre-configured batch sizes from Python

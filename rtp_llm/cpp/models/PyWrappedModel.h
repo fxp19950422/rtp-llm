@@ -65,7 +65,8 @@ public:
                    bool                      is_prefill_cuda_graph_mode = false,
                    bool                      use_spec_decoding          = false,
                    DSparkModelRole           dspark_model_role          = DSparkModelRole::NONE,
-                   bool                      allow_cuda_graph           = true);
+                   bool                      allow_cuda_graph           = true,
+                   bool                      is_draft_loop              = false);
     ~PyWrappedModel();
 
     GptModelOutputs forward(const GptModelInputs& inputs) override;
@@ -219,7 +220,8 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
                                       bool                      is_prefill_cuda_graph_mode,
                                       bool                      use_spec_decoding,
                                       DSparkModelRole           dspark_model_role,
-                                      bool                      allow_cuda_graph):
+                                      bool                      allow_cuda_graph,
+                                      bool                      is_draft_loop):
     device_props_(buildExecProperties(params.parallelism_config, params.device_resource_config)),
     // Every prefill-shaped forward of a CP-enabled model goes through the
     // standard split/gather path — including the DSpARK draft commit, whose
@@ -400,6 +402,7 @@ inline PyWrappedModel::PyWrappedModel(const GptModelInitParams& params,
                                              && !is_prefill_cuda_graph_mode;
         graph_params.is_target_verify =
             dspark_model_role_ != DSparkModelRole::NONE || use_spec_decoding || is_target_verify_decode;
+        graph_params.is_draft_loop    = is_draft_loop;
         if (params.sp_config.type != SP_TYPE_NONE) {
             graph_params.sp_steps = params.sp_config.gen_num_per_cycle;
         }

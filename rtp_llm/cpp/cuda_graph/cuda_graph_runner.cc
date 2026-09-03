@@ -1254,7 +1254,11 @@ void CudaGraphRunner::initCapture() {
             if (capture_mem_hold_.py_model_inputs_.numerical_status.defined()) {
                 capture_mem_hold_.py_model_inputs_.numerical_status.values.zero_();
             }
-            py_forward_method_(capture_mem_hold_.py_model_inputs_, attn_pyobj);
+            if (is_draft_loop_ && py_forward_draft_loop_method_ && !py_forward_draft_loop_method_.is_none()) {
+                py_forward_draft_loop_method_(capture_mem_hold_.py_model_inputs_, attn_pyobj, sp_steps_);
+            } else {
+                py_forward_method_(capture_mem_hold_.py_model_inputs_, attn_pyobj);
+            }
             checkNumericalStatusIdentity(
                 capture_mem_hold_.py_model_inputs_.numerical_status, status_identity, "capture initialization");
         } catch (const py::error_already_set& e) {
@@ -1326,15 +1330,30 @@ void CudaGraphRunner::captureOneGraphInstance(int key, const char* key_type) {
         // remain free of host-side barriers.
         ScopedEnvFlag cuda_graph_warmup("RTP_LLM_CUDA_GRAPH_WARMUP_FORWARD", "1");
         const auto status_identity = captureNumericalStatusIdentity(inputs.numerical_status);
+        // The first warmup run reveals whether this graph produces draft tokens
+        // (DSpARK proposal). Allocate the persistent replay output buffer from that
+        // shape so the capture below can copy into graph-owned memory.
         if (inputs.numerical_status.defined()) {
             inputs.numerical_status.values.zero_();
         }
-        py_forward_method_(inputs, attn_pyobj);
+        PyModelOutputs warmup_outputs;
+        if (is_draft_loop_ && py_forward_draft_loop_method_ && !py_forward_draft_loop_method_.is_none()) {
+            warmup_outputs = py_forward_draft_loop_method_(inputs, attn_pyobj, sp_steps_).cast<PyModelOutputs>();
+        } else {
+            warmup_outputs = py_forward_method_(inputs, attn_pyobj).cast<PyModelOutputs>();
+        }
         checkNumericalStatusIdentity(inputs.numerical_status, status_identity, "first graph warmup");
+        if (warmup_outputs.draft_tokens.defined()) {
+            graph_instances_[key].mem_hold_.setDraftTokens(torch::empty_like(warmup_outputs.draft_tokens));
+        }
         if (inputs.numerical_status.defined()) {
             inputs.numerical_status.values.zero_();
         }
-        py_forward_method_(inputs, attn_pyobj);
+        if (is_draft_loop_ && py_forward_draft_loop_method_ && !py_forward_draft_loop_method_.is_none()) {
+            py_forward_draft_loop_method_(inputs, attn_pyobj, sp_steps_);
+        } else {
+            py_forward_method_(inputs, attn_pyobj);
+        }
         checkNumericalStatusIdentity(inputs.numerical_status, status_identity, "second graph warmup");
     } catch (const py::error_already_set& e) {
         RTP_LLM_LOG_ERROR("WarmUp forward failed for %s %d: %s", key_type, key, e.what());
@@ -1370,7 +1389,12 @@ void CudaGraphRunner::captureOneGraphInstance(int key, const char* key_type) {
                     inputs.numerical_status.values.zero_();
                 }
                 const auto status_identity = captureNumericalStatusIdentity(inputs.numerical_status);
-                auto py_outputs_obj = py_forward_method_(inputs, attn_pyobj);
+                py::object py_outputs_obj;
+                if (is_draft_loop_ && py_forward_draft_loop_method_ && !py_forward_draft_loop_method_.is_none()) {
+                    py_outputs_obj = py_forward_draft_loop_method_(inputs, attn_pyobj, sp_steps_);
+                } else {
+                    py_outputs_obj = py_forward_method_(inputs, attn_pyobj);
+                }
                 outputs             = py_outputs_obj.cast<PyModelOutputs>();
                 checkNumericalStatusIdentity(inputs.numerical_status, status_identity, "graph capture");
             } catch (const py::error_already_set& e) {

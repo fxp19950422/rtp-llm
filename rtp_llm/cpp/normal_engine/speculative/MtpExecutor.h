@@ -193,6 +193,11 @@ protected:
 
     bool useAsyncPrepare() const;
 
+    // Opt-in gate for capturing the entire N-1 step MTP draft loop as a
+    // single CUDA graph (forward_draft_loop).  Default off.
+    // Env: DSV4_MTP_DRAFT_LOOP_GRAPH=1
+    bool useDraftLoopGraph() const;
+
     // Opt-in gate to skip the broad sync at decodeStep start.
     // Device state, epoch-guarded clears, and single-slotted workers preserve
     // correctness while bookkeeping overlaps the next step.
@@ -248,6 +253,9 @@ private:
     // parameters to the same two slots.
     std::shared_ptr<ModelBase>                       draft_model_;
     std::shared_ptr<ModelBase>                       sp_prefill_draft_model_;
+    // Draft-loop graph model: wraps forward_draft_loop (N-1 step unrolled).
+    // Created only when DSV4_MTP_DRAFT_LOOP_GRAPH=1.
+    std::shared_ptr<ModelBase>                       draft_loop_model_;
     std::unique_ptr<speculative::SpeculativeSampler> speculative_sampler_;
     std::unique_ptr<speculative::FastTopKSampler>    fast_topk_sampler_;
 
