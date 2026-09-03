@@ -14,6 +14,57 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
+from rtp_llm.models_py.modules.dsv4.runtime_config import get_switch, parse_bool
+
+# --- DSV4_FUSED_ROPE switch (Task #23) ------------------------------------
+# When ON, both apply_rotary_emb and apply_rotary_emb_batched use a single
+# fused CUDA kernel (ppu_fused_rope_apply) that replaces the entire
+# complex-number pipeline:
+#   x.float() -> unflatten -> view_as_complex -> conj -> mul -> view_as_real
+#   -> flatten -> copy_
+# Default OFF: existing complex path, byte-identical to before.
+_DSV4_FUSED_ROPE: bool = get_switch("DSV4_FUSED_ROPE", False, parse_bool)
+
+_ppu_fused_rope_apply = None  # lazy import; only resolved when switch is ON
+
+
+def _get_ppu_fused_rope_apply():
+    global _ppu_fused_rope_apply
+    if _ppu_fused_rope_apply is not None:
+        return _ppu_fused_rope_apply
+    from rtp_llm.ops.compute_ops import rtp_llm_ops
+    _ppu_fused_rope_apply = rtp_llm_ops.ppu_fused_rope_apply
+    return _ppu_fused_rope_apply
+
+
+def _fused_rope_inplace(
+    x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False
+) -> torch.Tensor:
+    """Apply RoPE in-place via the fused CUDA kernel.
+
+    Handles both ``apply_rotary_emb`` and ``apply_rotary_emb_batched``
+    shapes.  ``freqs_cis`` is a complex64 tensor whose leading dims are a
+    prefix of x's leading dims; the kernel broadcasts across heads.
+    """
+    RD = x.size(-1)
+    assert RD % 2 == 0
+    N = x.numel() // RD
+    row_stride = x.stride(-2)
+
+    # flatten freqs to [N_freq, k] and convert to [N_freq, k, 2] float32
+    if not freqs_cis.is_contiguous():
+        freqs_cis = freqs_cis.contiguous()
+    freqs_flat = freqs_cis.view(-1, freqs_cis.shape[-1])
+    N_freq = freqs_flat.shape[0]
+    assert N % N_freq == 0, f"N_rows={N} not divisible by N_freq={N_freq}"
+    freq_stride_n = N // N_freq
+    # view_as_real: [N_freq, k] complex64 -> [N_freq, k, 2] float32
+    cos_sin = torch.view_as_real(freqs_flat).contiguous()
+
+    fn = _get_ppu_fused_rope_apply()
+    fn(x, cos_sin, freq_stride_n, row_stride, inverse)
+    return x
+
 # Process-local memoization keyed by (params, device). All DSV4 compressor
 # layers compute identical freqs_cis (they share rope params), so a single
 # shared tensor replaces what was 61 distinct CPU + 61 distinct GPU copies
@@ -103,6 +154,8 @@ def apply_rotary_emb_batched(
     """
     if x.numel() == 0 or freqs_cis_per_b.numel() == 0:
         return x
+    if _DSV4_FUSED_ROPE:
+        return _fused_rope_inplace(x, freqs_cis_per_b, inverse)
     y = x
     B = x.size(0)
     S = x.size(1)
@@ -135,6 +188,8 @@ def apply_rotary_emb(
     """
     if x.numel() == 0 or freqs_cis.numel() == 0:
         return x
+    if _DSV4_FUSED_ROPE:
+        return _fused_rope_inplace(x, freqs_cis, inverse)
     y = x
     # Use explicit size (last_dim // 2, 2) rather than (-1, 2).  Some
     # torch paths (dynamo/fakemode, certain warmup shapes) reject the

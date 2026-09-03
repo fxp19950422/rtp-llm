@@ -598,3 +598,19 @@ py_test(
         "//conditions:default": ["@platforms//:incompatible"],
     }),
 )
+
+py_test(
+    name = "test_ppu_fused_rope",
+    srcs = ["test_ppu_fused_rope.py"],
+    # Operator-level alignment: ppu_fused_rope_apply vs the complex-number
+    # reference path copied verbatim from rope.py.  Needs the native op, so
+    # PPU-only; the test itself skips when the kernel is unavailable.
+    deps = [
+        "//rtp_llm/models_py:modules",
+        "//rtp_llm:testlib",
+    ],
+    target_compatible_with = select({
+        "@//:using_ppu": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)
