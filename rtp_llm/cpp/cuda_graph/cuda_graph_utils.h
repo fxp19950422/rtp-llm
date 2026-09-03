@@ -24,6 +24,10 @@ public:
         decoder_layer_hidden_states_ = hidden_states;
     };
 
+    void setDraftTokens(at::Tensor draft_tokens) {
+        draft_tokens_ = draft_tokens;
+    };
+
     CaptureMemoryHold() {}
 
     CaptureMemoryHold(at::Tensor hidden_states, torch_ext::PyModelInputs& inputs, bool is_embedding):
@@ -68,6 +72,7 @@ public:
 public:
     py::object               attn_pyobj_{py::none()};
     at::Tensor               decoder_layer_hidden_states_;
+    at::Tensor               draft_tokens_;
     torch_ext::PyModelInputs py_model_inputs_;
 };
 

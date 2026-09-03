@@ -283,6 +283,7 @@ void registerPyOpDefs(pybind11::module& m) {
         .def(pybind11::init<>(), "Default constructor")
         .def(pybind11::init<torch::Tensor>(), pybind11::arg("hidden_states"), "Initialize with hidden states tensor")
         .def_readwrite("hidden_states", &PyModelOutputs::hidden_states, "Hidden states output tensor")
+        .def_readwrite("draft_tokens", &PyModelOutputs::draft_tokens, "Draft tokens from forward_draft_loop")
         .def_readonly("numerical_status", &PyModelOutputs::numerical_status, "Device numerical status view");
 }
 

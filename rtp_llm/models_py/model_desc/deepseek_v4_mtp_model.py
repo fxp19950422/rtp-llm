@@ -439,12 +439,18 @@ class DeepSeekV4MtpModel(DeepSeekV4Model):
                     inputs.input_hiddens = mtp_buf[:valid]
 
                 # Advance sequence lengths on device (int32 add).
+                # attention_inputs is a tagged dict; extract the primary
+                # entry to access its sequence_lengths tensor.
+                _attn = primary_attention_inputs(
+                    inputs.attention_inputs, self.kv_cache
+                )
                 if (
-                    inputs.attention_inputs.sequence_lengths is not None
-                    and inputs.attention_inputs.sequence_lengths.is_cuda
+                    _attn is not None
+                    and _attn.sequence_lengths is not None
+                    and _attn.sequence_lengths.is_cuda
                 ):
-                    inputs.attention_inputs.sequence_lengths = (
-                        inputs.attention_inputs.sequence_lengths + 1
+                    _attn.sequence_lengths = (
+                        _attn.sequence_lengths + 1
                     ).to(torch.int32)
 
             self._cur_inputs = None

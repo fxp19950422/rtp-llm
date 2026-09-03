@@ -368,6 +368,7 @@ struct PyModelInputs {
 
 struct PyModelOutputs {
     torch::Tensor hidden_states;
+    torch::Tensor draft_tokens;  // [B, draft_loop_steps] int32, set by forward_draft_loop
     rtp_llm::NumericalStatusView numerical_status;
 
     PyModelOutputs() = default;

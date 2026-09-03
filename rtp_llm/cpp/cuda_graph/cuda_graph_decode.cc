@@ -14,11 +14,12 @@ std::vector<int> CudaGraphRunner::getDecodeBatchSizesToCapture() {
         std::sort(decode_capture_batch_sizes_.begin(), decode_capture_batch_sizes_.end());
         auto result = decode_capture_batch_sizes_;
         // Draft-loop graphs are N-1x larger than single-step graphs.
-        // Constrain to at most 2 batch sizes to stay under the ~1275 MiB
-        // VRAM red line.  Keep only the largest 2 (most common online).
-        if (is_draft_loop_ && result.size() > 2) {
-            RTP_LLM_LOG_INFO("[draft-loop] trimming capture batch sizes from %zu to 2", result.size());
-            result.erase(result.begin(), result.end() - 2);
+        // Constrain to exactly 1 batch size to stay within VRAM budget.
+        // Two graphs caused OOM on 144 GiB GPUs (~96 MiB shortfall);
+        // keeping only the largest (most common online) saves ~400-600 MiB.
+        if (is_draft_loop_ && result.size() > 1) {
+            RTP_LLM_LOG_INFO("[draft-loop] trimming capture batch sizes from %zu to 1", result.size());
+            result.erase(result.begin(), result.end() - 1);
         }
         return result;
     }
@@ -29,11 +30,9 @@ std::vector<int> CudaGraphRunner::getDecodeBatchSizesToCapture() {
     RTP_LLM_LOG_INFO("max_generate_batch_size for cuda graph: %d", max_generate_batch_size);
 
     if (is_draft_loop_) {
-        // Draft-loop mode: capture only the top 1-2 batch sizes to limit
-        // memory. Each graph stores N-1 steps of kernels.
-        if (max_generate_batch_size >= 16) {
-            capture_bs.push_back(max_generate_batch_size / 2);
-        }
+        // Draft-loop mode: capture exactly 1 batch size (the max) to limit
+        // memory.  Each graph stores N-1 steps of kernels, so a single
+        // graph already consumes ~600+ MiB.  Two graphs caused OOM.
         capture_bs.push_back(max_generate_batch_size);
         return capture_bs;
     }

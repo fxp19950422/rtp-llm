@@ -7,6 +7,7 @@
 #include <limits>
 #include <string>
 #include <c10/core/InferenceMode.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
 #include "rtp_llm/cpp/cuda_graph/cuda_graph_metadata_utils.h"
 #include "rtp_llm/cpp/utils/ProfilingScope.h"
@@ -803,9 +804,16 @@ PyModelOutputs CudaGraphRunner::forward(const PyModelInputs& inputs, CudaGraphSt
             RTP_LLM_PROFILE_SCOPE("cuda_graph.forward(replayDecode)");
             replayDecode(state.current_real_graph_bs);
         }
+        // Rows of a draft-loop buffer are step-major at the captured batch
+        // stride, so the single-step prefix slice would hand back step 0 only.
         outputs.hidden_states =
-            graph_instances_[state.current_real_graph_bs].mem_hold_.decoder_layer_hidden_states_.slice(
-                0, 0, state.seq_len_sum);
+            is_draft_loop_ ?
+                graph_instances_[state.current_real_graph_bs].mem_hold_.decoder_layer_hidden_states_ :
+                graph_instances_[state.current_real_graph_bs].mem_hold_.decoder_layer_hidden_states_.slice(
+                    0, 0, state.seq_len_sum);
+        if (graph_instances_[state.current_real_graph_bs].mem_hold_.draft_tokens_.defined()) {
+            outputs.draft_tokens = graph_instances_[state.current_real_graph_bs].mem_hold_.draft_tokens_;
+        }
         if (numerical_status_scope_ != NumericalStatusScope::NONE) {
             outputs.numerical_status =
                 graph_instances_[state.current_real_graph_bs].mem_hold_.py_model_inputs_.numerical_status;
@@ -1346,6 +1354,15 @@ void CudaGraphRunner::captureOneGraphInstance(int key, const char* key_type) {
         if (warmup_outputs.draft_tokens.defined()) {
             graph_instances_[key].mem_hold_.setDraftTokens(torch::empty_like(warmup_outputs.draft_tokens));
         }
+        // A draft-loop forward returns sp_steps_ stacked blocks of hidden
+        // states ([B * sp_steps, dim]) while the hold buffer was sized for one
+        // decode step ([B, dim]).  Re-anchor it on the warmup shape, otherwise
+        // the copy_ that ends the capture below throws on shape mismatch.
+        if (is_draft_loop_ && warmup_outputs.hidden_states.defined()
+            && graph_instances_[key].mem_hold_.decoder_layer_hidden_states_.sizes()
+                   != warmup_outputs.hidden_states.sizes()) {
+            graph_instances_[key].mem_hold_.setHiddenStates(torch::empty_like(warmup_outputs.hidden_states));
+        }
         if (inputs.numerical_status.defined()) {
             inputs.numerical_status.values.zero_();
         }
@@ -1377,6 +1394,12 @@ void CudaGraphRunner::captureOneGraphInstance(int key, const char* key_type) {
             RTP_LLM_LOG_INFO("CUDA Graph debug mode enabled, output file: %s", output_dot_filename.c_str());
         }
         RTP_LLM_LOG_INFO("Capture for %s %d begin.", key_type, key);
+        // Release PyTorch cached-but-unused GPU memory so the private pool
+        // used by graph capture has enough room (fixes draft-loop OOM).
+        if (is_draft_loop_) {
+            c10::cuda::CUDACachingAllocator::emptyCache();
+            RTP_LLM_LOG_INFO("Emptied PyTorch caching allocator before draft-loop graph capture.");
+        }
         PyModelOutputs outputs;
         {
             cuda_graph::graphCaptureBegin(graph, shared_graph_pool_);
@@ -1402,6 +1425,9 @@ void CudaGraphRunner::captureOneGraphInstance(int key, const char* key_type) {
                 throw;
             }
             graph_instances_[key].mem_hold_.decoder_layer_hidden_states_.copy_(outputs.hidden_states);
+            if (outputs.draft_tokens.defined() && graph_instances_[key].mem_hold_.draft_tokens_.defined()) {
+                graph_instances_[key].mem_hold_.draft_tokens_.copy_(outputs.draft_tokens);
+            }
             graph.capture_end();
         }
 

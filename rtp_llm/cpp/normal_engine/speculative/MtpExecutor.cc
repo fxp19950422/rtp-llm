@@ -2245,15 +2245,24 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
 
         // The draft_loop_model_ wraps a Python model whose forward is
         // actually forward_draft_loop.  Its PyModelOutputs carries:
-        //   hidden_states = [B * (propose_step_-1), dim]  (per-step hidden)
-        //   draft_tokens  = [B, propose_step_-1]  (int32 token ids)
+        //   hidden_states = [Bcap * (propose_step_-1), dim]  (per-step hidden)
+        //   draft_tokens  = [Bcap, propose_step_-1]  (int32 token ids)
+        // Bcap is the *captured* graph batch size, which is >= batch_size once
+        // the real batch has been padded up to a capture bucket.
         auto loop_output = forwardModel(draft_loop_model_.get(), model_input, ModelInputsModelRole::DRAFT);
         model_forward_us += autil::TimeUtility::currentTimeInMicroSeconds() - start_time_us;
 
         // Unpack draft_tokens columns.
         if (loop_output.draft_tokens.defined()) {
             for (int i = 0; i < propose_step_ - 1; i++) {
-                auto step_tokens = loop_output.draft_tokens.select(1, i).contiguous();
+                auto step_tokens = loop_output.draft_tokens.select(1, i);
+                // Trim padding rows: the replay ran at Bcap, the reshapes below
+                // (to_cuda_i32_flat and the scatter_ index) both demand exactly
+                // batch_size rows. Real sequences are a prefix of the pad.
+                if (step_tokens.size(0) > static_cast<int64_t>(batch_size)) {
+                    step_tokens = step_tokens.slice(0, 0, static_cast<int64_t>(batch_size));
+                }
+                step_tokens = step_tokens.contiguous();
                 draft_token_columns.push_back(to_cuda_i32_flat(step_tokens));
                 // For probs, we use a unit delta (point-mass at argmax).
                 auto probs = torch::zeros({(int64_t)batch_size, 1, (int64_t)draft_vocab_size_},

@@ -1280,6 +1280,8 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
                                      replay ? "" : decodeGraphFallbackReasonName(reason));
         };
 
+        // Propagate draft_tokens from graph replay / eager forward to final output
+        torch::Tensor graph_draft_tokens;
         // Cast the Python object to PyModelOutputs and extract hidden states
         if (can_replay_cuda_graph) {
             used_cuda_graph = true;
@@ -1302,6 +1304,9 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
             }
             RTP_LLM_LOG_DEBUG("[PyWrappedModel] CUDA graph forward completed");
             hidden_states = py_model_outputs.hidden_states.clone();
+            if (py_model_outputs.draft_tokens.defined()) {
+                graph_draft_tokens = py_model_outputs.draft_tokens;
+            }
         } else {
             record_decode_graph_decision(/*replay=*/false);
             py::gil_scoped_acquire gil;
@@ -1324,6 +1329,9 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
                 numerical_status_source = py_model_inputs.numerical_status;
             }
             hidden_states    = py_model_outputs.hidden_states.clone();
+            if (py_model_outputs.draft_tokens.defined()) {
+                graph_draft_tokens = py_model_outputs.draft_tokens;
+            }
         }
 
         cache_store_write_cycle.finish();
@@ -1368,6 +1376,9 @@ GptModelOutputs PyWrappedModel::forward(const GptModelInputs& inputs) {
                            std::move(outputs), numerical_status_source, used_cuda_graph, &status_fence);
         }
         auto outputs = callForwardPostLayers(hidden_states, inputs, true);
+        if (graph_draft_tokens.defined()) {
+            outputs.draft_tokens = graph_draft_tokens;
+        }
         return numerical_status_scope_ == NumericalStatusScope::NONE ?
                    outputs :
                    attachNumericalStatus(
