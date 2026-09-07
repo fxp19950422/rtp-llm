@@ -112,7 +112,7 @@ def mhc_pre_big_fuse(
     block_m = 64
     n_splits = (
         _compute_num_split(block_k, mhc_hidden_size, _ceil_div(num_tokens, block_m))
-        if backend in ("deepgemm", "tilelang_splitk")
+        if backend in ("deepgemm", "deepgemm_deterministic", "tilelang_splitk")
         else 1
     )
 
@@ -129,7 +129,7 @@ def mhc_pre_big_fuse(
     # The PPU DeepGEMM implementation performs its split-K reduction inside
     # HcPrenormGemm and writes a single reduced plane. Its current ABI accepts
     # [1, M, N] / [1, M], unlike the old exposed-partials caller contract.
-    output_splits = 1 if backend in ("deepgemm", "tilelang_single") else n_splits
+    output_splits = 1 if backend in ("deepgemm", "deepgemm_deterministic", "tilelang_single") else n_splits
     gemm_out_mul = torch.empty(
         output_splits,
         num_tokens,
@@ -140,8 +140,15 @@ def mhc_pre_big_fuse(
     gemm_out_sqrsum = torch.empty(
         output_splits, num_tokens, dtype=torch.float32, device=residual.device
     )
-    if backend == "deepgemm":
-        _run_deepgemm_splitk_gemm(
+    if backend in ("deepgemm", "deepgemm_deterministic"):
+        run_gemm = _run_deepgemm_splitk_gemm
+        if backend == "deepgemm_deterministic":
+            from internal_source.rtp_llm.models_py.modules.dsv4.ppu_hc_prenorm import (
+                tf32_hc_prenorm_gemm,
+            )
+
+            run_gemm = tf32_hc_prenorm_gemm
+        run_gemm(
             residual_flat.view(num_tokens, mhc_hidden_size),
             fn_flat,
             gemm_out_mul,
@@ -169,7 +176,7 @@ def mhc_pre_big_fuse(
     else:
         raise ValueError(
             "Unsupported DSV4_MHC_PRE_GEMM_BACKEND="
-            f"{backend!r}; expected deepgemm, tilelang_splitk, or tilelang_single."
+            f"{backend!r}; expected deepgemm, deepgemm_deterministic, tilelang_splitk, or tilelang_single."
         )
 
     _mhc_pre_big_fuse(
@@ -181,8 +188,8 @@ def mhc_pre_big_fuse(
         sinkhorn_repeat,
         n_splits=n_splits,
         mhc_mult=mhc_mult,
-        stabilize_mixes=backend == "deepgemm",
-        stabilize_comb=backend == "deepgemm",
+        stabilize_mixes=backend in ("deepgemm", "deepgemm_deterministic"),
+        stabilize_comb=backend in ("deepgemm", "deepgemm_deterministic"),
     )(
         gemm_out_mul,
         gemm_out_sqrsum,

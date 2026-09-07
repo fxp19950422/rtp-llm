@@ -251,6 +251,10 @@ struct PyModelInitResources {
 };
 
 struct PyCacheStoreInputs {
+    // Optional per-step pinned snapshot. Not exposed to Python; copied with
+    // the work item so asynchronous writers retain storage and completion.
+    std::shared_ptr<torch::Event> metadata_ready;
+    std::vector<torch::Tensor> metadata_sources;
     // Eligible non-warmup PD-prefill work item, filtered by PyWrappedModel before entering Python.
     torch::Tensor input_lengths_host;     // int32, [decoder + context]
     torch::Tensor prefix_lengths_host;    // int32, [context]

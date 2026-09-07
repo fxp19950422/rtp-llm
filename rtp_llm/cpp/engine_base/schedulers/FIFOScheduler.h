@@ -7,6 +7,7 @@
 #include "rtp_llm/cpp/cache/KVCacheManager.h"
 #include "rtp_llm/cpp/engine_base/stream/GenerateTypes.h"
 #include "rtp_llm/cpp/engine_base/schedulers/FIFOSchedulerBase.h"
+#include "rtp_llm/cpp/engine_base/schedulers/EpWorkSignal.h"
 #include "kmonitor/client/MetricsReporter.h"
 #include "rtp_llm/cpp/config/ConfigModules.h"
 #include "rtp_llm/cpp/engine_base/schedulers/EngineScheduleInfo.h"
@@ -31,7 +32,11 @@ public:
     std::pair<std::vector<bool>, std::vector<GenerateStreamPtr>>
     enqueueGroup(const std::vector<GenerateStreamPtr>& streams) override;
 
+    absl::Status enqueue(const GenerateStreamPtr& stream) override;
+    absl::Status stop() override;
+
     absl::StatusOr<std::list<GenerateStreamPtr>> schedule() override;
+    void onExecutionComplete() override;
 
 public:
     // for test. Group-aware shadow of the FIFOSchedulerBase helper so that
@@ -121,6 +126,9 @@ private:
     // Context-parallel prefill can opt into single-request admission until
     // the model-side path supports per-request layouts.
     const bool cp_force_single_prefill_ = false;
+    const int64_t dp_fake_wait_ms_ = 10;
+    std::unique_ptr<EpWorkSignal> ep_work_signal_;
+    uint64_t schedule_cycle_id_ = 0;  // Local ordinal, not a distributed epoch.
     // Soft per-round quota on the tokens that are actually recomputed (prefix-cache hits
     // excluded). 0 disables it.
     const size_t max_batch_tokens_without_cache_ = 0;

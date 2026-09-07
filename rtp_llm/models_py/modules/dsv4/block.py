@@ -97,6 +97,7 @@ class Block(nn.Module):
         ep_rank: int = 0,
         max_tokens_per_rank: int = 8192,
         is_decode_role: bool = False,
+        shared_tp_size: int = 1,
         fp8_kv_cache: bool = False,
         platform_provider: Optional[Dsv4PlatformProvider] = None,
     ):
@@ -165,6 +166,7 @@ class Block(nn.Module):
             ep_rank=ep_rank,
             max_tokens_per_rank=max_tokens_per_rank,
             is_decode_role=is_decode_role,
+            shared_tp_size=shared_tp_size,
         )
         self.ffn = (
             platform_provider.build_moe(MoE, **moe_kwargs)

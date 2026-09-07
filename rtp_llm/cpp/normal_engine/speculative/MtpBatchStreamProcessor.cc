@@ -1161,6 +1161,20 @@ void MtpBatchStreamProcessor::updateMultiStepDraftSamplerOutput(const StreamGrou
                                                                 torch::Tensor&              spec_token_ids_d_t,
                                                                 torch::Tensor&              draft_token_probs_d_t,
                                                                 std::vector<torch::Tensor>& draft_token_probs_list) {
+    if (draft_sampler_output.token_ids_are_point_mass) {
+        const auto streams = stream_groups.allStreams();
+        RTP_LLM_CHECK_WITH_INFO(!streams.empty() && draft_token_probs_list.empty(),
+                                "token-only draft batch must have streams and no dense probabilities");
+        for (const auto& stream : streams) {
+            RTP_LLM_CHECK_WITH_INFO(!stream->generateConfig()->stochastic(),
+                                    "token-only MTP host loop requires an all-greedy batch");
+        }
+        spec_token_ids_d_t             = draft_token_ids_d_t.slice(1, 1).contiguous();
+        draft_sampler_output.token_ids = spec_token_ids_d_t;
+        draft_sampler_output.all_probs = torch::Tensor();
+        draft_token_probs_d_t          = torch::Tensor();
+        return;
+    }
     std::vector<torch::Tensor> prev_draft_token_probs_list;
     for (const auto& stream : stream_groups.allStreams()) {
         auto sp_output_buffer = stream->getSPOutputBuffer();

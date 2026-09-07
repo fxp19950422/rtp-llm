@@ -80,3 +80,10 @@ py_test(
         'gpu': 'MI308X-ROCM7',
     },
 )
+
+py_test(
+    name = "test_v4_shared_tp_loader",
+    srcs = ["test_v4_shared_tp_loader.py"],
+    deps = ["//rtp_llm/models_py/standalone:auto_model"],
+    env = {"CUDA_VISIBLE_DEVICES": ""},
+)

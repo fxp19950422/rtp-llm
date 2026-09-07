@@ -804,9 +804,23 @@ class OverlapSharedExpertExecutor(SharedExpertExecutor):
         # EDGE 1 (fork, main -> side): input dependency.  Must be recorded
         # BEFORE the shared expert reads ``x`` on the side stream below.
         stream.wait_stream(torch.cuda.current_stream(x.device))
-        with torch.cuda.stream(stream):
-            with record_function_range("dsv4.moe.shared_expert"):
-                self._out = _run_shared_expert(shared_experts, x, self._fast_path)
+        try:
+            with torch.cuda.stream(stream):
+                with record_function_range("dsv4.moe.shared_expert"):
+                    self._out = _run_shared_expert(shared_experts, x, self._fast_path)
+        except Exception:
+            # start() is outside the caller's routed-work try block. A later
+            # launch may fail after earlier side-stream work was submitted;
+            # join that work before releasing inputs or propagating failure.
+            self._out = None
+            self._active_stream = None
+            try:
+                torch.cuda.current_stream(x.device).wait_stream(stream)
+            except Exception:
+                # CUDA may already have invalidated the capture/context.
+                # Keep the original launch error as the primary exception.
+                logging.exception("Shared-expert failure cleanup could not join side stream")
+            raise
         if capturing:
             # First successful in-graph fork/join announces itself (one INFO
             # per process) -- log-level arm-acceptance evidence that the

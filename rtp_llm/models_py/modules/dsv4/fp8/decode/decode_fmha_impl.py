@@ -33,6 +33,9 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+from rtp_llm.models_py.modules.dsv4.device_metadata import (
+    device_metadata_enabled, device_start_positions,
+)
 
 from rtp_llm.models_py.modules.dsv4.fp8.decode.decode_attn_metadata import (
     DSv4DecodeAttnMetadataFP8,
@@ -93,6 +96,7 @@ class DSv4DecodeFmhaImplFP8:
         attn_inputs: Any,
     ) -> None:
         self.config = config
+        self.cuda_graph_requires_host_metadata = not device_metadata_enabled(config.q_len > 1)
         self.device = device
         self.metadata: DSv4DecodeAttnMetadataFP8 = allocate_decode_metadata_fp8(
             max_batch_size=config.max_batch_size,
@@ -118,6 +122,12 @@ class DSv4DecodeFmhaImplFP8:
         # check was a copy of MlaImplBase's pattern that never evaluated to
         # False here (prepare_cuda_graph is hardcoded on the class).
         return True
+
+    def _metadata_inputs(self, attn_inputs: Any) -> Any:
+        attn = primary_attention_inputs(attn_inputs)
+        if self.cuda_graph_requires_host_metadata:
+            return attn
+        return device_start_positions(attn, self.config.q_len > 1)
 
     def _extract_paged_block_tables(
         self,
@@ -166,7 +176,7 @@ class DSv4DecodeFmhaImplFP8:
         paged_block_tables = self._extract_paged_block_tables(attn_inputs)
         update_decode_metadata_in_place_fp8(
             self.metadata,
-            primary_attention_inputs(attn_inputs),
+            self._metadata_inputs(attn_inputs),
             forbid_realloc=forbid_realloc,
             paged_block_tables=paged_block_tables,
             paged_pool_entries_per_block=self._paged_entries_per_block,
@@ -195,7 +205,7 @@ class DSv4DecodeFmhaImplFP8:
             )
         update_decode_metadata_in_place_fp8(
             self.metadata,
-            primary_attention_inputs(attn_inputs),
+            self._metadata_inputs(attn_inputs),
             forbid_realloc=True,
             paged_block_tables=paged_block_tables,
             paged_pool_entries_per_block=self._paged_entries_per_block,

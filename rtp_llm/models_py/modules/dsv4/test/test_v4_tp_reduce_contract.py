@@ -403,5 +403,99 @@ class MoEFinishOrderingContractTest(unittest.TestCase):
         self.assertEqual(events, [])
 
 
+class SharedTpCombinedReductionTest(unittest.TestCase):
+    def setUp(self):
+        moe_layer._FINAL_OUT_CACHE.clear()
+
+    def _case(self, tokens, cap, debug=False):
+        events = []
+        moe = _post_w2_moe(events, tp_size=4, max_tokens=cap)
+        moe._shared_tp_size = 4
+        seen = []
+
+        def reduce(local):
+            events.append("combined_reduce")
+            self.assertEqual(local.dtype, torch.float32)
+            # routed=2, scale=3, shared partial=5: scale must not touch shared.
+            self.assertTrue(torch.equal(local, torch.full_like(local, 11)))
+            seen.append(local.clone())
+            # Return different storage to cover collective fast paths.
+            return local * 4
+
+        with mock.patch.object(moe_layer, "_all_reduce_routed_tp", reduce), mock.patch.dict(
+            os.environ, {"MOEDBG": "1" if debug else "0"}
+        ):
+            actual = moe(
+                torch.zeros(tokens, 2, dtype=torch.bfloat16),
+                torch.arange(tokens, dtype=torch.long),
+            ).clone()
+        self.assertEqual(actual.dtype, torch.bfloat16)
+        self.assertTrue(torch.equal(actual, torch.full_like(actual, 44)))
+        self.assertEqual(len(seen), (tokens + cap - 1) // cap)
+        self.assertEqual(events.count("route_scale"), len(seen))
+        for i, event in enumerate(events):
+            if event == "combined_reduce":
+                self.assertEqual(events[i - 1], "shared_finish")
+        return moe
+
+    def test_nonchunk_single_combined_fp32_reduce(self):
+        self._case(2, 4)
+
+    def test_chunk_and_tail_each_reduce_once(self):
+        self._case(5, 2)
+
+    def test_debug_path_keeps_combined_reduction(self):
+        self._case(2, 4, debug=True)
+
+    def test_failed_routed_path_still_finishes_shared(self):
+        events = []
+        moe = _post_w2_moe(events, tp_size=4)
+        moe._shared_tp_size = 4
+        with mock.patch.object(
+            moe._strategy, "forward", side_effect=RuntimeError("routed")
+        ), self.assertRaisesRegex(RuntimeError, "routed"):
+            moe(torch.zeros(1, 2), torch.tensor([0]))
+        self.assertEqual(events[-1], "shared_finish")
+
+    def test_bf16_shared_partial_is_added_before_final_rounding(self):
+        moe = _post_w2_moe([], tp_size=4)
+        moe._shared_tp_size = 4
+        # Cancellation distinguishes FP32 add from an accidental BF16 local
+        # sum. This models the production BF16 shared-expert output path.
+        local_routed = torch.tensor([[2.0 ** -10]], dtype=torch.float32)
+        shared_bf16 = torch.ones(1, 1, dtype=torch.bfloat16)
+
+        def reduce(local):
+            self.assertEqual(local.dtype, torch.float32)
+            self.assertEqual(local.item(), 1.0 + 2.0 ** -10)
+            return local - 1.0
+
+        with mock.patch.object(moe_layer, "_all_reduce_routed_tp", reduce):
+            result = moe._combine_shared(local_routed, shared_bf16, torch.bfloat16)
+        self.assertEqual(result.dtype, torch.bfloat16)
+        self.assertEqual(result.item(), 2.0 ** -10)
+
+    def test_unsupported_shared_topologies_fail_before_weight_use(self):
+        kwargs = dict(
+            layer_id=0, dim=4096, moe_inter_dim=2048, n_routed_experts=256,
+            n_activated_experts=6, n_shared_experts=1, score_func="sqrtsoftplus",
+            route_scale=1.5, swiglu_limit=10.0, n_hash_layers=3, vocab_size=129280,
+            layer_weights={}, shared_tp_size=4, tp_size=4, ep_size=1,
+        )
+        for changes in (
+            {"is_decode_role": True}, {"tp_size": 1}, {"ep_size": 8},
+            {"moe_inter_dim": 4096}, {"dim": 8192}, {"shared_tp_size": 2},
+        ):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                MoE(**dict(kwargs, **changes))
+
+    def test_partial_dtype_mismatch_is_rejected(self):
+        moe = _post_w2_moe([], tp_size=4)
+        moe._shared_tp_size = 4
+        with self.assertRaisesRegex(RuntimeError, "FP32"):
+            moe._combine_shared(torch.ones(1, 2, dtype=torch.bfloat16),
+                                torch.ones(1, 2), torch.bfloat16)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -21,6 +21,7 @@
 #include <algorithm>
 #if USING_CUDA
 #include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDACachingAllocator.h>
 #include "rtp_llm/models_py/bindings/cuda/Bf16GemmOp.h"
 #include "rtp_llm/models_py/bindings/cuda/kernels/attention_input_metadata.h"
 #endif
@@ -869,6 +870,51 @@ std::optional<PyCacheStoreInputs> PyWrappedModel::prepareWriteCacheParams(const 
     }
 
     PyCacheStoreInputs cache_store_inputs;
+    if (!async_cache_metadata_.has_value()) {
+        py::gil_scoped_acquire gil;
+        auto config = py::module_::import("rtp_llm.models_py.modules.dsv4.runtime_config");
+        async_cache_metadata_ = config.attr("get_switch")(
+            "DSV4_ASYNC_CACHE_METADATA", false, config.attr("parse_bool")).cast<bool>();
+    }
+#if USING_CUDA
+    if (*async_cache_metadata_) {
+        RTP_LLM_PROFILE_SCOPE("py_model.prepareWriteCacheParams(async_snapshot)");
+        const auto producer = cuda_graph::graphGetCurrentStream();
+        const auto copy_stream = cuda_graph::graphGetStreamFromPool(false);
+        // Freeze CUDA inputs on their producer stream before the next MTP
+        // update can reuse them. Holding a Tensor alone does not freeze values.
+        auto snapshot = [](const torch::Tensor& t) {
+            return t.defined() ? t.clone() : t;
+        };
+        auto lengths = snapshot(inputs.input_lengths);
+        auto prefixes = snapshot(inputs.prefix_lengths);
+        auto blocks = snapshot(inputs.kv_cache_block_id);
+        auto produced = cuda_graph::makeGraphEvent();
+        produced.record(producer);
+        produced.block(copy_stream);
+        cuda_graph::GraphStreamGuard copy_guard(copy_stream);
+        auto to_pinned = [&](const torch::Tensor& t) {
+            if (!t.defined() || !t.is_cuda()) {
+                return t;
+            }
+            auto host = torch::empty(t.sizes(), t.options().device(torch::kCPU).pinned_memory(true));
+            host.copy_(t, /*non_blocking=*/true);
+            c10::cuda::CUDACachingAllocator::recordStream(t.storage().data_ptr(), copy_stream);
+            cache_store_inputs.metadata_sources.push_back(t);
+            return host;
+        };
+        cache_store_inputs.input_lengths_host = to_pinned(lengths);
+        cache_store_inputs.prefix_lengths_host = to_pinned(prefixes);
+        cache_store_inputs.host_kv_cache_offset = to_pinned(blocks);
+        cache_store_inputs.metadata_ready =
+            std::make_shared<torch::Event>(cuda_graph::makeGraphEvent());
+        cache_store_inputs.metadata_ready->record(copy_stream);
+        cache_store_inputs.request_id = snapshot(inputs.request_id);
+        cache_store_inputs.request_pd_separation = snapshot(inputs.request_pd_separation);
+        cache_store_inputs.cache_keys = snapshot(inputs.cache_keys);
+        return cache_store_inputs;
+    }
+#endif
     // runtimeWriteCacheStore reads these via raw host pointers on the async
     // writer thread; MTP device-state paths hand in CUDA tensors, so lift them
     // to host here (sync copy, prefill-frequency only).

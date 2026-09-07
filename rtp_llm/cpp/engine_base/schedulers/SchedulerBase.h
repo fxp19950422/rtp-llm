@@ -21,6 +21,11 @@ public:
     enqueueGroup(const std::vector<GenerateStreamPtr>& streams)     = 0;
     virtual absl::StatusOr<std::list<GenerateStreamPtr>> schedule() = 0;
 
+    // Called after the executor has completed the collective-bearing model
+    // step corresponding to the last schedule() result. Most schedulers have
+    // no cross-process state and intentionally use this no-op default.
+    virtual void onExecutionComplete() {}
+
     // Conservative-KV scheduling variant for async execution. The async path
     // schedules step N+1 before step N's specUpdate has run, so seq_len is not
     // yet authoritative. Conservative variants reserve the maximum possible

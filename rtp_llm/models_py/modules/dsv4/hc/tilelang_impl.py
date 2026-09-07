@@ -145,6 +145,7 @@ class HybridHCUnit(TileLangHCUnit):
             "tilelang",
             "tilelang_single",
             "deepgemm",
+            "deepgemm_deterministic",
         }
         if pre_backend not in allowed_pre_backends:
             allowed = ", ".join(repr(value) for value in sorted(allowed_pre_backends))
@@ -159,7 +160,7 @@ class HybridHCUnit(TileLangHCUnit):
 
             return FallbackHCUnit._pre_impl(self, x, dbg_tag=dbg_tag)
 
-        graph_safe_backends = {"tilelang_single", "deepgemm"}
+        graph_safe_backends = {"tilelang_single", "deepgemm", "deepgemm_deterministic"}
         capture_uses_fallback = pre_backend not in graph_safe_backends
         if (
             x.is_cuda

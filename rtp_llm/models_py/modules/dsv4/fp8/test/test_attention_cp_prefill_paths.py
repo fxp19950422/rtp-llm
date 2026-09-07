@@ -221,6 +221,15 @@ class AttentionSwaAsyncGatherTest(unittest.TestCase):
         self.assertIsNone(qkv.q)
         self.assertIsNotNone(qkv.kv_full)
 
+    def test_platform_shared_quantization_gate_overrides_duck_typing(self) -> None:
+        layer = self._make_qkv_layer([])
+        gate = MagicMock(return_value=False)
+        layer.wq_a = SimpleNamespace(can_share_input_quantization=gate)
+        self.assertFalse(layer._can_reuse_qkv_input_quant())
+        gate.assert_called_once_with(layer.wkv)
+        gate.return_value = True
+        self.assertTrue(layer._can_reuse_qkv_input_quant())
+
     def test_prefill_compute_qkv_reuses_shared_input_quant(self) -> None:
         seq: list = []
         layer = self._make_qkv_layer(seq)

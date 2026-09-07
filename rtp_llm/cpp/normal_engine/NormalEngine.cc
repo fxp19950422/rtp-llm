@@ -631,6 +631,13 @@ absl::Status NormalEngine::step() {
             RTP_LLM_PROFILE_SCOPE("engine.normal.may_add_fake_stream_work");
             mayAddFakeStream(streams);
         }
+        {
+            // Local ordinal: align ranks using collective order, not this ID alone.
+            ++schedule_cycle_id_;
+            RTP_LLM_PROFILE_SCOPE_DYNAMIC("engine.normal.batch(cycle=%lu,real=%zu,fake=%zu)",
+                                          schedule_cycle_id_, scheduled_real_batch,
+                                          streams.size() - scheduled_real_batch);
+        }
         // When TP > 1, all ranks must enter process() together so that
         // tpSyncModelInputs (collective broadcast) does not deadlock.
         // The skip_run flag inside process() handles the "no work" case.
@@ -689,6 +696,7 @@ absl::Status NormalEngine::step() {
             observer.recordProcessSubmit();
         }
         status = executor_->process(streams, tps_schedule_time_us);
+        scheduler_->onExecutionComplete();
         if (status.ok() && refresh_cache_status_snapshot) {
             RTP_LLM_PROFILE_SCOPE("engine.normal.refresh_cache_status_snapshot");
             resource_context_.cache_manager->refreshKVCacheInfoSnapshot();

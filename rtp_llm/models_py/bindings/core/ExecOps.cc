@@ -191,6 +191,11 @@ void runtimeWriteCacheStore(const torch_ext::PyCacheStoreInputs& cache_store_inp
     if (pre_created_event) {
         pre_created_event->synchronize();
     }
+    // Metadata can arrive on a dedicated copy stream independently of the KV
+    // layer event. Neither event implies completion of the other.
+    if (param.metadata_ready) {
+        param.metadata_ready->synchronize();
+    }
 
     RTP_LLM_CHECK_WITH_INFO(
         !layer_kv.tag.empty(), "cache-store write requires a cache tag for layer=%d", layer_kv.layer_id);

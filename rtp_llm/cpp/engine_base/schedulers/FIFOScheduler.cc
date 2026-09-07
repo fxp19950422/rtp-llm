@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <mutex>
+#include <stdexcept>
 
 using namespace std;
 namespace rtp_llm {
@@ -29,11 +30,35 @@ FIFOScheduler::FIFOScheduler(const RuntimeConfig&                   runtime_conf
                       metrics_reporter),
     cp_force_single_prefill_(parallelism_config.prefill_cp_config.is_enabled()
                              && runtime_config.fifo_scheduler_config.cp_force_single_prefill),
+    dp_fake_wait_ms_(runtime_config.fifo_scheduler_config.dp_fake_wait_ms),
     max_batch_tokens_without_cache_(static_cast<size_t>(
         std::max<int64_t>(runtime_config.fifo_scheduler_config.max_batch_tokens_without_cache, 0))),
     prefill_cp_size_(parallelism_config.prefill_cp_config.is_enabled() ?
                          static_cast<size_t>(std::max<int64_t>(parallelism_config.tp_size, 1)) :
                          1) {
+    if (dp_fake_wait_ms_ <= 0) {
+        throw std::invalid_argument("dp_fake_wait_ms must be positive (zero would busy-poll idle DP ranks)");
+    }
+    const auto& fifo_config = runtime_config.fifo_scheduler_config;
+    if (fifo_config.dp_adaptive_fake_wakeup) {
+        if (!need_fill_fake_stream_ || pd_sep_config.role_type != RoleType::DECODE) {
+            throw std::invalid_argument("dp_adaptive_fake_wakeup requires a DP decode scheduler on tp_rank 0");
+        }
+        if (parallelism_config.world_size != parallelism_config.local_world_size
+            || parallelism_config.dp_size != parallelism_config.ep_size) {
+            throw std::invalid_argument(
+                "dp_adaptive_fake_wakeup currently requires same-host world_size and dp_size == ep_size");
+        }
+        ep_work_signal_ = std::make_unique<EpWorkSignal>(fifo_config.dp_adaptive_fake_wakeup_id,
+                                                        parallelism_config.dp_rank,
+                                                        parallelism_config.dp_size);
+    }
+    RTP_LLM_LOG_INFO("[scheduler-config] dp_fake_wait_ms=%ld adaptive_fake_wakeup=%d signal_id=%s "
+                     "need_fill_fake_stream=%d",
+                     dp_fake_wait_ms_,
+                     ep_work_signal_ != nullptr,
+                     fifo_config.dp_adaptive_fake_wakeup_id.c_str(),
+                     need_fill_fake_stream_);
     RTP_LLM_LOG_INFO("max_generate_batch_size is [%zu], max_batch_tokens_size is [%zu], "
                      "max_batch_tokens_without_cache is [%zu], cp_force_single_prefill is [%d], "
                      "prefill_cp_size is [%zu], max_inited_kv_cache_streams is [%zu]",
@@ -48,6 +73,31 @@ FIFOScheduler::FIFOScheduler(const RuntimeConfig&                   runtime_conf
 FIFOScheduler::~FIFOScheduler() {
     (void)stop();
     RTP_LLM_LOG_INFO("destory FIFOScheduler");
+}
+
+absl::Status FIFOScheduler::enqueue(const GenerateStreamPtr& stream) {
+    auto status = FIFOSchedulerBase::enqueue(stream);
+    if (status.ok() && ep_work_signal_) {
+        ep_work_signal_->publishWork();
+    }
+    return status;
+}
+
+absl::Status FIFOScheduler::stop() {
+    auto status = FIFOSchedulerBase::stop();
+    if (ep_work_signal_) {
+        // Wake a scheduler blocked in the process-shared futex so it can see stop_.
+        ep_work_signal_->wakeAll();
+    }
+    return status;
+}
+
+void FIFOScheduler::onExecutionComplete() {
+    if (ep_work_signal_) {
+        // Advance exactly one collective epoch. Do not snapshot peer counters:
+        // a faster rank may already have published demand for the next epoch.
+        ep_work_signal_->completeStep();
+    }
 }
 
 void FIFOScheduler::cancelGroups(StreamGroupQueue& group_queue) {
@@ -121,6 +171,9 @@ FIFOScheduler::enqueueGroup(const vector<GenerateStreamPtr>& streams) {
         schedule_trigger_ = true;
     }
     cond_.notify_all();
+    if (ep_work_signal_) {
+        ep_work_signal_->publishWork();
+    }
     return {std::move(enqueue_successes), streams};
 }
 
@@ -567,11 +620,41 @@ void FIFOScheduler::evaluateWaitingGroupQueue() {
 }
 
 absl::StatusOr<list<GenerateStreamPtr>> FIFOScheduler::schedule() {
-    unique_lock<mutex> lock(lock_);
-    if (need_fill_fake_stream_) {
-        cond_.wait_for(lock, std::chrono::milliseconds(10), [this] { return waitPredicate(); });
-    } else {
-        cond_.wait(lock, [this] { return waitPredicate(); });
+    unique_lock<mutex> lock(lock_, std::defer_lock);
+    {
+        RTP_LLM_PROFILE_SCOPE("scheduler.acquire_lock");
+        lock.lock();
+    }
+    const auto cycle = ++schedule_cycle_id_;
+    {
+        const bool    ready      = waitPredicate();
+        const int64_t timeout_ms = ep_work_signal_ ? -1 : (need_fill_fake_stream_ ? dp_fake_wait_ms_ : -1L);
+        RTP_LLM_PROFILE_SCOPE_DYNAMIC("scheduler.wait(cycle=%lu,reason=%s,timeout_ms=%ld)",
+                                      cycle,
+                                      ready ? "ready" : (ep_work_signal_ ? "idle_ep_futex"
+                                                                         : (need_fill_fake_stream_ ? "idle_dp" : "idle")),
+                                      timeout_ms);
+        if (ep_work_signal_) {
+            if (waitPredicate()) {
+                // Ongoing local streams do not call enqueue again. Publish one
+                // epoch of real work so idle peers enter the matching fake step.
+                ep_work_signal_->publishWork();
+            }
+            while (!waitPredicate() && !ep_work_signal_->hasWorkForNextEpoch()) {
+                lock.unlock();
+                ep_work_signal_->waitForWorkForNextEpoch();
+                lock.lock();
+            }
+            if (waitPredicate()) {
+                // Work may have arrived locally while the scheduler mutex was
+                // released around futex_wait.
+                ep_work_signal_->publishWork();
+            }
+        } else if (need_fill_fake_stream_) {
+            cond_.wait_for(lock, std::chrono::milliseconds(dp_fake_wait_ms_), [this] { return waitPredicate(); });
+        } else {
+            cond_.wait(lock, [this] { return waitPredicate(); });
+        }
     }
 
     schedule_trigger_                 = false;

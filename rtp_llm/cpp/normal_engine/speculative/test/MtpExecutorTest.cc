@@ -259,6 +259,13 @@ public:
         return output_holder.get();
     }
 
+    torch::Tensor forwardTokenIds(const torch::Tensor& logits) override {
+        ++token_only_calls;
+        return forward(logits, 1).token_ids;
+    }
+
+    size_t token_only_calls = 0;
+
     void checkInputs(const torch::Tensor& logits) {
         auto expected_logits = logits_holder.get();
         RTP_LLM_LOG_INFO("check fast_topk_sampler logits");
@@ -1667,6 +1674,9 @@ TEST_F(MtpExecutorTest, testMultiBatchDecode) {
 }
 
 TEST_F(MtpExecutorTest, testDraftModelDecodeExpandsTargetVerifyPositionIds) {
+    // Reuse the same independent model/token/position expectations for all modes.
+    for (int mode = 0; mode < 3; ++mode) {
+    SCOPED_TRACE(mode);  // stochastic, all-greedy, mixed
     size_t propose_step = 4;
     size_t batch_size   = 2;
     size_t vocab_size   = 4;
@@ -1687,6 +1697,10 @@ TEST_F(MtpExecutorTest, testDraftModelDecodeExpandsTargetVerifyPositionIds) {
         stream_model_config, components.runtime_config, components.resource_context, {1, 2, 3, 0, 1, 2, 3, 0});
     stream1->setContextPositionIds(torch::tensor({0, 0, 0}, torch::kInt32));
     stream2->setContextPositionIds(torch::tensor({0, 0, 0}, torch::kInt32));
+    stream1->generateConfig()->do_sample = mode == 0;
+    stream2->generateConfig()->do_sample = true;
+    stream1->generateConfig()->top_k = 0;
+    stream2->generateConfig()->top_k = mode == 1 ? 1 : 0;
 
     auto sp_output_buffer1    = std::make_shared<SpeculativeExecutorStreamOutput>();
     sp_output_buffer1->tokens = torch::tensor({10, 11}, torch::kInt32).reshape({1, 2});
@@ -1753,12 +1767,17 @@ TEST_F(MtpExecutorTest, testDraftModelDecodeExpandsTargetVerifyPositionIds) {
         {draft_sampler_output_1, draft_sampler_output_2, draft_sampler_output_3});
 
     components.executor->setDraftModel(std::move(components.fake_draft_model));
+    auto* fake_fast_topk_sampler = components.fake_fast_topk_sampler.get();
     components.executor->setFastTopKSampler(std::move(components.fake_fast_topk_sampler));
 
     std::vector<torch::Tensor> draft_probs_list;
     torch::Tensor              draft_token_ids_t;
     int64_t                    model_forward_us = 0;
-    components.executor->draftModelDecode(model_input, stream_groups, draft_probs_list, draft_token_ids_t, model_forward_us);
+    const bool token_only = components.executor->draftModelDecode(
+        model_input, stream_groups, draft_probs_list, draft_token_ids_t, model_forward_us);
+    EXPECT_EQ(token_only, mode == 1);
+    EXPECT_EQ(draft_probs_list.size(), mode == 1 ? 0u : propose_step - 1);
+    EXPECT_EQ(fake_fast_topk_sampler->token_only_calls, mode == 1 ? propose_step - 1 : 0u);
 
     EXPECT_EQ((std::vector<int>{10, 11, 12, 13, 14, 20, 21, 22, 23, 24}), toVec<int>(model_input.combo_tokens));
     EXPECT_EQ((std::vector<int>{5, 5}), toVec<int>(model_input.input_lengths));
@@ -1771,6 +1790,7 @@ TEST_F(MtpExecutorTest, testDraftModelDecodeExpandsTargetVerifyPositionIds) {
     EXPECT_EQ((std::vector<int>{5, 5, 5, 6, 6, 6, 7, 7, 7, 8,  8,  8,  9,  9,  9,
                                 7, 7, 7, 8, 8, 8, 9, 9, 9, 10, 10, 10, 11, 11, 11}),
               toVec<int>(model_input.combo_position_ids));
+    }
 }
 
 TEST_F(MtpExecutorTest, testDSparkDraftMasksInvalidTemperatureAndUsesProbabilitySampling) {

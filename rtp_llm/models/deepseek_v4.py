@@ -82,6 +82,11 @@ def _dsv4_fixed_pool_use_host_memory() -> bool:
     return raw.strip().lower() in _TRUTHY_ENV_VALUES
 
 
+class _V4SharedExpertConfig(AttnConfig):
+    shared_tp_size: int = 1
+    shared_tp_rank: int = 0
+
+
 class DeepSeekV4Weight(DeepSeekV2Weight):
     """DeepSeek-V4 weight info.
 
@@ -101,6 +106,12 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
         whether the layer's router is hash (``layer_id < num_hash_layers``) or
         noaux_tc (``layer_id >= num_hash_layers``).
     """
+
+    def __init__(self, model_config, parallelism_config, *args, **kwargs):
+        from rtp_llm.models_py.modules.dsv4.shared_tp import resolve_prefill_shared_tp4
+
+        self._shared_tp_layout = resolve_prefill_shared_tp4(parallelism_config)
+        super().__init__(model_config, parallelism_config, *args, **kwargs)
 
     def _process_meta(self, meta_dict, weight_keys):  # type: ignore[override]
         # V4 has no LoRA q-projection split (we use ``wq_a`` / ``wq_b`` directly)
@@ -311,7 +322,11 @@ class DeepSeekV4Weight(DeepSeekV2Weight):
         return out
 
     def _build_shared_expert(self, layer_id: int) -> List[WeightModule]:
-        cfg = self._v4_attn_cfg()
+        cfg = _V4SharedExpertConfig(
+            **self._v4_attn_cfg().model_dump(),
+            shared_tp_size=self._shared_tp_layout.size,
+            shared_tp_rank=self._shared_tp_layout.rank,
+        )
         return [
             AttnAtomicWeight(
                 W.v4_shared_w13_w,

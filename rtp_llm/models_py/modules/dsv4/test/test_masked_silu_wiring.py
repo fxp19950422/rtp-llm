@@ -63,9 +63,14 @@ class MaskedSiluCallContractTest(unittest.TestCase):
         self.assertEqual(call.keywords, [])
         self.assertEqual(
             [a.id for a in call.args if isinstance(a, ast.Name)],
-            ["gate_up_grouped", "safe_counts", "swiglu_limit", "compute_capacity"],
+            ["gate_up_grouped", "safe_counts", "swiglu_limit"],
         )
         self.assertEqual(len(call.args), 4)
+        hint = call.args[3]
+        self.assertIsInstance(hint, ast.IfExp)
+        self.assertEqual(hint.test.id, "_BUCKET_EXPECTED_M")
+        self.assertEqual(hint.body.id, "expected_m")
+        self.assertEqual(hint.orelse.id, "compute_capacity")
 
     def test_the_op_allocates_both_outputs(self):
         # The measured patch pre-allocated the payload and the scale in Python

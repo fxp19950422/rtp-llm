@@ -137,3 +137,84 @@ def compact_to_strided_prefix(
             else "unknown CUDA Runtime error"
         )
         raise RuntimeError(f"cudaMemcpy2DAsync failed ({status}): {message}")
+
+
+def strided_prefix_to_compact(
+    padded: torch.Tensor,
+    compact: torch.Tensor,
+) -> None:
+    """Copy ``padded[e, :C, :]`` into ``compact[e, :, :]`` asynchronously.
+
+    Reverse direction of :func:`compact_to_strided_prefix`, added for the
+    dispatch side (N3): DeepEP LL hands back a strided ``[E, LL, D]`` buffer and
+    the grouped MXFP4 GEMM only needs the first ``C`` rows per expert.  The
+    elementwise ``.contiguous()`` on that slice reaches ~239 GB/s; the same
+    ``cudaMemcpy2DAsync`` the combine side already runs in production reaches
+    ~1.67 TB/s on identical geometry.
+
+    dtype is deliberately widened to ``uint8`` as well: the dispatch payload is
+    packed MXFP4 (uint8), whereas the combine payload is BF16.  Both are opaque
+    byte blobs to a pitched copy.
+    """
+    if not isinstance(padded, torch.Tensor) or not isinstance(compact, torch.Tensor):
+        raise TypeError("strided_prefix_to_compact requires two torch.Tensor values")
+    if padded.dim() != 3 or compact.dim() != 3:
+        raise ValueError("strided_prefix_to_compact requires rank-3 tensors")
+    allowed = (torch.bfloat16, torch.uint8)
+    if padded.dtype not in allowed or compact.dtype != padded.dtype:
+        raise TypeError("strided_prefix_to_compact requires matching BF16 or uint8 tensors")
+    if not padded.is_cuda or not compact.is_cuda:
+        raise ValueError("strided_prefix_to_compact requires CUDA/PPU tensors")
+    if padded.device != compact.device:
+        raise ValueError("padded and compact tensors must be on the same device")
+    if not padded.is_contiguous() or not compact.is_contiguous():
+        raise ValueError("padded and compact tensors must both be contiguous")
+    if padded.requires_grad or compact.requires_grad:
+        raise ValueError("strided_prefix_to_compact is inference-only")
+
+    experts, compact_rows, width = compact.shape
+    padded_experts, padded_rows, padded_width = padded.shape
+    if experts <= 0 or compact_rows <= 0 or width <= 0:
+        raise ValueError("compact tensor dimensions must all be positive")
+    if experts != padded_experts or width != padded_width:
+        raise ValueError("padded and compact expert/width dimensions must match")
+    if compact_rows > padded_rows:
+        raise ValueError("compact rows must not exceed padded rows")
+    if torch.cuda.current_device() != compact.get_device():
+        raise RuntimeError("compact tensor device must be the current CUDA device")
+
+    element_bytes = compact.element_size()
+    width_bytes = compact_rows * width * element_bytes
+    src_pitch = padded_rows * width * element_bytes
+    compact_bytes = compact.numel() * element_bytes
+    padded_bytes = padded.numel() * element_bytes
+    compact_start = compact.data_ptr()
+    padded_start = padded.data_ptr()
+    if not (
+        compact_start + compact_bytes <= padded_start
+        or padded_start + padded_bytes <= compact_start
+    ):
+        raise ValueError("padded and compact storage must not overlap")
+
+    prepare_compact_prefix_copy()
+    assert _CUDA_MEMCPY_2D_ASYNC is not None
+    assert _CUDA_GET_ERROR_STRING is not None
+    stream = torch.cuda.current_stream(compact.device).cuda_stream
+    status = _CUDA_MEMCPY_2D_ASYNC(
+        ctypes.c_void_p(compact_start),
+        ctypes.c_size_t(width_bytes),
+        ctypes.c_void_p(padded_start),
+        ctypes.c_size_t(src_pitch),
+        ctypes.c_size_t(width_bytes),
+        ctypes.c_size_t(experts),
+        ctypes.c_int(_CUDA_MEMCPY_DEVICE_TO_DEVICE),
+        ctypes.c_void_p(stream),
+    )
+    if status != 0:
+        raw_message = _CUDA_GET_ERROR_STRING(status)
+        message = (
+            raw_message.decode("utf-8", "replace")
+            if raw_message is not None
+            else "unknown CUDA Runtime error"
+        )
+        raise RuntimeError(f"cudaMemcpy2DAsync failed ({status}): {message}")

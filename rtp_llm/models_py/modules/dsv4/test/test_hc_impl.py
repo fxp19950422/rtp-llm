@@ -439,7 +439,7 @@ class TestHCImpl(unittest.TestCase):
         tilelang_result = object()
         fallback_result = object()
 
-        for backend in (None, "tilelang", "deepgemm", "TILELANG_SINGLE "):
+        for backend in (None, "tilelang", "deepgemm", "deepgemm_deterministic", "TILELANG_SINGLE "):
             with self.subTest(backend=backend), _env(
                 "DSV4_MHC_PRE_GEMM_BACKEND", backend
             ), mock.patch(
@@ -454,6 +454,7 @@ class TestHCImpl(unittest.TestCase):
             if backend is not None and backend.strip().lower() in {
                 "tilelang_single",
                 "deepgemm",
+                "deepgemm_deterministic",
             }:
                 self.assertIs(actual, tilelang_result)
                 tilelang_pre.assert_called_once_with(cuda_x, dbg_tag="graph")

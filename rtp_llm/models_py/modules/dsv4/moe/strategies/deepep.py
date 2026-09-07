@@ -23,6 +23,7 @@ import torch
 
 from ...runtime_config import (
     get_switch,
+    parse_bool,
     parse_nonneg_int,
     parse_percentile_list,
 )
@@ -32,6 +33,9 @@ from ..warmup_sync import (
 )
 from .base import MoeCfg, RoutedExpertsStrategy, register_strategy
 from .local_loop import LocalLoopStrategy
+from ._expected_m import expected_m_for_tokens
+
+_BUCKET_EXPECTED_M = get_switch("DSV4_MOE_BUCKET_EXPECTED_M", False, parse_bool)
 
 
 _CAPACITY_OVERFLOW_MODE = (
@@ -60,17 +64,43 @@ class _CapacityOverflowMonitor:
     capture/replay.
     """
 
-    __slots__ = ("_stats", "_per_expert")
+    __slots__ = ("_stats", "_per_expert", "_by_bucket")
 
     def __init__(self) -> None:
         self._stats: Optional[torch.Tensor] = None
+        # Bucket key (padded local token count) -> ``(stats3, per_expert)``,
+        # where ``stats3`` is ``[dropped, max_seen, steps]``.  Same two device
+        # accumulators the aggregate path uses, scoped to one bucket, plus a
+        # step counter: peak alone invites the mistake this project already
+        # made once ("headroom inferred from the mean was 40x optimistic"), so
+        # the readout carries the divisor that separates mean from peak.
+        # Populated only while ``DSV4_MOE_OVERFLOW_BUCKETS`` is on.
+        self._by_bucket: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
         # Per-expert token counts, allocated only while the outside-graph
         # readout is enabled (DSV4_MOE_OVERFLOW_REPLAY_LOG_EVERY > 0).  Device-only
         # accumulation, like ``_stats``: captured into the graph so replays
         # advance it with zero host involvement.  Never synced per step.
         self._per_expert: Optional[torch.Tensor] = None
 
-    def record(self, counts: torch.Tensor, capacity: int) -> None:
+    def record(
+        self,
+        counts: torch.Tensor,
+        capacity: int,
+        local_tokens: "Optional[int]" = None,
+    ) -> None:
+        """Accumulate one forward's per-expert routing counts.
+
+        ``local_tokens`` is the caller's padded local token count
+        (``x.shape[0]``) -- the CUDA-graph decode bucket multiplied by the
+        per-request candidate count, so an MTP draft forward and a verify
+        forward on different buckets can legitimately share a value.  That is
+        the right key regardless: a bucket-aware capacity (N4) has to be a
+        function of exactly this number and nothing else, and it is the only
+        quantity reachable from here that identifies the bucket at all (the
+        bucket list itself lives in C++).  It stays a plain host int -- read at
+        capture time, burnt into the graph -- so using it as a dict key adds no
+        device work and no host work on replay.
+        """
         if _CAPACITY_OVERFLOW_MODE == "off":
             return
         if counts.numel() == 0:
@@ -86,6 +116,30 @@ class _CapacityOverflowMonitor:
             self._per_expert = torch.zeros(
                 counts.numel(), dtype=torch.int64, device=counts.device
             )
+        bucket = None
+        if _OVF_BUCKETS and local_tokens is not None:
+            key = int(local_tokens)
+            bucket = self._by_bucket.get(key)
+            if bucket is None:
+                # Same "allocate before the warmup guard" contract as the
+                # accumulators above, and it is what makes the per-key vectors
+                # safe at all: the eager warmup forward for a bucket runs
+                # immediately before that bucket's capture
+                # (cuda_graph_runner.cc:1339) on the same padded shape, so the
+                # zeros() fill lands OUTSIDE the capture and the graph records
+                # only the adds.
+                # ``setdefault`` (atomic under the GIL) rather than ``[key] =``:
+                # the forward runs on both the engine thread and an AsyncRunner
+                # worker, and a lost insert would silently drop a bucket.
+                bucket = self._by_bucket.setdefault(
+                    key,
+                    (
+                        torch.zeros(3, dtype=torch.int64, device=counts.device),
+                        torch.zeros(
+                            counts.numel(), dtype=torch.int64, device=counts.device
+                        ),
+                    ),
+                )
         # Warmup forwards run on dummy inputs just before each capture
         # (RTP_LLM_CUDA_GRAPH_WARMUP_FORWARD=1).  Their routing counts can be
         # inflated and would poison the first readout window with fake
@@ -95,10 +149,24 @@ class _CapacityOverflowMonitor:
             return
         c64 = counts.to(torch.int64)
         # dropped == sum(max(0, c - capacity)), reusing the clamp the caller needs
-        self._stats[0] += c64.sum() - c64.clamp(max=capacity).sum()
-        self._stats[1] = torch.maximum(self._stats[1], c64.max())
+        dropped_delta = c64.sum() - c64.clamp(max=capacity).sum()
+        step_max = c64.max()
+        self._stats[0] += dropped_delta
+        self._stats[1] = torch.maximum(self._stats[1], step_max)
         if _OVF_OUTSIDE_EVERY > 0:
             self._per_expert += c64
+        if bucket is not None:
+            # Deliberately the same three device ops the aggregate path above
+            # already runs inside captured graphs -- no new op shapes, no new
+            # capture risk -- just scoped to one bucket, plus the step count.
+            # ``max_count_seen`` here is the number N4 must size a bucket's
+            # capacity against; ``steps`` turns the per-expert sums into a mean
+            # so the peak/mean ratio is visible in the log itself.
+            bucket_stats, bucket_per_expert = bucket
+            bucket_stats[0] += dropped_delta
+            bucket_stats[1] = torch.maximum(bucket_stats[1], step_max)
+            bucket_stats[2] += 1
+            bucket_per_expert += c64
 
     def read(self, reset: bool = True):
         """Return ``(dropped_routes, max_count_seen)`` or ``None``.
@@ -133,6 +201,39 @@ class _CapacityOverflowMonitor:
             self._per_expert.zero_()
         return [int(v) for v in vals]
 
+
+    def read_per_bucket(self, reset: bool = True):
+        """Return ``{local_tokens: (dropped, max_seen, steps, per_expert)}``.
+
+        Same capture-safety contract as ``read``: syncs, so it is guarded
+        against graph capture.  ``None`` when bucket grouping is off (the
+        default) or nothing was ever recorded.  Costs two host syncs per
+        bucket, which is why the readout window should stay coarse
+        (``DSV4_MOE_OVERFLOW_REPLAY_LOG_EVERY>=50``).
+
+        The dict is snapshotted first: ``record`` inserts new buckets from the
+        AsyncRunner worker thread, and iterating a dict during an insert raises.
+        """
+        if not self._by_bucket:
+            return None
+        if _graph_capture_active():
+            return None
+        out: "Dict[int, Tuple[int, int, int, List[int]]]" = {}
+        for key, (bucket_stats, bucket_per_expert) in sorted(
+            list(self._by_bucket.items())
+        ):
+            vals = bucket_stats.tolist()
+            counts = bucket_per_expert.tolist()
+            if reset:
+                bucket_stats.zero_()
+                bucket_per_expert.zero_()
+            out[key] = (
+                int(vals[0]),
+                int(vals[1]),
+                int(vals[2]),
+                [int(v) for v in counts],
+            )
+        return out
 
 _CAPACITY_OVERFLOW_INSTANCES: "list" = []
 
@@ -216,6 +317,13 @@ def drain_capacity_overflow_outside_graph() -> None:
         max_seen = 0
         seen_any = False
         per_expert_max: Optional[List[int]] = None
+        # bucket -> [dropped, max_seen, steps, per_expert]; aggregated across
+        # monitor instances (= MoE layers) exactly like the globals above:
+        # dropped sums, max_seen and the per-expert vector take the max, so a
+        # bucket line reports its busiest layer.  ``steps`` takes the max too:
+        # every layer sees the same forward, so they agree, and a max keeps the
+        # divisor right even if one layer was added to the process later.
+        buckets: "Dict[int, List]" = {}
         for mon in _CAPACITY_OVERFLOW_INSTANCES:
             got = mon.read(reset=True)
             if got is None:
@@ -223,6 +331,22 @@ def drain_capacity_overflow_outside_graph() -> None:
             seen_any = True
             dropped += got[0]
             max_seen = max(max_seen, got[1])
+            per_bucket = mon.read_per_bucket(reset=True)
+            if per_bucket:
+                for key, (bdrop, bmax, bsteps, bcounts) in per_bucket.items():
+                    slot = buckets.get(key)
+                    if slot is None:
+                        buckets[key] = [bdrop, bmax, bsteps, list(bcounts)]
+                    else:
+                        slot[0] += bdrop
+                        slot[1] = max(slot[1], bmax)
+                        slot[2] = max(slot[2], bsteps)
+                        acc = slot[3]
+                        if len(bcounts) > len(acc):
+                            acc.extend([0] * (len(bcounts) - len(acc)))
+                        for i, c in enumerate(bcounts):
+                            if c > acc[i]:
+                                acc[i] = c
             counts = mon.read_per_expert(reset=True)
             if counts is None:
                 continue
@@ -253,6 +377,41 @@ def drain_capacity_overflow_outside_graph() -> None:
             active,
             pctl,
         )
+        # One extra line per bucket seen in this window.  Deliberately a NEW
+        # prefix, not extra fields on the line above: the aggregate line stays
+        # byte-identical so existing log readers keep working, and the bucket
+        # lines are greppable on their own.
+        #
+        # ``max_count_seen`` is the number a per-bucket capacity (N4) has to be
+        # sized against.  ``mean_rows`` is printed next to it on purpose: this
+        # project already sized headroom off a mean once and was 40x optimistic,
+        # so the log makes the peak/mean gap impossible to overlook.  The raw
+        # per-expert sums stay on the line as the underlying evidence.
+        now = time.time()
+        for key in sorted(buckets):
+            bdrop, bmax, bsteps, bcounts = buckets[key]
+            bpctl = ""
+            if _OVF_ROUTER_PERCENTILES:
+                qs = _percentiles_from_counts(bcounts, _OVF_ROUTER_PERCENTILES)
+                bpctl = " " + " ".join(
+                    "p%d=%d" % (p, q)
+                    for p, q in zip(_OVF_ROUTER_PERCENTILES, qs)
+                )
+            divisor = max(1, bsteps) * max(1, len(bcounts))
+            logging.info(
+                "[CAPACITY_OVERFLOW_BUCKET] ts=%.3f local_tokens=%d steps=%d "
+                "dropped_routes=%d max_count_seen=%d mean_rows=%.2f "
+                "active_experts=%d%s per_expert_sum=%s",
+                now,
+                key,
+                bsteps,
+                bdrop,
+                bmax,
+                float(sum(bcounts)) / divisor,
+                sum(1 for c in bcounts if c > 0),
+                bpctl,
+                ",".join(str(c) for c in bcounts),
+            )
 
 
 # 0 disables the log.  N>0 emits one line every N eager calls.
@@ -310,6 +469,23 @@ _OVF_ROUTER_PCTL_EVERY = get_switch(
     "DSV4_MOE_ROUTER_PERCENTILE_LOG_EVERY", 0, parse_nonneg_int
 )
 _OVF_ROUTER_PCTL_CALLS = [0]
+
+# DSV4_MOE_OVERFLOW_BUCKETS=1: also accumulate the overflow statistics per
+# padded local token count (``x.shape[0]``) instead of only in aggregate.
+#
+# Why it is needed: the aggregate readout answers "what is the worst per-expert
+# row count anywhere", which is exactly the number a bucket-aware capacity (N4)
+# must NOT be sized against -- one capacity per bucket needs one peak per
+# bucket.  Nothing in Python is told which graph bucket the runner selected,
+# and ``x.shape[0]`` is bucket x candidates rather than the bucket itself, but
+# that is precisely the quantity such a capacity would be a function of, so it
+# is the correct grouping key (see ``_CapacityOverflowMonitor.record``).
+#
+# Cost when on: two int64 vectors per key per MoE layer, four extra device ops
+# per recorded forward, and two extra host syncs per key per layer on each
+# readout window (so keep DSV4_MOE_OVERFLOW_REPLAY_LOG_EVERY>=50).
+# Off by default => byte-identical to the aggregate-only behaviour.
+_OVF_BUCKETS = get_switch("DSV4_MOE_OVERFLOW_BUCKETS", False, parse_bool)
 
 
 def _graph_capture_active() -> bool:
@@ -383,6 +559,16 @@ def _maybe_log_capacity_overflow(capacity, counts=None):
     )
 
 
+def _dispatch_copy_2d_enabled() -> bool:
+    """N3 gate.  Off by default => byte-identical to the pre-N3 behaviour."""
+    return os.environ.get("DSV4_PPU_DEEPEP_DISPATCH_COPY_2D", "0").strip().lower() in (
+        "1",
+        "true",
+        "on",
+        "yes",
+    )
+
+
 def _ppu_deepep_compact_copy_2d_enabled() -> bool:
     return os.environ.get("DSV4_PPU_DEEPEP_COMPACT_COPY_2D", "0").strip().lower() in (
         "1",
@@ -447,6 +633,21 @@ _LL_NO_COMPACT = os.environ.get("DSV4_MOE_LL_NO_COMPACT", "0").strip().lower() i
 )
 _LL_NO_COMPACT_LOGGED = [False]
 
+# Test-only same-work reference: restore the existing N3 input copy, while
+# retaining the full capacity and in-place combine used by no-compact.
+# Requiring N3 avoids .contiguous() silently eliding the reference copy when
+# the full-slot payload is already contiguous. Never enable for production.
+_LL_COPY_INPUT_REFERENCE = get_switch(
+    "DSV4_MOE_LL_COPY_INPUT_REFERENCE", False, parse_bool
+)
+if _LL_COPY_INPUT_REFERENCE and (
+    not _LL_NO_COMPACT or not _dispatch_copy_2d_enabled()
+):
+    raise ValueError(
+        "DSV4_MOE_LL_COPY_INPUT_REFERENCE requires "
+        "DSV4_MOE_LL_NO_COMPACT=1 and DSV4_PPU_DEEPEP_DISPATCH_COPY_2D=1"
+    )
+
 
 # The masked SwiGLU+MXFP4 kernel computes only the rows below each expert's
 # count, so the activation stops scaling with the compute slot.  It is wired next
@@ -467,6 +668,29 @@ _MASKED_SILU_SKIP_LOGGED = [False]
 # the same strides the compact path materializes; otherwise the expert stride
 # grows, and no masked GEMM has been run against that stride.
 _MASKED_SILU_BLOCK_N = 256
+
+
+def _full_slot_mxfp4_views(payload, scales):
+    """Reuse the LL tensors in the masked FP4 runner without packing.
+
+    PPU DeepGEMM consumes uint8 nibbles and uint16 scale pairs in mn-major
+    layout. Validate metadata only: copying or reading counts here would defeat
+    the full-slot path or introduce a graph-unsafe host synchronization.
+    """
+    if payload.dim() != 3 or scales.dim() != 3:
+        raise ValueError("LL MXFP4 payload/scales must be rank 3")
+    e, m, packed_k = payload.shape
+    if (
+        packed_k % 32
+        or tuple(scales.shape) != (e, m, packed_k // 32)
+        or payload.dtype != torch.uint8
+        or scales.dtype != torch.uint16
+        or payload.device != scales.device
+        or not payload.is_contiguous()
+        or not scales.permute(0, 2, 1).is_contiguous()
+    ):
+        raise ValueError("LL MXFP4 full-slot payload/scales have incompatible layout")
+    return payload, scales
 
 
 def _tensor_byte_span(t) -> Tuple[int, int]:
@@ -600,6 +824,7 @@ class DeepEPStrategy(RoutedExpertsStrategy):
         recv_topk_weights: torch.Tensor,
         recv_topk_idx: torch.Tensor,
         capacity: int,
+        local_tokens: Optional[int] = None,
     ) -> torch.Tensor:
         """Fixed-capacity, CUDA-graph-safe grouped MXFP4 local expert compute."""
         import deep_gemm
@@ -685,6 +910,12 @@ class DeepEPStrategy(RoutedExpertsStrategy):
             )
             // cfg.n_routed_experts,
         )
+        if _BUCKET_EXPECTED_M:
+            if local_tokens is None:
+                raise RuntimeError("bucket expected_m requires the caller's graph token count")
+            expected_m = expected_m_for_tokens(
+                local_tokens, cfg.ep_size, cfg.n_activated_experts, cfg.n_routed_experts
+            )
         deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(
             (scatter_fp4_grouped, scatter_scale_grouped),
             (self._ppu_w13, self._ppu_s13),
@@ -737,6 +968,7 @@ class DeepEPStrategy(RoutedExpertsStrategy):
         expert_x,
         expert_num_tokens: torch.Tensor,
         out: "Optional[torch.Tensor]" = None,
+        local_tokens: "Optional[int]" = None,
     ) -> torch.Tensor:
         """Run grouped MXFP4 experts on DeepEP LL's compact payload.
 
@@ -744,6 +976,15 @@ class DeepEPStrategy(RoutedExpertsStrategy):
         directly so the caller can skip a full-slot copy.  A mismatch is not an
         error: it just means the compact path is active and the buffer is the
         wrong shape, so allocate as before.
+
+        ``local_tokens`` is the caller's ``x.shape[0]``: the padded local token
+        count, i.e. the CUDA-graph decode bucket scaled by the per-request
+        candidate count.  Every shape reachable from here (``E``,
+        ``ll_capacity``, ``packed_D``) is a compile-time constant, so this is
+        the only way the batch size enters this function.  Currently it feeds
+        the overflow monitor's per-bucket grouping; it is also the exact
+        quantity a bucket-aware ``expected_m`` (N2) needs, which is why it is
+        plumbed as a parameter rather than read off a global.
         """
         import deep_gemm
 
@@ -809,7 +1050,7 @@ class DeepEPStrategy(RoutedExpertsStrategy):
                 f"grouped-FP4 expert counts must have {E} elements, "
                 f"got {expert_num_tokens.numel()}"
             )
-        self._ovf.record(expert_num_tokens, compute_capacity)
+        self._ovf.record(expert_num_tokens, compute_capacity, local_tokens)
         _maybe_log_capacity_overflow(compute_capacity, expert_num_tokens)
         safe_counts = (
             expert_num_tokens.clamp(min=0, max=compute_capacity)
@@ -823,8 +1064,28 @@ class DeepEPStrategy(RoutedExpertsStrategy):
         # default, >8x the measured B80 mean); copy just that prefix into a
         # compact graph-stable tensor and keep the original LL-shaped output
         # for combine.
-        if packed_dispatch:
-            x_fp4_grouped = packed_x[:, :compute_capacity, :].contiguous()
+        if packed_dispatch and _LL_NO_COMPACT and not _LL_COPY_INPUT_REFERENCE:
+            # SGLang feeds the LL views straight into the masked GEMM. N3 is
+            # only for the compact branch: at full capacity it would allocate
+            # and copy the entire LL slot (192 MiB of payload at E32/M3072/D4096).
+            x_fp4_grouped, x_scale_grouped = _full_slot_mxfp4_views(
+                packed_x, packed_scale
+            )
+        elif packed_dispatch:
+            if _dispatch_copy_2d_enabled():
+                # N3: same pitched copy the combine side already runs in
+                # production, direction reversed.  Elementwise .contiguous()
+                # on this slice measures ~239 GB/s vs ~1.67 TB/s for 2D DMA.
+                from ._compact_prefix_copy import strided_prefix_to_compact
+
+                x_fp4_grouped = torch.empty(
+                    (packed_x.shape[0], compute_capacity, packed_x.shape[2]),
+                    dtype=packed_x.dtype,
+                    device=packed_x.device,
+                )
+                strided_prefix_to_compact(packed_x, x_fp4_grouped)
+            else:
+                x_fp4_grouped = packed_x[:, :compute_capacity, :].contiguous()
             # DeepEP exposes logical [E, LL_M, K/64] scales with mn-major
             # stride. Compact the physical [E, K/64, M] storage, then restore
             # the same logical view with the smaller M stride.
@@ -861,6 +1122,12 @@ class DeepEPStrategy(RoutedExpertsStrategy):
             )
             // cfg.n_routed_experts,
         )
+        if _BUCKET_EXPECTED_M:
+            if local_tokens is None:
+                raise RuntimeError("bucket expected_m requires the caller's graph token count")
+            expected_m = expected_m_for_tokens(
+                local_tokens, cfg.ep_size, cfg.n_activated_experts, cfg.n_routed_experts
+            )
         deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(
             (x_fp4_grouped, x_scale_grouped),
             (self._ppu_w13, self._ppu_s13),
@@ -905,7 +1172,7 @@ class DeepEPStrategy(RoutedExpertsStrategy):
                     gate_up_grouped,
                     safe_counts,
                     swiglu_limit,
-                    compute_capacity,
+                    expected_m if _BUCKET_EXPECTED_M else compute_capacity,
                 )
             )
         else:
@@ -996,7 +1263,10 @@ class DeepEPStrategy(RoutedExpertsStrategy):
             else:
                 expert_y_pre = candidate
         compact_expert_y = self._compute_ppu_grouped_fp4_packed(
-            expert_x, expert_num_tokens, out=expert_y_pre
+            expert_x,
+            expert_num_tokens,
+            out=expert_y_pre,
+            local_tokens=x.shape[0],
         )
         # The LL RDMA buffer already owns the required full slot geometry.  Do
         # not allocate another [E, ll_capacity, D] tensor (768 MiB for V4 at
@@ -1170,6 +1440,7 @@ class DeepEPStrategy(RoutedExpertsStrategy):
                 recv_topk_weights.contiguous(),
                 recv_topk_idx.contiguous(),
                 grouped_capacity,
+                local_tokens=x.shape[0],
             )
         elif M > 0:
             global_topk_idx = recv_topk_idx.to(torch.int64).contiguous()

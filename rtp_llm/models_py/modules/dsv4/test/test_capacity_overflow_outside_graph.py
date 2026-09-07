@@ -212,6 +212,7 @@ def _load_deepep(env=None):
     try:
         rc = _load_module(RC_PATH, _PKG + ".runtime_config")
         sys.modules[_PKG].runtime_config = rc
+        _load_module(DEEPEP_PATH.parent / "_expected_m.py", _STRATS + "._expected_m")
         dp = _load_module(DEEPEP_PATH, _STRATS + ".deepep")
     finally:
         for k, v in saved.items():

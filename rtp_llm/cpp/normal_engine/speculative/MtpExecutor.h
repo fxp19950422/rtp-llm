@@ -162,7 +162,8 @@ protected:
                                       std::shared_ptr<torch::Event>                rejection_event,
                                       std::shared_ptr<torch::Event>                draft_event);
 
-    void draftModelDecode(GptModelInputs&             model_input,
+    // Returns whether the host loop used the token-only point-mass contract.
+    bool draftModelDecode(GptModelInputs&             model_input,
                           const StreamGroups&         stream_groups,
                           std::vector<torch::Tensor>& draft_probs_list,
                           torch::Tensor&              draft_token_ids_t,

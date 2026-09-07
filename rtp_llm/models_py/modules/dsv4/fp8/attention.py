@@ -1937,6 +1937,8 @@ class AttentionFP8(nn.Module):
             self.indexer.freqs_cis = None
             if self.indexer.compressor is not None:
                 clear_compressor_rope_cache(self.indexer.compressor)
+        if getattr(self, "_decode_overlap_state", None) is not None:
+            self._prepare_decode_overlap_resources()
 
     def _get_fp8_decode_op(self):
         """Lazy-build the persistent ``SparseAttnV4DecodeFp8Op`` so its
@@ -1984,6 +1986,10 @@ class AttentionFP8(nn.Module):
         return layer(x, out=out) if out is not None else layer(x)
 
     def _can_reuse_qkv_input_quant(self) -> bool:
+        # Platform adapters own their quantization ABI and opt-in policy.
+        can_share = getattr(self.wq_a, "can_share_input_quantization", None)
+        if can_share is not None:
+            return can_share(self.wkv)
         return (
             hasattr(self.wq_a, "quantize_input")
             and hasattr(self.wq_a, "forward_quantized")
@@ -2091,6 +2097,189 @@ class AttentionFP8(nn.Module):
         grouped = o_4d.reshape(B, S, self.n_groups, -1)
         return self.wo_a(grouped)
 
+    def configure_decode_overlap(self, context) -> None:
+        """Bind the model's two persistent streams; allocate nothing in capture."""
+        if self.compress_ratio not in (4, 128):
+            return
+        if getattr(self, "_decode_overlap_state", None) is not None:
+            raise RuntimeError("D1 attention context must be bound only once")
+        self._decode_overlap_state = context.new_layer()
+        self._prepare_decode_overlap_resources(warm_blas=True)
+
+    def _prepare_decode_overlap_resources(self, *, warm_blas=False) -> None:
+        state = self._decode_overlap_state
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("D1 cannot initialize RoPE/BLAS resources during capture")
+        device = state.owner.device
+        self._ensure_freqs_cis_bound()
+        # Main and nested compressor may share the process-level cache. Publish
+        # it on main before any side can read or create the same cache key.
+        self.compressor._ensure_cos_sin_cache(device)
+        if self.indexer is not None:
+            self.indexer.compressor._ensure_cos_sin_cache(device)
+        self._decode_overlap_rope_identity = id(self.freqs_cis)
+        state.invalidate_rope()
+        if warm_blas:
+            from .compressor import _linear_bf16_bf16_fp32
+            dummy = torch.zeros((1, 64, self.dim), dtype=torch.bfloat16, device=device)
+            # Warm the main-stream nested BLAS handle as well as the actual
+            # side-stream main-compressor handle, without touching KV pools.
+            if self.indexer is not None:
+                _linear_bf16_bf16_fp32(dummy, self.indexer.compressor._wkv_wgate_fused)
+            # Reuse the same finally-joined orchestration for first-use BLAS:
+            # initialization failures must not leave side work unaccounted for.
+            state.run(
+                lambda: None,
+                lambda: _linear_bf16_bf16_fp32(dummy, self.compressor._wkv_wgate_fused),
+                None, swa_tensors=(),
+                compressor_tensors=(dummy, self.compressor._wkv_wgate_fused),
+            )
+
+    def _decode_overlap_eligible(self, x, attn_metadata) -> bool:
+        state = getattr(self, "_decode_overlap_state", None)
+        if state is None:
+            return False
+        from .decode_overlap import eligible
+        return eligible(
+            target=True, graph_metadata=bool(attn_metadata.is_cuda_graph),
+            shape=tuple(x.shape), compress_ratio=self.compress_ratio,
+            cp_active=self._cp_ctx is not None,
+        )
+
+    def _forward_decode_overlapped(
+        self, x, qkv, bsz, q_len, start_pos, position_ids, attn_metadata
+    ):
+        """D1: unchanged QKV is complete; SWA/main-compressor fork around indexer."""
+        from .decode_overlap import assert_disjoint_branches, tensor_leaves
+        from rtp_llm.models_py.modules.dsv4.kv_cache_utils import (
+            CSA_KV, CSA_STATE, HCA_KV, HCA_STATE,
+            INDEXER_KV, INDEXER_STATE, SWA_KV,
+        )
+        state = self._decode_overlap_state
+        if self._decode_overlap_rope_identity != id(self.freqs_cis):
+            self._prepare_decode_overlap_resources()
+        geometry = (int(bsz), int(q_len))
+        state.require_warm_capture(geometry)
+        if self.compress_ratio == 4:
+            main_kv_tag, main_state_tag = CSA_KV, CSA_STATE
+        else:
+            main_kv_tag, main_state_tag = HCA_KV, HCA_STATE
+        main_meta = self._decode_compressor_meta_from_metadata(
+            attn_metadata, state_attn_type=main_state_tag,
+            kv_attn_type=main_kv_tag, bsz=bsz, q_len=q_len,
+        )
+        indexer_meta = None
+        if self.indexer is not None:
+            indexer_meta = self._decode_compressor_meta_from_metadata(
+                attn_metadata, state_attn_type=INDEXER_STATE,
+                kv_attn_type=INDEXER_KV, bsz=bsz, q_len=q_len,
+            )
+
+        def pool(tag):
+            value = self._pool_raw_u8(tag)
+            if value is None:
+                raise RuntimeError(f"D1 requires materialized pool {tag}")
+            return value
+
+        def effective(value, name):
+            if value is None:
+                raise RuntimeError(f"D1 requires materialized effective view {name}")
+            return value
+
+        writes = {
+            "swa": [(SWA_KV, pool(SWA_KV)),
+                    ("swa_effective", effective(self._pool_view_3d_fp8(SWA_KV), SWA_KV))],
+            "compressor": [
+                (main_kv_tag, pool(main_kv_tag)),
+                (main_state_tag, pool(main_state_tag)),
+                ("kv_effective", effective(self.compressor._kv_pool_view, main_kv_tag)),
+                ("state_effective", effective(self.compressor._state_pool_3d, main_state_tag)),
+            ],
+            "main": [],
+        }
+        if self.indexer is not None:
+            from .indexer import _get_decode_topk_workspace
+            # Existing main-stream-only workspace: initialize on eager graph
+            # warmup; its existing guard forbids cold allocation in capture.
+            topk_workspace = _get_decode_topk_workspace(x.device)
+            writes["main"] = [
+                (INDEXER_KV, pool(INDEXER_KV)),
+                (INDEXER_STATE, pool(INDEXER_STATE)),
+                ("kv_effective", effective(self.indexer._kv_pool_view, INDEXER_KV)),
+                ("state_effective", effective(self.indexer._state_pool_3d, INDEXER_STATE)),
+                ("topk", attn_metadata.topk_buffer_compressed),
+                ("topk_workspace", topk_workspace),
+            ]
+        swa_inputs = (qkv.kv, attn_metadata.pool_write_slot_mappings[SWA_KV])
+        compressor_inputs = (
+            x, start_pos, position_ids, main_meta, self.freqs_cis,
+            self.compressor._cos_sin_cache, self.compressor._wkv_wgate_fused,
+            self.compressor._kv_block_table, self.compressor._state_block_table,
+            tuple(self.compressor.parameters()), tuple(self.compressor.buffers()),
+        )
+        main_inputs = (x, qkv.qr, start_pos, position_ids, indexer_meta, self.freqs_cis)
+        if self.indexer is not None:
+            main_inputs += (
+                self.indexer.weights_proj,
+                self.indexer._kv_block_table, self.indexer._state_block_table,
+                self.indexer.compressor._cos_sin_cache,
+                tuple(self.indexer.parameters()), tuple(self.indexer.buffers()),
+            )
+        reads = {
+            branch: [(str(i), tensor) for i, tensor in enumerate(tensor_leaves(values))]
+            for branch, values in (
+                ("swa", swa_inputs), ("compressor", compressor_inputs),
+                ("main", main_inputs),
+            )
+        }
+        # Actual occupied byte runs, including offset/stride and raw-pool padding.
+        # Outer bounding intervals alone can overlap across valid strided tags.
+        # Also audit effective kernel views: their as_strided geometry can differ
+        # from the raw base, so raw-tag disjointness alone is insufficient.
+        alias_report = assert_disjoint_branches(writes, reads)
+        if not hasattr(self, "_decode_overlap_alias_reports"):
+            self._decode_overlap_alias_reports = {}
+        self._decode_overlap_alias_reports[geometry] = alias_report
+
+        def write_swa():
+            self._decode_write_swa_fp8(qkv.kv, bsz, q_len, attn_metadata)
+
+        def run_compressor():
+            self.compressor.forward_decode_vectorized(
+                x, start_pos, meta=main_meta, position_ids=position_ids,
+            )
+
+        def run_indexer():
+            self.indexer.forward_decode_vectorized(
+                x, qkv.qr, start_pos,
+                attn_metadata.topk_buffer_compressed[:bsz],
+                position_ids=position_ids, compressor_meta=indexer_meta,
+            )
+
+        state.run(
+            write_swa, run_compressor,
+            run_indexer if self.indexer is not None else None,
+            swa_tensors=(swa_inputs, [t for _, t in writes["swa"]]),
+            compressor_tensors=(compressor_inputs, [t for _, t in writes["compressor"]]),
+        )
+        # Both side streams have joined main before pool reads or output GEMMs.
+        if self.indexer is not None:
+            cmp_local_raw = attn_metadata.topk_buffer_compressed[:bsz]
+        else:
+            tt_h = attn_metadata.topk_total_by_ratio.get(128)
+            if tt_h is None:
+                raise RuntimeError("D1 HCA dense compressed indices missing")
+            cmp_local_raw = tt_h[:bsz, :, self.window_size:]
+        output = self._forward_decode_compressed(
+            qkv.q, cmp_local_raw, bsz, q_len, attn_metadata,
+            cmp_attn_type=main_kv_tag,
+        )
+        if not torch.cuda.is_current_stream_capturing():
+            # The actual shape has now run all side/native and main-indexer
+            # first-use paths outside capture. Unknown cold shapes fail closed.
+            state.warmed_geometries.add(geometry)
+        return output
+
     def forward_decode(
         self,
         x: torch.Tensor,  # [B, q_len, dim] bf16
@@ -2150,6 +2339,12 @@ class AttentionFP8(nn.Module):
                 INDEXER_KV,
                 SWA_KV,
             )
+
+        if self._decode_overlap_eligible(x, attn_metadata):
+            o = self._forward_decode_overlapped(
+                x, qkv, bsz, q_len, start_pos, position_ids, attn_metadata
+            )
+            return decode_output_proj(self, o, qkv.freqs_cis, bsz, q_len)
 
         self._decode_write_swa_fp8(qkv.kv, bsz, q_len, attn_metadata)
 

@@ -146,6 +146,27 @@ void callPrepareCudaGraph(py::object attn_pyobj, PyModelInputs& inputs) {
     }
 }
 
+// Fail closed for legacy backends, including mixed tagged implementations.
+bool requiresHostMetadata(py::handle impl) {
+    if (impl.is_none()) {
+        return true;
+    }
+    if (py::isinstance<py::dict>(impl)) {
+        auto entries = py::reinterpret_borrow<py::dict>(impl);
+        if (entries.empty()) {
+            return true;
+        }
+        for (auto entry : entries) {
+            if (requiresHostMetadata(entry.second)) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return !py::hasattr(impl, "cuda_graph_requires_host_metadata")
+           || impl.attr("cuda_graph_requires_host_metadata").cast<bool>();
+}
+
 #if USING_CUDA
 void addCudaGraphPrepareFillRegion(
     CudaGraphPrepareFillParams& params, torch::Tensor& tensor, int64_t start, int64_t end, int32_t value) {
@@ -332,6 +353,12 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
         is_prefill_cuda_graph_mode_ ? state.current_real_graph_seq_len : state.current_real_graph_bs;
     auto&      py_model_inputs_ = graph_instances_[graph_idx].mem_hold_.py_model_inputs_;
     auto       attn_pyobj       = graph_instances_[graph_idx].mem_hold_.attn_pyobj_;
+    auto& host_metadata = graph_instances_[graph_idx].mem_hold_.requires_host_metadata_;
+    if (!host_metadata.has_value()) {
+        py::gil_scoped_acquire gil;
+        host_metadata = requiresHostMetadata(attn_pyobj);
+    }
+    const bool device_metadata = !*host_metadata && !isEmbeddingStylePrefillCudaGraph();
     const bool has_tagged_cache = !inputs.attention_inputs_by_tag.empty();
 
     // Per-launch capacity contract: see fuse_copy_util.h sizing rationale.
@@ -410,6 +437,13 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
     {
         RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareAttentionInputs(fused_fill)");
         CudaGraphPrepareFillParams fill_params;
+        if (device_metadata && !is_prefill_cuda_graph_mode_) {
+            // Padded ordinary decode rows must describe position zero, not
+            // stale capture-time maximum sequence lengths.
+            addCudaGraphPrepareFillRegion(fill_params,
+                                          py_model_inputs_.attention_inputs.sequence_lengths_plus_1_device,
+                                          state.current_batch_size, selected_graph_batch_size, 1);
+        }
         if (!has_tagged_cache) {
             addCudaGraphPrepareFillRegion(fill_params,
                                           py_model_inputs_.attention_inputs.kv_cache_kernel_block_id_device,
@@ -426,32 +460,52 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
                                               0);
             }
         }
-        if (is_prefill_cuda_graph_mode_) {
+        if (is_prefill_cuda_graph_mode_ || (device_metadata && num_tokens_per_bs_ > 1)) {
+            // The producer already built the live cumulative lengths. Read its
+            // final element directly: this fill runs BEFORE the live D2D copy,
+            // so reading the destination would observe the previous replay.
+            if (device_metadata) {
+                for (const auto* source : {&inputs.attention_inputs.cu_seqlens_device,
+                                           &inputs.attention_inputs.cu_kv_seqlens_device}) {
+                    RTP_LLM_CHECK_WITH_INFO(source->defined() && source->is_cuda()
+                                                && source->scalar_type() == torch::kInt32
+                                                && source->is_contiguous()
+                                                && source->numel() >= state.current_batch_size + 1,
+                                            "device metadata requires the producer's live cumulative lengths");
+                }
+            }
             addCudaGraphPrepareFillRegion(fill_params,
                                           py_model_inputs_.attention_inputs.prefix_lengths_device,
                                           state.current_batch_size,
-                                          max_bs_,
+                                          selected_graph_batch_size,
                                           0);
             addCudaGraphPrepareFillRegion(fill_params,
                                           py_model_inputs_.attention_inputs.input_lengths_device,
                                           state.current_batch_size,
-                                          max_bs_,
+                                          selected_graph_batch_size,
                                           0);
-            addCudaGraphPrepareFillRegion(fill_params,
-                                          py_model_inputs_.attention_inputs.cu_seqlens_device,
-                                          state.current_batch_size + 1,
-                                          max_bs_ + 1,
-                                          state.current_seq_len);
+            if (device_metadata) {
+                addCudaGraphPrepareFillRegionFromDevice(fill_params,
+                                                        py_model_inputs_.attention_inputs.cu_seqlens_device,
+                                                        state.current_batch_size + 1,
+                                                        selected_graph_batch_size + 1,
+                                                        inputs.attention_inputs.cu_seqlens_device,
+                                                        state.current_batch_size);
+            } else {
+                addCudaGraphPrepareFillRegion(fill_params,
+                                              py_model_inputs_.attention_inputs.cu_seqlens_device,
+                                              state.current_batch_size + 1,
+                                              selected_graph_batch_size + 1,
+                                              state.current_seq_len);
+            }
             addCudaGraphPrepareFillRegionFromDevice(fill_params,
                                                     py_model_inputs_.attention_inputs.cu_kv_seqlens_device,
                                                     state.current_batch_size + 1,
-                                                    max_bs_ + 1,
+                                                    selected_graph_batch_size + 1,
                                                     inputs.attention_inputs.cu_kv_seqlens_device,
                                                     state.current_batch_size);
         }
-        // Target-verify padding (input_lengths / prefix_lengths / cu_*) is cleared by
-        // the shared tail block below, which covers both the host mirrors and the
-        // device buffers in one place.
+        // Legacy host-metadata target verify keeps the shared tail block below.
         invokeCudaGraphPrepareFill(fill_params, cuda_graph::graphGetCurrentStream().stream());
     }
 #else
@@ -557,7 +611,7 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
     // NOTE: we do H2H after D2D copies to let GPU finish the D2D copies as soon as possible,
     // so that the GPU can start the kernel launch as soon as possible.
 
-    {
+    if (!device_metadata) {
         RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareAttentionInputs(host_mirror_copy)");
 
         // H2H copies (common to both modes)
@@ -665,7 +719,7 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
     // which initCaptureAttentionInputs allocated prefix_lengths{,_device} at all.
     // Clear graph padding so rounded-up batch slots do not retain capture-time
     // max sequence lengths and trigger unnecessary attention work.
-    if ((is_prefill_cuda_graph_mode_ || num_tokens_per_bs_ > 1)
+    if (!device_metadata && (is_prefill_cuda_graph_mode_ || num_tokens_per_bs_ > 1)
         && state.current_batch_size < selected_graph_batch_size) {
         py_model_inputs_.attention_inputs.prefix_lengths.slice(0, state.current_batch_size, selected_graph_batch_size)
             .fill_(0);
@@ -687,6 +741,25 @@ void CudaGraphRunner::prepareAttentionInputs(const PyModelInputs& inputs,
             .fill_(last_valid_q);
         fill_padded_cu_kv_tail = true;
     }
+
+#if !USING_CUDA
+    // Platforms without the fused CUDA fill retain the existing fallback.
+    if (device_metadata && (is_prefill_cuda_graph_mode_ || num_tokens_per_bs_ > 1)) {
+        RTP_LLM_PROFILE_SCOPE("cuda_graph.prepareAttentionInputs(device_cumulative_lengths)");
+        auto& attn = py_model_inputs_.attention_inputs;
+        // Only device tensors are touched. Recompute cumulative lengths after
+        // copying active rows and clearing padding; storage addresses stay fixed.
+        attn.prefix_lengths_device.slice(0, state.current_batch_size, selected_graph_batch_size).zero_();
+        attn.input_lengths_device.slice(0, state.current_batch_size, selected_graph_batch_size).zero_();
+        attn.cu_seqlens_device.slice(0, 0, 1).zero_();
+        attn.cu_kv_seqlens_device.slice(0, 0, 1).zero_();
+        attn.cu_seqlens_device.slice(0, 1, selected_graph_batch_size + 1)
+            .copy_(attn.input_lengths_device.slice(0, 0, selected_graph_batch_size).cumsum(0, torch::kInt32));
+        attn.cu_kv_seqlens_device.slice(0, 1, selected_graph_batch_size + 1)
+            .copy_((attn.input_lengths_device.slice(0, 0, selected_graph_batch_size)
+                    + attn.prefix_lengths_device.slice(0, 0, selected_graph_batch_size)).cumsum(0, torch::kInt32));
+    }
+#endif
 
     // launch prepare_cuda_graph when attention inputs are ready.
     // GIL is required: this function may be invoked from an AsyncRunner worker thread

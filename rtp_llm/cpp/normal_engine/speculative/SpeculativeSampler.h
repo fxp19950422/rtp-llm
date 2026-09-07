@@ -42,8 +42,11 @@ public:
     virtual ~FastTopKSampler() {}
 
     virtual FastTopKSamplerOutput forward(const torch::Tensor& logits, int top_k = 1);
+    // Same softmax/max and vocab mapping as forward(logits, 1), without dense one-hot output.
+    virtual torch::Tensor forwardTokenIds(const torch::Tensor& logits);
 
 private:
+    FastTopKSamplerOutput forwardImpl(const torch::Tensor& logits, int top_k, bool materialize_probs);
     torch::Tensor d2t_map_;
 };
 

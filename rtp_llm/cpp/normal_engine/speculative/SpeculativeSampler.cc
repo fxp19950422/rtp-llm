@@ -9,6 +9,14 @@ namespace rtp_llm {
 namespace speculative {
 
 FastTopKSamplerOutput FastTopKSampler::forward(const torch::Tensor& logits, int top_k) {
+    return forwardImpl(logits, top_k, true);
+}
+
+torch::Tensor FastTopKSampler::forwardTokenIds(const torch::Tensor& logits) {
+    return forwardImpl(logits, 1, false).token_ids;
+}
+
+FastTopKSamplerOutput FastTopKSampler::forwardImpl(const torch::Tensor& logits, int top_k, bool materialize_probs) {
     FastTopKSamplerOutput output;
     auto                  draft_probs = torch::softmax(logits, -1);
 
@@ -20,7 +28,9 @@ FastTopKSamplerOutput FastTopKSampler::forward(const torch::Tensor& logits, int 
     }
 
     output.token_ids = std::get<1>(sample_res);
-    if (top_k == 1) {
+    if (!materialize_probs) {
+        // Retain the exact softmax/max token choice; only omit the unused distribution.
+    } else if (top_k == 1) {
         // A deterministic top-1 proposal must be represented by its point-mass
         // distribution when rejection sampling computes its acceptance ratio.
         output.all_probs = torch::zeros_like(draft_probs).scatter_(-1, output.token_ids, 1.0);

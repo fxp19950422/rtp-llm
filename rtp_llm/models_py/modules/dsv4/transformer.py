@@ -93,6 +93,7 @@ class V4Args:
     world_size: int = 1
     world_rank: int = 0
     is_decode_role: bool = False
+    shared_tp_size: int = 1
     # KV-cache dtype switch.  True selects ``AttentionFP8`` (paged 584B
     # SWA/CSA/HCA pools, FlashMLA dual-pool decode); False keeps the BF16
     # ``Attention`` path. Resolved from
@@ -155,6 +156,7 @@ def _block_kwargs(
         ep_rank=args.ep_rank,
         max_tokens_per_rank=args.max_tokens_per_rank,
         is_decode_role=args.is_decode_role,
+        shared_tp_size=args.shared_tp_size,
         fp8_kv_cache=args.fp8_kv_cache,
     )
 

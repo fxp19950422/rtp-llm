@@ -37,6 +37,7 @@ _stub_package(
 )
 
 from rtp_llm.models_py.modules.dsv4.moe import gate as gate_module
+from rtp_llm.models_py.modules.dsv4 import platform_provider as provider_module
 from rtp_llm.models_py.modules.dsv4.moe.gate import (
     Gate,
     _select_routes_with_nonfinite_fallback,
@@ -90,6 +91,54 @@ def _gate_from_logits(
 
 
 class RouterEagerContractTest(unittest.TestCase):
+    def test_gate_preserves_provider_fp32_logits_before_selection(self):
+        gate = _gate_from_logits(8, 2, 1.0, torch.zeros(8))
+        x = torch.zeros((1, 8), dtype=torch.bfloat16)
+        # All logits collapse to 1 in BF16; retaining FP32 selects experts7/6.
+        precise = 1.0 + torch.arange(8, dtype=torch.float32).view(1, 8) * 0.0001
+        self.assertTrue(torch.equal(precise.bfloat16(), torch.ones_like(x)))
+        with mock.patch.dict(os.environ, {"DSV4_GATE_FP32": "0"}), mock.patch.object(
+            gate_module, "_use_fused_gate", return_value=False
+        ), mock.patch.object(
+            provider_module, "run_dsv4_bf16_fp32_linear",
+            return_value=precise,
+        ) as dispatch:
+            _, indices = gate(x)
+        self.assertEqual(indices.tolist(), [[7, 6]])
+        dispatch.assert_called_once()
+        self.assertIs(dispatch.call_args.args[1], x)
+        self.assertEqual(dispatch.call_args.args[2].dtype, torch.bfloat16)
+
+    def test_gate_legacy_provider_fallback_remains_unchanged(self):
+        gate = _gate_from_logits(8, 2, 1.0, torch.zeros(8))
+        x = torch.arange(8, dtype=torch.bfloat16).view(1, 8)
+        with mock.patch.dict(os.environ, {"DSV4_GATE_FP32": "0"}), mock.patch.object(
+            gate_module, "_use_fused_gate", return_value=False
+        ), mock.patch.object(
+            provider_module, "run_dsv4_bf16_fp32_linear",
+            side_effect=lambda fallback, *args: fallback(*args),
+        ):
+            actual_w, actual_i = gate(x)
+        with mock.patch.dict(os.environ, {"DSV4_GATE_FP32": "1"}), mock.patch.object(
+            gate_module, "_use_fused_gate", return_value=False
+        ):
+            expected_w, expected_i = gate(x)
+        self.assertTrue(torch.equal(actual_i, expected_i))
+        self.assertTrue(torch.equal(actual_w, expected_w))
+
+    def test_gate_fp32_override_and_empty_batch_bypass_provider(self):
+        gate = _gate_from_logits(8, 2, 1.0, torch.zeros(8))
+        with mock.patch.dict(os.environ, {"DSV4_GATE_FP32": "1"}), mock.patch.object(
+            gate_module, "_use_fused_gate", return_value=False
+        ), mock.patch.object(
+            provider_module, "run_dsv4_bf16_fp32_linear"
+        ) as dispatch:
+            gate(torch.arange(8, dtype=torch.float32).view(1, 8))
+            weights, indices = gate(torch.empty((0, 8), dtype=torch.bfloat16))
+        dispatch.assert_not_called()
+        self.assertEqual(weights.shape, (0, 2))
+        self.assertEqual(indices.shape, (0, 2))
+
     def test_tiny_e8_top2_bias_only_ranks_and_unbiased_scores_weight(self):
         original = torch.tensor(
             [

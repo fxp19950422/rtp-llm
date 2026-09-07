@@ -203,6 +203,32 @@ class W8A8Fp8PerBlockAtomicWeight(AtomicWeight):
         super().__init__(*args, **kwargs)
 
     def _get_split_func(self):
+        config = getattr(self, "config", None)
+        shared_tp_size = getattr(config, "shared_tp_size", 1)
+        shared_keys = {
+            W.v4_shared_w13_w: ("w13", False),
+            W.v4_shared_w13_s: ("w13", True),
+            W.v4_shared_w2_w: ("w2", False),
+            W.v4_shared_w2_s: ("w2", True),
+        }
+        if shared_tp_size > 1 and self.name in shared_keys:
+            from rtp_llm.models_py.modules.dsv4.shared_tp import shared_fp8_tp_slice
+
+            projection, is_scale = shared_keys[self.name]
+            shared_tp_rank = config.shared_tp_rank
+
+            def split_shared(t, **_):
+                # Generic loader kwargs include tp_rank/ffn_tp_rank. Neither
+                # may override this weight instance's resolved shared rank.
+                return shared_fp8_tp_slice(
+                    t,
+                    projection=projection,
+                    tp_size=shared_tp_size,
+                    tp_rank=shared_tp_rank,
+                    is_scale=is_scale,
+                )
+
+            return split_shared
         return self.gpt_style_tp_strategy[self.name]
 
 

@@ -55,6 +55,9 @@ from rtp_llm.models_py.modules.dsv4.moe.moe_layer import (
     resolve_moe_max_tokens_per_rank,
 )
 from rtp_llm.models_py.modules.dsv4.prefill.forward import forward_prefill
+from rtp_llm.models_py.modules.dsv4.prefill_moe_budget import (
+    resolve_prefill_moe_max_tokens,
+)
 from rtp_llm.models_py.modules.dsv4.prefill_workspace import (
     tp_local_prefill_q_dim,
 )
@@ -300,6 +303,9 @@ class DeepSeekV4Model(GptModelBase):
     # derivation) but never captures; DeepSeekV4DSparkModel overrides this.
     _captures_aux_hidden = True
 
+    # Own-class lookup excludes MTP/DSpARK and unknown inherited proposers.
+    _dsv4_attention_overlap_target = True
+
     def __init__(
         self,
         model_config: ModelConfig,
@@ -363,6 +369,10 @@ class DeepSeekV4Model(GptModelBase):
         else:
             # V4-Flash = 2048. config.inter_size = n_shared * 2048 = 2048 (since n_shared=1).
             args.moe_inter_dim = int(model_config.inter_size) or args.moe_inter_dim
+
+        from rtp_llm.models_py.modules.dsv4.shared_tp import resolve_prefill_shared_tp4
+
+        args.shared_tp_size = resolve_prefill_shared_tp4(parallelism_config).size
 
         # S7 scaffold: thread the framework's parallelism config into V4Args.
         # No behavior change at TP=1; the fields are read by future patches
@@ -639,6 +649,8 @@ class DeepSeekV4Model(GptModelBase):
         self._is_decode_role = bool(init_resource.is_decode_role)
         self._max_context_batch_size = init_resource.max_context_batch_size
         self._v4_args.is_decode_role = self._is_decode_role
+        if self._is_decode_role and self._v4_args.shared_tp_size != 1:
+            raise RuntimeError("decode role cannot consume TP-sharded shared weights")
         runtime_resolved_max_tokens_per_rank = resolve_moe_max_tokens_per_rank(
             max_seq_len=int(self._v4_args.max_seq_len),
             current_max_tokens_per_rank=int(self._v4_args.max_tokens_per_rank),
@@ -647,6 +659,12 @@ class DeepSeekV4Model(GptModelBase):
             is_decode_role=self._is_decode_role,
             is_speculative=self._is_speculative,
             gen_num_per_cycle=self._gen_num_per_cycle,
+        )
+        runtime_resolved_max_tokens_per_rank = resolve_prefill_moe_max_tokens(
+            runtime_resolved_max_tokens_per_rank,
+            self.parallelism_config,
+            is_decode_role=self._is_decode_role,
+            chunked_moe=chunked_moe_enabled(),
         )
         if runtime_resolved_max_tokens_per_rank != self._v4_args.max_tokens_per_rank:
             chunk_tokens_env_for_log = (
@@ -709,6 +727,19 @@ class DeepSeekV4Model(GptModelBase):
         # meta context yields zeros; we need real values).
         for layer in self.v4.layers:
             layer.attn.reset_rope_cache(device=device_str)
+
+        from rtp_llm.models_py.modules.dsv4.fp8.decode_overlap import (
+            create_decode_attention_overlap_context,
+            target_class_identity,
+        )
+        self._dsv4_decode_overlap_context = create_decode_attention_overlap_context(
+            is_target_model=(target_class_identity(self) and self._is_decode_role
+                             and self.fp8_kv_cache),
+            device=device_str,
+        )
+        if self._dsv4_decode_overlap_context is not None:
+            for layer in self.v4.layers:
+                layer.attn.configure_decode_overlap(self._dsv4_decode_overlap_context)
 
         # Subclass hook: lift any model-level weights (e.g. MTP fusion
         # norms / projections) off the ModelWeights wrapper before we
@@ -951,7 +982,9 @@ class DeepSeekV4Model(GptModelBase):
                 _dense_gemm_prefill_chunk_size = 0
                 if not self._is_decode_role and chunked_moe_enabled():
                     _dense_gemm_prefill_chunk_size = max(
-                        int(moe_chunk_tokens_from_env()), 0
+                        int(moe_chunk_tokens_from_env()),
+                        int(self._v4_args.max_tokens_per_rank),
+                        0,
                     )
                 _prefill_cp_config = getattr(
                     self.parallelism_config, "prefill_cp_config", None

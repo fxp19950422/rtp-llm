@@ -61,6 +61,43 @@ class TargetVerifyTailSensitiveModel:
         return PyModelOutputs(inputs.input_hiddens + hidden_signature + token_signature)
 
 
+class DeviceOnlyLengthImpl:
+    cuda_graph_requires_host_metadata = False
+
+    def __init__(self):
+        self.metadata_addresses = None
+
+    def support_cuda_graph(self):
+        return True
+
+    def prepare_cuda_graph(self, attn_inputs):
+        # A device-only backend must not need the host mirror refreshed.
+        entries = sorted(attn_inputs.items()) if isinstance(attn_inputs, dict) else [("flat", attn_inputs)]
+        addresses = tuple((tag, tuple(getattr(attn, name).data_ptr() for name in (
+            "input_lengths_device", "prefix_lengths_device",
+            "cu_seqlens_device", "cu_kv_seqlens_device"))) for tag, attn in entries)
+        if self.metadata_addresses is None:
+            self.metadata_addresses = addresses
+        else:
+            assert addresses == self.metadata_addresses, "captured metadata addresses changed"
+
+
+class DeviceOnlySequenceLengthModel(TaggedSequenceLengthModel):
+    def prepare_fmha_impl(self, inputs, is_cuda_graph=False):
+        return DeviceOnlyLengthImpl()
+
+
+class DeviceOnlyPerRowLengthModel(DeviceOnlySequenceLengthModel):
+    def forward(self, inputs, fmha_impl=None):
+        attn = inputs.attention_inputs["full"]
+        rows = torch.stack((attn.cu_seqlens_device[1:],
+                            attn.cu_kv_seqlens_device[1:],
+                            attn.input_lengths_device,
+                            attn.prefix_lengths_device), dim=1)
+        return PyModelOutputs(inputs.input_hiddens + rows.to(
+            inputs.input_hiddens.dtype).repeat_interleave(4, dim=0))
+
+
 class NumericalStatusModel:
     numerical_status_scope = "origin_row"
 
@@ -450,6 +487,88 @@ class TestCudaGraphTaggedCache(unittest.TestCase):
                     output.hidden_states,
                     expected_signature.unsqueeze(0).expand_as(output.hidden_states),
                 )
+
+    def test_device_only_target_verify_lengths(self) -> None:
+        runner = CudaGraphRunner()
+        runner.init_decode(DeviceOnlySequenceLengthModel(), HIDDEN_SIZE, 64,
+                           TOKENS_PER_BLOCK, TOKENS_PER_BLOCK, [4], GROUP_TAGS, True, 4)
+        for batch_size, prefix in ((4, 11), (1, 31), (3, 7), (1, 0), (4, 15)):
+            inputs = _build_target_verify_inputs(
+                GROUP_TAGS, {"full": 2, "aux": 1}, batch_size=batch_size,
+                query_len=4, prefix_len=prefix)
+            self.assertTrue(runner.canRun(inputs))
+            output = runner.forward(inputs)
+            expected = torch.tensor([batch_size * 4, batch_size * (4 + prefix),
+                                     batch_size * 4, batch_size * prefix],
+                                    dtype=output.hidden_states.dtype, device="cuda")
+            torch.testing.assert_close(output.hidden_states, expected.expand_as(output.hidden_states))
+
+    def test_device_only_verify_reuses_live_cumulative_prefix(self) -> None:
+        runner = CudaGraphRunner()
+        runner.init_decode(DeviceOnlyPerRowLengthModel(), HIDDEN_SIZE, 64,
+                           TOKENS_PER_BLOCK, TOKENS_PER_BLOCK, [1, 2, 4],
+                           GROUP_TAGS, True, 4)
+        # Decreasing/repeated buckets and different prefixes across a KV block
+        # boundary must preserve every live scan entry, not only its final sum.
+        for prefixes in ([7, 8, 15, 16], [0], [31, 7, 8], [1], [8, 15], [0, 0, 0, 0]):
+            with self.subTest(prefixes=prefixes):
+                bs = len(prefixes)
+                inputs = _build_target_verify_inputs(
+                    GROUP_TAGS, {"full": 2, "aux": 1}, batch_size=bs,
+                    query_len=4, prefix_len=max(prefixes))
+                prefix = torch.tensor(prefixes, dtype=torch.int32)
+                cu_q = torch.arange(bs + 1, dtype=torch.int32) * 4
+                cu_kv = torch.cat((torch.zeros(1, dtype=torch.int32), (prefix + 4).cumsum(0)))
+                tagged = inputs.attention_inputs
+                for attn in tagged.values():
+                    attn.prefix_lengths = prefix.pin_memory()
+                    attn.cu_kv_seqlens_device = cu_kv.to(device="cuda", dtype=torch.int32)
+                inputs.attention_inputs = tagged
+                self.assertTrue(runner.canRun(inputs))
+                # CPU dispatch profiling sees ATen calls made by the actual C++
+                # runner; building the oracle is deliberately outside this scope.
+                with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
+                    output = runner.forward(inputs)
+                expected = torch.stack((cu_q[1:], cu_kv[1:],
+                                        torch.full_like(prefix, 4), prefix), dim=1)
+                expected = expected.to(device="cuda", dtype=output.hidden_states.dtype).repeat_interleave(4, dim=0)
+                torch.testing.assert_close(output.hidden_states, expected, atol=0, rtol=0)
+                self.assertNotIn("aten::cumsum", {event.key for event in profile.key_averages()},
+                                 "graph prepare must reuse producer cumulative lengths")
+
+    def test_device_only_draft_prefill_reuses_cumulative_tail(self) -> None:
+        runner = CudaGraphRunner()
+        runner.init_prefill(DeviceOnlySequenceLengthModel(), 4, 64,
+                            TOKENS_PER_BLOCK, TOKENS_PER_BLOCK, [2, 4],
+                            HIDDEN_SIZE, GROUP_TAGS, 4)
+        for query_len, prefix_len in ((4, 7), (1, 31), (3, 8), (1, 0), (2, 15)):
+            with self.subTest(query_len=query_len, prefix_len=prefix_len):
+                inputs = _build_prefill_inputs(GROUP_TAGS, {"full": 1, "aux": 2}, query_len)
+                tagged = inputs.attention_inputs
+                for attn in tagged.values():
+                    attn.prefix_lengths = torch.tensor([prefix_len], dtype=torch.int32).pin_memory()
+                    attn.cu_kv_seqlens_device = torch.tensor([0, query_len + prefix_len], dtype=torch.int32, device="cuda")
+                inputs.attention_inputs = tagged
+                self.assertTrue(runner.canRun(inputs))
+                with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU]) as profile:
+                    output = runner.forward(inputs)
+                expected = torch.tensor([query_len, query_len + prefix_len, query_len, prefix_len],
+                                        dtype=output.hidden_states.dtype, device="cuda")
+                torch.testing.assert_close(output.hidden_states, expected.expand_as(output.hidden_states), atol=0, rtol=0)
+                self.assertNotIn("aten::cumsum", {event.key for event in profile.key_averages()})
+
+    def test_device_only_verify_rejects_missing_live_cumulative_lengths(self) -> None:
+        runner = CudaGraphRunner()
+        runner.init_decode(DeviceOnlySequenceLengthModel(), HIDDEN_SIZE, 64,
+                           TOKENS_PER_BLOCK, TOKENS_PER_BLOCK, [4], GROUP_TAGS, True, 4)
+        inputs = _build_target_verify_inputs(GROUP_TAGS, {"full": 0, "aux": 0}, query_len=4)
+        tagged = inputs.attention_inputs
+        for attn in tagged.values():
+            attn.cu_kv_seqlens_device = torch.empty(0, dtype=torch.int32, device="cuda")
+        inputs.attention_inputs = tagged
+        self.assertTrue(runner.canRun(inputs))
+        with self.assertRaisesRegex(RuntimeError, "producer's live cumulative lengths"):
+            runner.forward(inputs)
 
     def test_target_verify_clears_token_tail_across_a_b_b_replays(self) -> None:
         query_len = 4

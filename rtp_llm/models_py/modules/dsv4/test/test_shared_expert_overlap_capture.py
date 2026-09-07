@@ -665,6 +665,47 @@ class ModeOverrideAuditTest(_SeTestCase):
 
 
 class FinishErrorPropagationTest(_SeTestCase):
+    def test_failed_side_stream_start_joins_and_preserves_exception(self):
+        # A launch can enqueue work before a later launch raises. start() is
+        # outside moe_layer's routed try/finally, so it must join that work.
+        for capturing in (False, True):
+            with self.subTest(capturing=capturing):
+                ORCH.clear()
+                se = _load_se({_SWITCH: "1"})
+                executor = se.OverlapSharedExpertExecutor()
+                executor.prepare(_SharedWithCudaWeight())
+                error = RuntimeError("failure after side-stream launch")
+
+                class PartialLaunch(_Shared):
+                    def forward(self, x):
+                        super().forward(x)
+                        raise error
+
+                with _env(DSV4_MOE_STRICT_FUSED="0"), _capturing(capturing):
+                    with self.assertRaises(RuntimeError) as caught:
+                        executor.start(PartialLaunch(), _FakeTensor())
+                    self.assertIs(caught.exception, error)
+                    self.assertEqual(_ops()[-1], ("wait", "main", "side"))
+                    self.assertIsNone(executor._out)
+                    self.assertIsNone(executor._active_stream)
+                    # A handled eager failure must not poison the next start.
+                    # Stub capture recovery here asserts state, not CUDA's
+                    # ability to recover an invalidated real capture.
+                    executor.start(_Shared(), _FakeTensor())
+                    self.assertIs(executor.finish(), _RUN_OUT)
+
+    def test_cleanup_failure_does_not_replace_launch_error(self):
+        se = _load_se({_SWITCH: "1"})
+        executor = se.OverlapSharedExpertExecutor()
+        with _env(DSV4_MOE_STRICT_FUSED="0"), patch.object(
+            _MAIN, "wait_stream", side_effect=RuntimeError("invalidated capture")
+        ), self.assertLogs(level=logging.ERROR) as logs:
+            with self.assertRaisesRegex(RuntimeError, "kernel exploded"):
+                executor.start(self._boom(), _FakeTensor())
+        self.assertIn("could not join side stream", logs.output[0])
+        self.assertIsNone(executor._out)
+        self.assertIsNone(executor._active_stream)
+
     def _boom(self):
         class _BoomShared(_Shared):
             def forward(self, x):
@@ -795,16 +836,19 @@ class SourceWiringTest(unittest.TestCase):
             )
 
         fork_idx = next(i for i, s in enumerate(body) if is_wait_stream(s))
-        with_idx = next(i for i, s in enumerate(body) if is_stream_with(s))
+        try_idx = next(
+            i for i, s in enumerate(body)
+            if isinstance(s, ast.Try) and any(is_stream_with(n) for n in s.body)
+        )
+        with_idx = try_idx
         self.assertLess(
             fork_idx,
             with_idx,
             "fork edge (main -> side input dependency) must precede the "
             "side-stream with-block",
         )
-        # Both are direct children of start's body: neither sits inside an
-        # if/try dead branch.
-        with_stmt = body[with_idx]
+        # The launch is unconditional inside the exception-cleanup try.
+        with_stmt = next(s for s in body[try_idx].body if is_stream_with(s))
         self.assertTrue(
             any(
                 isinstance(n, ast.Call)

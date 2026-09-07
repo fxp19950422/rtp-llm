@@ -383,6 +383,12 @@ enum class PDFusionSchedulerMode {
 PDFusionSchedulerMode parsePDFusionSchedulerMode(const std::string& mode);
 
 struct FIFOSchedulerConfig {
+    // Positive timeout for idle DP ranks before participating with fake work.
+    int64_t dp_fake_wait_ms = 10;
+    // Same-host event-driven wakeup for idle DP ranks in an EP group. Disabled
+    // by default; when enabled every rank must use the same non-empty id.
+    bool        dp_adaptive_fake_wakeup = false;
+    std::string dp_adaptive_fake_wakeup_id;
     int64_t max_context_batch_size = 1;
     int64_t max_batch_tokens_size  = 0;
     // PDFUSION scheduler mode. Supported values:

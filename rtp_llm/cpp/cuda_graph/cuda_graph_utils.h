@@ -71,6 +71,7 @@ public:
 
 public:
     py::object               attn_pyobj_{py::none()};
+    std::optional<bool>      requires_host_metadata_;
     at::Tensor               decoder_layer_hidden_states_;
     at::Tensor               draft_tokens_;
     torch_ext::PyModelInputs py_model_inputs_;

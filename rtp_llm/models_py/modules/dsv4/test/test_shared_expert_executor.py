@@ -410,6 +410,46 @@ class TestSharedExpertExecutor(unittest.TestCase):
         self.assertTrue(torch.equal(got, shared(x).float()))
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
+    def test_failed_start_joins_submitted_work_in_graph(self):
+        # A Python failure after a valid launch must still record the join.
+        # This does not claim recovery from a CUDA-invalidated context.
+        _SHARED_EXPERT_STREAM_CACHE.clear()
+        x = torch.ones(33, 128, device="cuda", dtype=torch.bfloat16)
+        marker = torch.empty_like(x)
+        out = torch.empty_like(x)
+        failure = RuntimeError("failure after valid launch")
+
+        class PartialShared(_SharedWithCudaWeight):
+            def forward(self, inputs):
+                marker.copy_(inputs * 2)
+                raise failure
+
+        executor = OverlapSharedExpertExecutor()
+        shared = PartialShared()
+        with _env("DSV4_MOE_STRICT_FUSED", "0"), mock.patch.object(
+            _se, "_SHARED_EXPERT_OVERLAP_ENABLED", True
+        ):
+            executor.prepare(shared)
+            # Warm the exact operations before graph capture.
+            with self.assertRaises(RuntimeError) as caught:
+                executor.start(shared, x)
+            self.assertIs(caught.exception, failure)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                with self.assertRaises(RuntimeError) as caught:
+                    executor.start(shared, x)
+                self.assertIs(caught.exception, failure)
+                out.copy_(marker)
+            for value in (3, 7, 11):
+                x.fill_(value)
+                graph.replay()
+                torch.cuda.synchronize()
+                self.assertTrue(torch.equal(out, x * 2))
+            self.assertIsNone(executor._out)
+            self.assertIsNone(executor._active_stream)
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
     def test_overlap_executor_captures_with_precreated_stream(self):
         # Switch on + capture + precreated stream: the fork/join itself is
         # recorded into the graph (active stream stays the warmup stream),

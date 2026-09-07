@@ -1,4 +1,6 @@
+import os
 import unittest
+from unittest import mock
 
 import torch
 
@@ -148,6 +150,24 @@ def _record_for_request(result: dict, request_id: int) -> dict:
 
 
 class PyWrappedModelCacheStoreIntegrationTest(unittest.TestCase):
+    def test_async_metadata_preserves_cache_writer_contracts(self) -> None:
+        from rtp_llm.models_py.modules.dsv4 import runtime_config
+
+        # Exercise the actual PyWrappedModel producer and asynchronous writer,
+        # not just a hand-constructed PyCacheStoreInputs completion event.
+        checks = (
+            self.test_multi_tag_uses_each_tag_local_physical_block_table,
+            self.test_micro_batch_slices_request_metadata_with_block_rows,
+            self.test_context_parallel_publishes_original_lengths_not_local_chunk,
+            self.test_mtp_writer_uses_selected_sub_config_for_real_write,
+        )
+        with mock.patch.dict(os.environ, {"DSV4_ASYNC_CACHE_METADATA": "1"}), mock.patch.dict(
+            runtime_config._VALUES, {}, clear=True
+        ):
+            for check in checks:
+                with self.subTest(contract=check.__name__):
+                    check()
+
     def test_multi_tag_uses_each_tag_local_physical_block_table(self) -> None:
         model = CacheStoreForwardModel()
         result = run_scenario(model, "multi_tag")

@@ -85,6 +85,13 @@ class BackendManager(object):
             model_config=model_config,
         )
 
+        if model_config.model_type == "deepseek_v4":
+            from rtp_llm.models_py.modules.dsv4.prefill.communication import (
+                maybe_warmup_ppu_tp_communication,
+            )
+
+            maybe_warmup_ppu_tp_communication(engine_config.parallelism_config)
+
         # Initialize DeepEP/MoriEP wrapper if MOE model and EP is enabled
         if (
             model_config.expert_num > 0

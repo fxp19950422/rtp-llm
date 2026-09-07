@@ -15,5 +15,6 @@ cc_library(
         "//rtp_llm/cpp/models:context_parallel_layout",
         "//rtp_llm/cpp/utils:profiling_scope",
     ],
+    linkopts = ["-lrt"],
     visibility = ["//visibility:public"],
 )

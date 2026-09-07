@@ -1330,7 +1330,8 @@ absl::Status MtpExecutor::decodeStep(const std::list<GenerateStreamPtr>& streams
             model_input, stream_groups, dspark_round_head, draft_sampler_output, draft_token_ids_t, model_forward_us);
     } else if (propose_step_ > 1) {
         RTP_LLM_LOG_DEBUG("[MTP decode] draftModelDecode start");
-        draftModelDecode(model_input, stream_groups, draft_probs_list, draft_token_ids_t, model_forward_us);
+        draft_sampler_output.token_ids_are_point_mass =
+            draftModelDecode(model_input, stream_groups, draft_probs_list, draft_token_ids_t, model_forward_us);
         RTP_LLM_LOG_DEBUG("[MTP decode] draftModelDecode end");
     }
 
@@ -2132,7 +2133,7 @@ bool MtpExecutor::updateEplbConfig(const EPLBConfig& config) {
     return true;
 }
 
-void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
+bool MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
                                    const StreamGroups&         stream_groups,
                                    std::vector<torch::Tensor>& draft_probs_list,
                                    torch::Tensor&              draft_token_ids_t,
@@ -2172,6 +2173,12 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         pre_propose_token_t_raw = to_cuda_i32_flat(model_input.combo_tokens);
     }
     const auto all_streams = stream_groups.allStreams();
+    const bool use_draft_loop_graph = useDraftLoopGraph() && draft_loop_model_ && propose_step_ > 1;
+    // Non-driver ranks, fake batches and mixed/stochastic requests retain the existing path.
+    const bool token_only = !use_draft_loop_graph && !model_input.is_fake_stream && !all_streams.empty()
+                            && std::all_of(all_streams.begin(), all_streams.end(), [](const auto& stream) {
+                                   return !stream->generateConfig()->stochastic();
+                               });
 
     torch::Tensor pre_target_token_t;
     // Prefer device state published before the bookkeeping worker launches.
@@ -2238,7 +2245,7 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
     // eliminates the per-iteration host→device round-trip (GIL, graph
     // select, prepareInputs) that causes 52.8x bare/graph TPOT.
     // ====================================================================
-    if (useDraftLoopGraph() && draft_loop_model_ && propose_step_ > 1) {
+    if (use_draft_loop_graph) {
         RTP_LLM_PROFILE_SCOPE("executor.mtp.draft_model_decode(draft_loop_graph)");
         ensureModelInputsOnCuda(model_input, "draft_decode.draft_loop_graph");
         int64_t start_time_us = autil::TimeUtility::currentTimeInMicroSeconds();
@@ -2287,10 +2294,14 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
         RTP_LLM_LOG_DEBUG("[MTP draftDecode] loop step %d forward done", i);
 
         // sample
-        auto fast_topk_sampler_output = fast_topk_sampler_->forward(draft_decode_model_output.logits, 1);
-        auto draft_probs              = fast_topk_sampler_output.all_probs;
-        auto draft_probs_reshape      = draft_probs.reshape({(int)batch_size, 1, -1});
-        auto draft_token_ids          = fast_topk_sampler_output.token_ids;
+        torch::Tensor draft_token_ids;
+        if (token_only) {
+            draft_token_ids = fast_topk_sampler_->forwardTokenIds(draft_decode_model_output.logits);
+        } else {
+            auto sampler_output = fast_topk_sampler_->forward(draft_decode_model_output.logits, 1);
+            draft_token_ids     = sampler_output.token_ids;
+            draft_probs_list.push_back(sampler_output.all_probs.reshape({(int)batch_size, 1, -1}));
+        }
 
         if (model_input.is_fake_stream) {
             draft_token_ids.zero_();
@@ -2299,7 +2310,6 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
 
         draft_token_ids = to_cuda_i32_flat(draft_token_ids);
         draft_token_columns.push_back(draft_token_ids);
-        draft_probs_list.push_back(draft_probs_reshape);
 
         // update model input
         if (i != propose_step_ - 2) {
@@ -2375,6 +2385,7 @@ void MtpExecutor::draftModelDecode(GptModelInputs&             model_input,
 
         applyCacheStrideToModelInput(model_input, cache_manager_->cacheConfig());
     }
+    return token_only;
 }
 
 bool MtpExecutor::useStreamAsync() const {

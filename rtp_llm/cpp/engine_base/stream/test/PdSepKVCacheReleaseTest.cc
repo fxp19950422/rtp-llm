@@ -20,6 +20,7 @@
 #include "rtp_llm/cpp/config/RoleTypes.h"
 #include "rtp_llm/models_py/bindings/OpDefs.h"
 #include "rtp_llm/models_py/bindings/core/ExecOps.h"
+#include "rtp_llm/cpp/cuda_graph/cuda_graph_device_shims.h"
 
 #include <atomic>
 #include <chrono>
@@ -1192,116 +1193,128 @@ TEST_F(PdSepKVCacheReleaseTest, testDsv4CacheStorePDSepTransfersAllLayerRegionsW
 // calls on background threads.
 // =============================================================================
 TEST_F(PdSepKVCacheReleaseTest, testWriteCacheStoreWithPinnedHostMetadataAndEvent) {
-    auto config  = makeConfig();  // 3 layers, 16 blocks, 8 tokens/block, INT8
-    auto manager = std::make_shared<KVCacheManager>(config, /*warmup=*/false, nullptr);
-    ASSERT_TRUE(manager->init());
+    for (const bool independent_metadata_event : {false, true}) {
+        auto config  = makeConfig();  // 3 layers, 16 blocks, 8 tokens/block, INT8
+        auto manager = std::make_shared<KVCacheManager>(config, /*warmup=*/false, nullptr);
+        ASSERT_TRUE(manager->init());
 
-    const int spb            = 8;
-    const int block_num      = 2;
-    const int input_length   = block_num * spb;
-    const int request_id_val = 42;
+        const int spb            = 8;
+        const int block_num      = 2;
+        const int input_length   = block_num * spb;
+        const int request_id_val = 42;
 
-    // Allocate KV blocks.
-    auto resource = std::make_shared<BatchKVCacheResource>();
-    resource->resetBatchSize(1);
-    resource->initGroups(manager->cacheConfig().topologyPtr());
+        // Allocate KV blocks.
+        auto resource = std::make_shared<BatchKVCacheResource>();
+        resource->resetBatchSize(1);
+        resource->initGroups(manager->cacheConfig().topologyPtr());
 
-    auto input              = std::make_shared<GenerateInput>();
-    input->input_ids        = torch::arange(input_length, torch::kInt32);
-    input->generate_config  = std::make_shared<GenerateConfig>();
-    auto complete_token_ids = std::make_shared<CompleteTokenIds>(1, 1, input_length + spb, spb);
-    complete_token_ids->init(input);
-    complete_token_ids->setSeqLength(input_length);
+        auto input              = std::make_shared<GenerateInput>();
+        input->input_ids        = torch::arange(input_length, torch::kInt32);
+        input->generate_config  = std::make_shared<GenerateConfig>();
+        auto complete_token_ids = std::make_shared<CompleteTokenIds>(1, 1, input_length + spb, spb);
+        complete_token_ids->init(input);
+        complete_token_ids->setSeqLength(input_length);
 
-    auto result = manager->malloc({resource, complete_token_ids, request_id_val, true, false, false});
-    ASSERT_TRUE(result.success);
+        auto result = manager->malloc({resource, complete_token_ids, request_id_val, true, false, false});
+        ASSERT_TRUE(result.success);
 
-    // Fill KV cache blocks with a known pattern so MemoryBackedCacheStore can
-    // verify the transfer.
-    auto layout = manager->getMainModelCacheLayerLayout();
-    for (int layer_id = 0; layer_id < 3; ++layer_id) {
-        auto buf = layout.at(static_cast<size_t>(layer_id)).kv_addr;
-        ASSERT_TRUE(buf.defined());
-        for (int b = 0; b < block_num; ++b) {
-            auto bid       = resource->blocks(0, 0)[b];
-            auto kv_stride = config.kv_block_stride_bytes;
-            ASSERT_FALSE(isNullBlockIdx(bid));
-            auto device_slice = torch::from_blob((uint8_t*)buf.data_ptr() + bid * kv_stride,
-                                                 {(int64_t)kv_stride},
-                                                 torch::TensorOptions(torch::kUInt8).device(torch::kCUDA));
-            device_slice.fill_(static_cast<uint8_t>(layer_id * 10 + b));
+        // Fill KV cache blocks with a known pattern so MemoryBackedCacheStore can
+        // verify the transfer.
+        auto layout = manager->getMainModelCacheLayerLayout();
+        for (int layer_id = 0; layer_id < 3; ++layer_id) {
+            auto buf = layout.at(static_cast<size_t>(layer_id)).kv_addr;
+            ASSERT_TRUE(buf.defined());
+            for (int b = 0; b < block_num; ++b) {
+                auto bid       = resource->blocks(0, 0)[b];
+                auto kv_stride = config.kv_block_stride_bytes;
+                ASSERT_FALSE(isNullBlockIdx(bid));
+                auto device_slice = torch::from_blob((uint8_t*)buf.data_ptr() + bid * kv_stride,
+                                                     {(int64_t)kv_stride},
+                                                     torch::TensorOptions(torch::kUInt8).device(torch::kCUDA));
+                device_slice.fill_(static_cast<uint8_t>(layer_id * 10 + b));
+            }
         }
-    }
-    runtimeSyncAndCheck();
+        runtimeSyncAndCheck();
 
-    // Prepare cache keys (one per block).
-    std::vector<CacheKeyType> cache_keys;
-    for (int i = 0; i < block_num; ++i) {
-        cache_keys.push_back(10000 + i);
-    }
-
-    // --- Core of the test: async D2H to pinned host, then event ---
-    // Create device tensors (mimicking what buildPyAttentionInputs produces).
-    auto input_lengths_device  = torch::tensor({input_length}, torch::kInt32).cuda();
-    auto prefix_lengths_device = torch::tensor({0}, torch::kInt32).cuda();
-
-    // Async-copy to pinned host (mimicking prepareWriteCacheParams).
-    auto pinned_i32          = torch::TensorOptions(torch::kInt32).pinned_memory(true);
-    auto input_lengths_host  = torch::empty({1}, pinned_i32);
-    auto prefix_lengths_host = torch::empty({1}, pinned_i32);
-    input_lengths_host.copy_(input_lengths_device, /*non_blocking=*/true);
-    prefix_lengths_host.copy_(prefix_lengths_device, /*non_blocking=*/true);
-
-    // Record event AFTER async D2H on the current stream.
-    auto event = runtimeCreateEvent();
-
-    // --- Call runtimeWriteCacheStore (event->synchronize() inside) ---
-    auto cache_store = std::make_shared<MemoryBackedCacheStore>();
-    auto block_ids   = torch::from_blob(const_cast<int*>(resource->blocks(0, 0).data()),
-                                        {1, (int64_t)resource->blocks(0, 0).size()},
-                                      torch::kInt32)
-                         .clone();
-
-    const auto& cache_config = manager->cacheConfig();
-    for (int layer_id = 0; layer_id < 3; ++layer_id) {
-        auto inputs = makeDsv4WriteInputs(
-            /*request_id=*/request_id_val, input_length, /*prefix_length=*/0, block_ids, cache_keys);
-        // The pinned-host metadata is deliberately left un-synchronized here;
-        // runtimeWriteCacheStore must wait on the event before reading it.
-        inputs.input_lengths_host  = input_lengths_host;
-        inputs.prefix_lengths_host = prefix_lengths_host;
-
-        torch_ext::LayerKVCache layer_cache;
-        layer_cache.kv_cache_base      = layout.at(static_cast<size_t>(layer_id)).kv_addr;
-        layer_cache.seq_size_per_block = spb;
-        layer_cache.layer_id           = layer_id;
-        layer_cache.group_id           = 0;
-        layer_cache.tag                = "default";
-
-        runtimeWriteCacheStore(inputs,
-                               layer_cache,
-                               cache_config,
-                               cache_store,
-                               /*cache_model_id=*/0,
-                               /*cp_rank=*/0,
-                               /*cp_size=*/1,
-                               event);
-    }
-
-    // Verify: cache store received correct request key for all 3 layers.
-    EXPECT_EQ(cache_store->store_request_keys_.size(), 3u);
-    // MHA (non-opaque, non-mla) splits each block into k + v → 2 entries per block.
-    EXPECT_EQ(cache_store->stored_blocks_.size(), 3u * block_num * 2u);
-
-    // Verify stored data matches the pattern we filled.
-    for (int layer_id = 0; layer_id < 3; ++layer_id) {
-        for (int b = 0; b < block_num; ++b) {
-            auto k_key = "k_" + makeCacheKey(0, std::to_string(cache_keys[b]), layer_id);
-            auto it    = cache_store->stored_blocks_.find(k_key);
-            ASSERT_NE(it, cache_store->stored_blocks_.end()) << "missing key: " << k_key;
-            uint8_t expected = static_cast<uint8_t>(layer_id * 10 + b);
-            EXPECT_EQ(it->second[0], expected) << "layer=" << layer_id << " block=" << b << " first byte mismatch";
+        // Prepare cache keys (one per block).
+        std::vector<CacheKeyType> cache_keys;
+        for (int i = 0; i < block_num; ++i) {
+            cache_keys.push_back(10000 + i);
         }
+
+        // --- Core of the test: async D2H to pinned host, then event ---
+        // Create device tensors (mimicking what buildPyAttentionInputs produces).
+        auto input_lengths_device  = torch::tensor({input_length}, torch::kInt32).cuda();
+        auto prefix_lengths_device = torch::tensor({0}, torch::kInt32).cuda();
+
+        // Async-copy to pinned host (mimicking prepareWriteCacheParams).
+        auto pinned_i32          = torch::TensorOptions(torch::kInt32).pinned_memory(true);
+        auto input_lengths_host  = torch::empty({1}, pinned_i32);
+        auto prefix_lengths_host = torch::empty({1}, pinned_i32);
+        auto producer_ready = runtimeCreateEvent();
+        std::shared_ptr<torch::Event> event;
+        if (independent_metadata_event) {
+            const auto copy_stream = cuda_graph::graphGetStreamFromPool(false);
+            producer_ready->block(copy_stream);
+            cuda_graph::GraphStreamGuard guard(copy_stream);
+            input_lengths_host.copy_(input_lengths_device, /*non_blocking=*/true);
+            prefix_lengths_host.copy_(prefix_lengths_device, /*non_blocking=*/true);
+            event = runtimeCreateEvent();
+        } else {
+            input_lengths_host.copy_(input_lengths_device, /*non_blocking=*/true);
+            prefix_lengths_host.copy_(prefix_lengths_device, /*non_blocking=*/true);
+            event = runtimeCreateEvent();
+        }
+
+        // --- Call runtimeWriteCacheStore (event->synchronize() inside) ---
+        auto cache_store = std::make_shared<MemoryBackedCacheStore>();
+        auto block_ids   = torch::from_blob(const_cast<int*>(resource->blocks(0, 0).data()),
+                                            {1, (int64_t)resource->blocks(0, 0).size()},
+                                          torch::kInt32)
+                             .clone();
+
+        const auto& cache_config = manager->cacheConfig();
+        for (int layer_id = 0; layer_id < 3; ++layer_id) {
+            auto inputs = makeDsv4WriteInputs(
+                /*request_id=*/request_id_val, input_length, /*prefix_length=*/0, block_ids, cache_keys);
+            // The pinned-host metadata is deliberately left un-synchronized here;
+            // runtimeWriteCacheStore must wait on the event before reading it.
+            inputs.input_lengths_host  = input_lengths_host;
+            inputs.prefix_lengths_host = prefix_lengths_host;
+            inputs.metadata_ready = independent_metadata_event ? event : nullptr;
+
+            torch_ext::LayerKVCache layer_cache;
+            layer_cache.kv_cache_base      = layout.at(static_cast<size_t>(layer_id)).kv_addr;
+            layer_cache.seq_size_per_block = spb;
+            layer_cache.layer_id           = layer_id;
+            layer_cache.group_id           = 0;
+            layer_cache.tag                = "default";
+
+            runtimeWriteCacheStore(inputs,
+                                   layer_cache,
+                                   cache_config,
+                                   cache_store,
+                                   /*cache_model_id=*/0,
+                                   /*cp_rank=*/0,
+                                   /*cp_size=*/1,
+                                   independent_metadata_event ? producer_ready : event);
+        }
+
+        // Verify: cache store received correct request key for all 3 layers.
+        EXPECT_EQ(cache_store->store_request_keys_.size(), 3u);
+        // MHA (non-opaque, non-mla) splits each block into k + v → 2 entries per block.
+        EXPECT_EQ(cache_store->stored_blocks_.size(), 3u * block_num * 2u);
+
+        // Verify stored data matches the pattern we filled.
+        for (int layer_id = 0; layer_id < 3; ++layer_id) {
+            for (int b = 0; b < block_num; ++b) {
+                auto k_key = "k_" + makeCacheKey(0, std::to_string(cache_keys[b]), layer_id);
+                auto it    = cache_store->stored_blocks_.find(k_key);
+                ASSERT_NE(it, cache_store->stored_blocks_.end()) << "missing key: " << k_key;
+                uint8_t expected = static_cast<uint8_t>(layer_id * 10 + b);
+                EXPECT_EQ(it->second[0], expected) << "layer=" << layer_id << " block=" << b << " first byte mismatch";
+            }
+    }
     }
 }
 

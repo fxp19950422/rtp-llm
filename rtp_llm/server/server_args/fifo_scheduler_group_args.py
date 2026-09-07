@@ -6,6 +6,30 @@ def init_fifo_scheduler_group_args(parser, fifo_scheduler_config):
     # FIFO 调度器配置
     ##############################################################################################################
     fifo_scheduler_group = parser.add_argument_group("FIFO Scheduler")
+    fifo_scheduler_group.add_argument(
+        "--dp_fake_wait_ms",
+        env_name="RTP_LLM_DP_FAKE_WAIT_MS",
+        bind_to=[(fifo_scheduler_config, "dp_fake_wait_ms")],
+        type=int,
+        default=10,
+        help="Positive idle-DP wait in milliseconds before fake work (experiment: 1).",
+    )
+    fifo_scheduler_group.add_argument(
+        "--dp_adaptive_fake_wakeup",
+        env_name="RTP_LLM_DP_ADAPTIVE_FAKE_WAKEUP",
+        bind_to=[(fifo_scheduler_config, "dp_adaptive_fake_wakeup")],
+        type=str2bool,
+        default=False,
+        help="Block idle same-host DP/EP ranks on a CPU futex and wake them only when a peer has real work.",
+    )
+    fifo_scheduler_group.add_argument(
+        "--dp_adaptive_fake_wakeup_id",
+        env_name="RTP_LLM_DP_ADAPTIVE_FAKE_WAKEUP_ID",
+        bind_to=[(fifo_scheduler_config, "dp_adaptive_fake_wakeup_id")],
+        type=str,
+        default="",
+        help="Shared 1..64 character launch id for adaptive DP fake wakeup; must be unique per live service.",
+    )
 
     fifo_scheduler_group.add_argument(
         "--max_context_batch_size",

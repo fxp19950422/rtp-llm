@@ -1583,6 +1583,28 @@ TEST_F(MtpBatchStreamProcessorTest, updateMultiStepDraftSamplerOutput) {
     vector<float> expect_all_probs = {0.1, 0.2, 0.3, 0.4, 1.1, 1.2, 1.3, 1.4, 2.1, 2.2, 2.3, 2.4,
                                       0.5, 0.6, 0.7, 0.8, 1.5, 1.6, 1.7, 1.8, 2.5, 2.6, 2.7, 2.8};
     EXPECT_EQ(expect_all_probs, toVec<float>(sampler_output.all_probs));
+
+    // Dense inputs deliberately absent: token-only must not read carried probabilities.
+    stream1->generateConfig()->do_sample = false;
+    stream2->generateConfig()->top_k = 1;
+    stream1->getSPOutputBuffer()->all_probs = torch::Tensor();
+    stream2->getSPOutputBuffer()->all_probs = torch::Tensor();
+    draft_token_probs_list.clear();
+    sampler_output.token_ids_are_point_mass = true;
+    processor.updateMultiStepDraftSamplerOutput(stream_groups, sampler_output, draft_token_ids_d_t,
+                                                spec_token_ids_d_t, draft_token_probs_d_t, draft_token_probs_list);
+    EXPECT_EQ(expect_token_ids, toVec<int>(sampler_output.token_ids));
+    EXPECT_TRUE(sampler_output.token_ids_are_point_mass);
+    EXPECT_FALSE(sampler_output.all_probs.defined());
+    EXPECT_FALSE(draft_token_probs_d_t.defined());
+    EXPECT_TRUE(draft_token_probs_list.empty());
+
+    // The contract fails closed if an incompatible stream is accidentally included.
+    stream2->generateConfig()->do_sample = true;
+    stream2->generateConfig()->top_k = 0;
+    EXPECT_ANY_THROW(processor.updateMultiStepDraftSamplerOutput(
+        stream_groups, sampler_output, draft_token_ids_d_t, spec_token_ids_d_t,
+        draft_token_probs_d_t, draft_token_probs_list));
 }
 
 TEST_F(MtpBatchStreamProcessorTest, testPrefillDispatchUsesDraftLastHiddenOverride) {

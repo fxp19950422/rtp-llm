@@ -180,6 +180,7 @@ private:
     std::shared_ptr<NumericalStatusCompletionRing> numerical_status_ring_;
     std::atomic<uint64_t>                          numerical_status_epoch_{0};
     std::shared_ptr<torch::Event>                   eager_numerical_status_source_fence_;
+    std::optional<bool>                            async_cache_metadata_;
     bool                                            eager_numerical_status_source_fence_recorded_{false};
     std::vector<std::pair<torch::Tensor, std::shared_ptr<torch::Event>>> retired_eager_numerical_status_;
 

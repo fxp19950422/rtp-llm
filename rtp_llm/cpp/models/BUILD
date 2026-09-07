@@ -158,6 +158,8 @@ cc_library(
 
 cc_library(
     name = "models",
+    # PyWrappedModel resolves the opt-in async metadata switch at runtime.
+    data = ["//rtp_llm/models_py:dsv4_runtime_config"],
     hdrs = glob([
         "*.h",
     ], exclude = ["ModelInputsLogger.h"]),

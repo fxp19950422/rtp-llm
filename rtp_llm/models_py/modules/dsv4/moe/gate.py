@@ -260,15 +260,22 @@ class Gate(nn.Module):
                 torch.zeros((0, self.topk), dtype=torch.float32, device=x.device),
                 torch.zeros((0, self.topk), dtype=torch.long, device=x.device),
             )
-        # P1 (plan_0427.md): BF16 GEMM with FP32 epilogue replaces the
-        # FP32-everywhere path that previously emitted SIMT sgemm 128x128
-        # (127× × 1.15 ms = 145 ms in the 64k+CP=4 trace).  Score numerics
-        # then run in FP32 through softplus/sqrt/topk, same as before.
+        # A platform with a BF16-input/FP32-output GEMM must retain the FP32
+        # logits: F.linear(BF16, BF16).float() rounds to BF16 first and can
+        # change selected experts. Reuse the existing provider seam (the PPU
+        # implementation is also SGLang's default), without changing platforms
+        # that have not declared this capability or the explicit FP32 override.
         if os.environ.get("DSV4_GATE_FP32", "0") == "1":
             scores = F.linear(x.float(), self.weight.float())
         else:
+            from ..platform_provider import run_dsv4_bf16_fp32_linear
+
             x_bf16 = x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16)
-            scores = F.linear(x_bf16, self._weight_bf16()).float()
+            scores = run_dsv4_bf16_fp32_linear(
+                lambda inputs, weight: F.linear(inputs, weight).float(),
+                x_bf16,
+                self._weight_bf16(),
+            )
         router_logits = scores
         if _dbg is not None:
             _rt.record_if_level(2, f"{_dbg}_linear_scores", scores)

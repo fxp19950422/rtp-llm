@@ -1,6 +1,12 @@
 load("@arch_config//:arch_select.bzl", "requirement")
 
 py_library(
+    name = "dsv4_runtime_config",
+    srcs = ["modules/dsv4/runtime_config.py"],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
     name = "utils",
     srcs = glob([
         "utils/*.py",

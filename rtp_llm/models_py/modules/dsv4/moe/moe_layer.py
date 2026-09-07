@@ -26,11 +26,28 @@ import torch
 import torch.nn as nn
 
 from rtp_llm.models_py.modules.dsv4._profiler import record_function_range
+from rtp_llm.models_py.modules.dsv4.runtime_config import get_switch, parse_bool
 from rtp_llm.models_py.modules.dsv4.chunk_env import (
     DEFAULT_DSV4_CHUNK_TOKENS,
     dsv4_chunk_tokens_from_env,
     dsv4_global_chunk_tokens_configured,
 )
+
+# DSV4_MOE_ROUTED_ALLREDUCE_BF16=1: reduce the routed output in its incoming
+# dtype (BF16) and apply the scalar ``route_scale`` afterwards, instead of
+# casting to FP32 first and reducing 2x the bytes.  ``scale * sum(x_i) ==
+# sum(scale * x_i)`` algebraically, so this changes rounding only -- which is
+# also why it is the whole of the win and cannot be had for free.
+#
+# Resolved through ``runtime_config`` rather than a bare ``os.environ.get`` so
+# that the engine log carries one ``[DSV4_CONFIG]`` line proving what the
+# *worker* process actually saw.  That matters here specifically: on 2026-09-04
+# this switch was set in the deployment's knob file, the launcher's manifest
+# recorded it, and it still never reached the code -- the prefill trace showed
+# the BF16 allreduce count unchanged (88 vs 88) against a gate-absent
+# reference.  A bare env read cannot tell "off" from "on but no effect".
+_ROUTED_ALLREDUCE_BF16 = get_switch("DSV4_MOE_ROUTED_ALLREDUCE_BF16", False, parse_bool)
+
 
 from .gate import Gate
 from .shared_expert import (
@@ -164,6 +181,7 @@ class MoE(nn.Module):
     # only opts in through an explicit class declaration.
     _post_w2_route_weight_contract = False
     _routed_tp_size = 1
+    _shared_tp_size = 1
 
     def __init__(
         self,
@@ -185,6 +203,7 @@ class MoE(nn.Module):
         max_tokens_per_rank: int = 8192,
         is_decode_role: bool = False,
         strategy: Optional[str] = None,
+        shared_tp_size: int = 1,
     ):
         """``layer_weights`` is the framework's per-layer dict
         (``ModelWeights.weights[layer_id]``) keyed by ``W.v4_*`` enum.
@@ -205,6 +224,14 @@ class MoE(nn.Module):
         self.swiglu_limit = swiglu_limit
         self.max_tokens_per_rank = max_tokens_per_rank
         self._is_decode_role = bool(is_decode_role)
+        if shared_tp_size not in (1, 4):
+            raise ValueError("shared_tp_size must be 1 or 4")
+        self._shared_tp_size = int(shared_tp_size)
+        if self._shared_tp_size > 1 and (
+            self._is_decode_role or tp_size != 4 or ep_size != 1
+            or dim != 4096 or moe_inter_dim != 2048
+        ):
+            raise ValueError("shared TP4 requires prefill Flash TP4/EP1 with D4096/I2048")
 
         assert (
             n_routed_experts % max(ep_size, 1) == 0
@@ -266,6 +293,16 @@ class MoE(nn.Module):
             getattr(strategy_cls, "routed_includes_shared", False)
         )
 
+        if self._shared_tp_size > 1:
+            if (
+                not self._post_w2_route_weight_contract
+                or self._routed_includes_shared
+                or strategy_cls.__name__ != "PpuGroupedFP4Strategy"
+            ):
+                raise RuntimeError("shared TP4 requires the PPU grouped-FP4 post-W2 strategy")
+            if _ROUTED_ALLREDUCE_BF16 or os.environ.get("DSV4_SHARED_EXPERT_BF16_ADD", "0") == "1":
+                raise RuntimeError("shared TP4 requires FP32 local add and TP reduction")
+
         if self._routed_includes_shared:
             # The fused strategy pops + owns W.v4_shared_* in setup_weights.
             self.shared_experts = None
@@ -277,18 +314,42 @@ class MoE(nn.Module):
                 "w2_w": layer_weights[W.v4_shared_w2_w],
                 "w2_s": layer_weights[W.v4_shared_w2_s],
             }
+            shared_inter_dim = moe_inter_dim // self._shared_tp_size
+            if self._shared_tp_size > 1:
+                expected = {
+                    "w13_w": ((2 * shared_inter_dim, dim), torch.float8_e4m3fn),
+                    "w13_s": ((2 * shared_inter_dim // 128, dim // 128), torch.float8_e8m0fnu),
+                    "w2_w": ((dim, shared_inter_dim), torch.float8_e4m3fn),
+                    "w2_s": ((dim // 128, shared_inter_dim // 128), torch.float8_e8m0fnu),
+                }
+                for key, (shape, dtype) in expected.items():
+                    if tuple(shared_w[key].shape) != shape or shared_w[key].dtype != dtype:
+                        raise ValueError(f"shared TP4 {key} requires raw {shape}/{dtype}")
             self.shared_experts = W13SharedExpert(
                 dim,
-                moe_inter_dim,
+                shared_inter_dim,
                 expert_weights=shared_w,
                 swiglu_limit=swiglu_limit,
             )
             self._shared_executor = get_shared_expert_executor(
                 max_tokens_per_rank=max_tokens_per_rank,
                 dim=dim,
-                inter_dim=moe_inter_dim,
+                inter_dim=shared_inter_dim,
                 swiglu_limit=swiglu_limit,
             )
+            if self._shared_tp_size > 1:
+                if (
+                    type(self._shared_executor).__name__ != "SequentialSharedExpertExecutor"
+                    or type(self.shared_experts.w13).__name__ != "PpuFp8Linear"
+                    or type(self.shared_experts.w2).__name__ != "PpuFp8Linear"
+                ):
+                    raise RuntimeError("shared TP4 requires sequential PPU FP8 shared execution")
+                logger.info(
+                    "DSV4_SHARED_TP_LAYOUT layer=%d size=4 inter_dim=%d "
+                    "w13=%s w2=%s reduction=fp32_combined",
+                    layer_id, shared_inter_dim,
+                    tuple(shared_w["w13_w"].shape), tuple(shared_w["w2_w"].shape),
+                )
             self._shared_executor.prepare(self.shared_experts)
         self._final_out: torch.Tensor | None = None
 
@@ -344,6 +405,9 @@ class MoE(nn.Module):
                     "post-W2 route weighting requires standalone shared expert"
                 )
 
+        if self._shared_tp_size > 1 and self._routed_tp_size != self._shared_tp_size:
+            raise RuntimeError("routed/shared TP shard counts do not match")
+
     def _route(self, x: torch.Tensor, input_ids: torch.Tensor):
         """Run Gate under the selected strategy's explicit weight contract."""
         if self._post_w2_route_weight_contract:
@@ -351,17 +415,42 @@ class MoE(nn.Module):
         return self.gate(x, input_ids)
 
     def _finish_routed(self, routed: torch.Tensor) -> torch.Tensor:
-        """Apply route scale, then TP reduction, before any shared add."""
+        """Scale routed output; defer TP reduction when shared is also sharded."""
         if not self._post_w2_route_weight_contract:
             return routed
 
-        routed = routed.float() * float(self.gate.route_scale)
         tp_size = int(self._routed_tp_size)
         if tp_size < 1:
             raise RuntimeError(f"routed_tp_size must be positive, got {tp_size}")
-        if tp_size > 1:
+        if _ROUTED_ALLREDUCE_BF16:
+            # Item 5: reduce in the incoming dtype (BF16) and apply the scalar
+            # route_scale afterwards.  scale * sum(x_i) == sum(scale * x_i)
+            # algebraically, so this only changes rounding, and it halves the
+            # allreduce payload (the reference only ever reduces in BF16).
+            # Return dtype is kept FP32 so every caller sees the old contract.
+            if tp_size > 1:
+                routed = _all_reduce_routed_tp(routed)
+            routed = routed.float() * float(self.gate.route_scale)
+            return routed
+        routed = routed.float() * float(self.gate.route_scale)
+        if tp_size > 1 and self._shared_tp_size == 1:
             routed = _all_reduce_routed_tp(routed)
         return routed
+
+    def _combine_shared(self, routed, shared, out_dtype, out=None):
+        if self._shared_tp_size == 1:
+            return combine_routed_and_shared(routed, shared, out_dtype, out=out)
+        # _finish_routed allocated this FP32 scaled local output. Add each
+        # rank's shared partial exactly once, then reuse the one existing
+        # [T,D] FP32 collective. Never scale the shared partial.
+        if routed.dtype != torch.float32 or routed.shape != shared.shape:
+            raise RuntimeError("shared TP4 requires a matching FP32 routed partial")
+        routed.add_(shared)
+        combined = _all_reduce_routed_tp(routed)
+        if out is not None:
+            out.copy_(combined)
+            return out
+        return combined.to(out_dtype)
 
     def _should_chunk(self, tokens: int) -> bool:
         max_tokens = int(self.max_tokens_per_rank)
@@ -413,7 +502,7 @@ class MoE(nn.Module):
             with record_function_range("dsv4.moe.shared_expert_finish"):
                 shared = self._shared_executor.finish()
             with record_function_range("dsv4.moe.add_shared"):
-                combined = combine_routed_and_shared(routed, shared, x.dtype, out=out)
+                combined = self._combine_shared(routed, shared, x.dtype, out=out)
                 if combined.data_ptr() != out.data_ptr():
                     out.copy_(combined)
             return
@@ -442,7 +531,7 @@ class MoE(nn.Module):
         with record_function_range("dsv4.moe.shared_expert_finish"):
             shared = self._shared_executor.finish()
         with record_function_range("dsv4.moe.add_shared"):
-            combined = combine_routed_and_shared(routed, shared, x.dtype, out=out)
+            combined = self._combine_shared(routed, shared, x.dtype, out=out)
             if combined.data_ptr() != out.data_ptr():
                 out.copy_(combined)
 
@@ -554,7 +643,7 @@ class MoE(nn.Module):
                     x.dtype,
                     x.device,
                 )
-                y = combine_routed_and_shared(y, shared_y, x.dtype, out=out[:T])
+                y = self._combine_shared(y, shared_y, x.dtype, out=out[:T])
                 return y.view(shape)
 
         with record_function_range("dsv4.moe.gate"):
@@ -635,7 +724,10 @@ class MoE(nn.Module):
                 )
         if _dbg:
             with record_function_range("dsv4.moe.add_shared"):
-                y = y + shared_y
+                y = (
+                    self._combine_shared(y, shared_y, x.dtype)
+                    if self._shared_tp_size > 1 else y + shared_y
+                )
             if dbg_pos_mask is not None:
                 _rt.record_if_level(
                     2,
@@ -651,5 +743,5 @@ class MoE(nn.Module):
                 x.dtype,
                 x.device,
             )
-            y = combine_routed_and_shared(y, shared_y, x.dtype, out=out[:T])
+            y = self._combine_shared(y, shared_y, x.dtype, out=out[:T])
             return y.view(shape)

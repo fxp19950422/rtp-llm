@@ -1,3 +1,12 @@
+py_test(
+    name = "test_device_metadata",
+    srcs = ["test_device_metadata.py"],
+    deps = [
+        "//rtp_llm/models_py:modules",
+        "//rtp_llm:testlib",
+    ],
+)
+
 # DSV4 python tests target the CUDA13/Blackwell stack (deep_gemm >= 2.6, dsv4
 # kernels, pytest closure). They are skipped as incompatible on other platforms
 # instead of failing on pools that can never satisfy those dependencies.
@@ -41,6 +50,13 @@ py_test(
         "@//:using_ppu": [],
         "//conditions:default": ["@platforms//:incompatible"],
     }),
+)
+
+py_test(
+    name = "test_ll_full_slot_views",
+    srcs = ["test_ll_full_slot_views.py"],
+    data = ["//rtp_llm/models_py:modules"],
+    deps = ["//rtp_llm:testlib"],
 )
 
 py_test(
@@ -93,6 +109,16 @@ py_test(
     # Source-only: executes the checked-in shared_expert.py against a minimal
     # torch stub (stdlib unittest only) — no real torch/native runtime needed.
     data = ["//rtp_llm/models_py:modules"],
+    tags = ["source-only"],
+)
+
+py_test(
+    name = "test_prefill_communication",
+    srcs = ["test_prefill_communication.py"],
+    data = [
+        "//rtp_llm/models_py:modules",
+        "//rtp_llm/server:backend_manager.py",
+    ],
     tags = ["source-only"],
 )
 
@@ -613,4 +639,25 @@ py_test(
         "@//:using_ppu": [],
         "//conditions:default": ["@platforms//:incompatible"],
     }),
+)
+
+py_test(
+    name = "test_shared_tp",
+    srcs = ["test_shared_tp.py"],
+    deps = [
+        "//rtp_llm/models_py:modules",
+        "//rtp_llm/models_py/standalone:auto_model",
+        "//rtp_llm:testlib",
+    ],
+    env = {"CUDA_VISIBLE_DEVICES": ""},
+)
+
+py_test(
+    name = "test_prefill_moe_budget",
+    srcs = ["test_prefill_moe_budget.py"],
+    data = [
+        "//rtp_llm/models_py:models",
+        "//rtp_llm/models_py:modules",
+    ],
+    tags = ["source-only"],
 )

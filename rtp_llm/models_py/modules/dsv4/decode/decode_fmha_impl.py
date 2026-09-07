@@ -33,6 +33,9 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import torch
+from rtp_llm.models_py.modules.dsv4.device_metadata import (
+    device_metadata_enabled, device_start_positions,
+)
 
 from rtp_llm.models_py.modules.dsv4.decode.decode_attn_metadata import (
     DSv4DecodeAttnMetadata,
@@ -94,6 +97,8 @@ class DSv4DecodeFmhaImpl:
         attn_inputs=None,
     ) -> None:
         self.config = config
+        # This BF16 backend supports ordinary decode only.
+        self.cuda_graph_requires_host_metadata = not device_metadata_enabled(False)
         self.device = device
         self.metadata: DSv4DecodeAttnMetadata = allocate_decode_metadata(
             max_batch_size=config.max_batch_size,
@@ -147,7 +152,8 @@ class DSv4DecodeFmhaImpl:
             raise RuntimeError(
                 "DSv4DecodeFmhaImpl.prepare received no attention inputs"
             )
-        seq_lens = attn.sequence_lengths
+        seq_lens = (device_start_positions(attn, False)
+                    if not self.cuda_graph_requires_host_metadata else attn.sequence_lengths)
         if seq_lens.device != self.device:
             seq_lens = seq_lens.to(self.device)
         start_pos = seq_lens.to(torch.int32)

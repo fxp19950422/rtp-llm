@@ -33,6 +33,9 @@ class ServerArgsSetTest(TestCase):
         os.environ["CONCURRENCY_LIMIT"] = "64"
         os.environ["PREFILL_PREPARE_RESOURCE_POOL_SIZE"] = "256"
         os.environ["MAX_CONTEXT_BATCH_SIZE"] = "32"
+        os.environ["RTP_LLM_DP_FAKE_WAIT_MS"] = "1"
+        os.environ["RTP_LLM_DP_ADAPTIVE_FAKE_WAKEUP"] = "true"
+        os.environ["RTP_LLM_DP_ADAPTIVE_FAKE_WAKEUP_ID"] = "server-args-test"
         os.environ["MAX_BATCH_TOKENS_WITHOUT_CACHE"] = "2048"
         os.environ["CP_FORCE_SINGLE_PREFILL"] = "0"
         os.environ["WARM_UP"] = "1"
@@ -54,6 +57,12 @@ class ServerArgsSetTest(TestCase):
 
         importlib.reload(rtp_llm.server.server_args.server_args)
         py_env_configs = rtp_llm.server.server_args.server_args.setup_args()
+        self.assertEqual(py_env_configs.runtime_config.fifo_scheduler_config.dp_fake_wait_ms, 1)
+        self.assertTrue(py_env_configs.runtime_config.fifo_scheduler_config.dp_adaptive_fake_wakeup)
+        self.assertEqual(
+            py_env_configs.runtime_config.fifo_scheduler_config.dp_adaptive_fake_wakeup_id,
+            "server-args-test",
+        )
 
         # Verify model_args
         self.assertEqual(py_env_configs.model_args.model_type, "qwen")
@@ -104,6 +113,8 @@ class ServerArgsSetTest(TestCase):
         self.assertEqual(legacy_fifo_config.max_batch_tokens_size, 8192)
         self.assertEqual(legacy_fifo_config.max_inited_kv_cache_streams, 0)
         self.assertEqual(legacy_fifo_config.max_batch_tokens_without_cache, 0)
+        self.assertFalse(legacy_fifo_config.dp_adaptive_fake_wakeup)
+        self.assertEqual(legacy_fifo_config.dp_adaptive_fake_wakeup_id, "")
 
         # Verify frontend and DashSc pre-stop windows are configured independently.
         self.assertEqual(

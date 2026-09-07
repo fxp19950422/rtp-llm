@@ -4,6 +4,13 @@
 #include <algorithm>
 #include <memory>
 #include <numeric>
+#include <future>
+#include <thread>
+#include <unistd.h>
+#include <cerrno>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include "torch/all.h"
 #include "gmock/gmock-actions.h"
 #include "gmock/gmock-function-mocker.h"
@@ -48,6 +55,230 @@ static PDSepConfig makePDFusionPDSepConfig() {
     PDSepConfig pd_sep_config;
     pd_sep_config.role_type = RoleType::PDFUSION;
     return pd_sep_config;
+}
+
+TEST_F(FIFOSchedulerTest, dpFakeWaitTimeoutAndWakeup) {
+    auto cache_manager = std::make_shared<KVCacheManager>(
+        makeMhaCacheConfig(1, 4, 1, 4, 8, rtp_llm::DataType::TYPE_FP16));
+    ASSERT_TRUE(cache_manager->init());
+    ModelConfig model;
+    model.max_seq_len = 8192;
+    RuntimeConfig runtime;
+    PDSepConfig pd;
+    ParallelismConfig parallel;
+    parallel.dp_size = 8;
+    ModelSpecificConfig specific;
+    EXPECT_EQ(runtime.fifo_scheduler_config.dp_fake_wait_ms, 10);
+    for (int timeout : {10, 1}) {
+        runtime.fifo_scheduler_config.dp_fake_wait_ms = timeout;
+        FIFOScheduler scheduler(runtime, model, pd, parallel, specific, cache_manager);
+        const auto start = std::chrono::steady_clock::now();
+        auto result = scheduler.schedule();
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        ASSERT_TRUE(result.ok());
+        EXPECT_TRUE(result.value().empty()); // Engine, not scheduler, creates fake work.
+        EXPECT_GE(elapsed, std::chrono::milliseconds(timeout));
+        EXPECT_EQ(scheduler.schedule_cycle_id_, 1);
+    }
+    runtime.fifo_scheduler_config.dp_fake_wait_ms = 10000;
+    FIFOScheduler scheduler(runtime, model, pd, parallel, specific, cache_manager);
+    auto waiting = std::async(std::launch::async, [&] { return scheduler.schedule(); });
+    // stop() must notify even with a long idle timeout.
+    ASSERT_TRUE(scheduler.stop().ok());
+    EXPECT_EQ(waiting.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    waiting.get();
+}
+
+TEST_F(FIFOSchedulerTest, dpFakeWaitRejectsBusyPolling) {
+    ModelConfig model;
+    RuntimeConfig runtime;
+    PDSepConfig pd;
+    ParallelismConfig parallel;
+    ModelSpecificConfig specific;
+    for (int timeout : {0, -1}) {
+        runtime.fifo_scheduler_config.dp_fake_wait_ms = timeout;
+        EXPECT_THROW(FIFOScheduler(runtime, model, pd, parallel, specific, nullptr), std::invalid_argument);
+    }
+}
+
+TEST_F(FIFOSchedulerTest, epWorkSignalBlocksUntilPeerPublishesEachEpoch) {
+    const auto id = "fifo_ep_work_" + std::to_string(::getpid()) + "_" +
+                    std::to_string(autil::TimeUtility::currentTimeInMicroSeconds());
+    EpWorkSignal rank0(id, 0, 2);
+    EpWorkSignal rank1(id, 1, 2);
+
+    auto first_wait = std::async(std::launch::async, [&] { rank1.waitForWorkForNextEpoch(); });
+    EXPECT_EQ(first_wait.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
+    rank0.publishWork();
+    EXPECT_EQ(first_wait.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    first_wait.get();
+
+    // A faster rank may publish epoch 2 before its peer completes epoch 1.
+    // Epoch addressing must preserve that demand instead of snapshotting it
+    // away as part of epoch 1.
+    rank0.completeStep();
+    rank0.publishWork();
+    rank1.completeStep();
+    EXPECT_TRUE(rank1.hasWorkForNextEpoch());
+
+    rank0.completeStep();
+    rank1.completeStep();
+    auto second_wait = std::async(std::launch::async, [&] { rank1.waitForWorkForNextEpoch(); });
+    EXPECT_EQ(second_wait.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
+    rank0.publishWork();
+    EXPECT_EQ(second_wait.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    second_wait.get();
+}
+
+TEST_F(FIFOSchedulerTest, epWorkSignalDuplicateOwnerPreservesLiveSignal) {
+    const auto id = "fifo_ep_owner_" + std::to_string(::getpid()) + "_" +
+                    std::to_string(autil::TimeUtility::currentTimeInMicroSeconds());
+    std::string name;
+    {
+        EpWorkSignal owner(id, 0, 2);
+        name = owner.shmNameForTest();
+        // A rejected creator must not unlink the live owner's object.
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            EXPECT_THROW((EpWorkSignal(id, 0, 2)), std::runtime_error);
+            const int fd = ::shm_open(name.c_str(), O_RDWR | O_CLOEXEC, 0600);
+            ASSERT_GE(fd, 0) << "duplicate owner removed the live signal: " << errno;
+            ASSERT_EQ(::close(fd), 0);
+        }
+        {
+            EpWorkSignal peer(id, 1, 2);
+            EXPECT_FALSE(peer.hasWorkForNextEpoch());
+            owner.publishWork();
+            EXPECT_TRUE(peer.hasWorkForNextEpoch());
+            owner.completeStep();
+            peer.completeStep();
+            EXPECT_FALSE(peer.hasWorkForNextEpoch());
+            peer.publishWork();
+            EXPECT_TRUE(owner.hasWorkForNextEpoch());
+        }
+        // An attaching rank also has no unlink ownership.
+        const int fd = ::shm_open(name.c_str(), O_RDWR | O_CLOEXEC, 0600);
+        ASSERT_GE(fd, 0);
+        ASSERT_EQ(::close(fd), 0);
+    }
+    const int fd = ::shm_open(name.c_str(), O_RDWR | O_CLOEXEC, 0600);
+    const int open_errno = errno;
+    if (fd >= 0) {
+        ::close(fd);
+    }
+    EXPECT_EQ(fd, -1);
+    EXPECT_EQ(open_errno, ENOENT);
+    // Normal owner destruction releases the name for a clean launch.
+    EXPECT_NO_THROW((EpWorkSignal(id, 0, 2)));
+}
+
+TEST_F(FIFOSchedulerTest, epWorkSignalWaitsForBackingStorageBeforeReading) {
+    const auto id = "fifo_ep_storage_" + std::to_string(::getpid()) + "_" +
+                    std::to_string(autil::TimeUtility::currentTimeInMicroSeconds());
+    EpWorkSignal owner(id, 0, 2);
+    const int fd = ::shm_open(owner.shmNameForTest().c_str(), O_RDWR | O_CLOEXEC, 0600);
+    ASSERT_GE(fd, 0);
+    struct stat info {};
+    ASSERT_EQ(::fstat(fd, &info), 0);
+    std::vector<char> initialized_state(info.st_size);
+    ASSERT_EQ(::pread(fd, initialized_state.data(), initialized_state.size(), 0), info.st_size);
+    // Recreate shm_open -> ftruncate's observable zero-size interval. Do not
+    // access the owner's mapping until its backing storage has been restored.
+    ASSERT_EQ(::ftruncate(fd, 0), 0);
+    auto restore = std::async(std::launch::async, [&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        return ::pwrite(fd, initialized_state.data(), initialized_state.size(), 0);
+    });
+    EpWorkSignal peer(id, 1, 2);
+    EXPECT_EQ(restore.get(), info.st_size);
+    EXPECT_EQ(::close(fd), 0);
+    owner.publishWork();
+    EXPECT_TRUE(peer.hasWorkForNextEpoch());
+    owner.completeStep();
+    peer.completeStep();
+    peer.publishWork();
+    EXPECT_TRUE(owner.hasWorkForNextEpoch());
+}
+
+TEST_F(FIFOSchedulerTest, epWorkSignalRejectsWrongBackingSizeWithoutUnlinking) {
+    const auto id = "fifo_ep_bad_size_" + std::to_string(::getpid()) + "_" +
+                    std::to_string(autil::TimeUtility::currentTimeInMicroSeconds());
+    EpWorkSignal owner(id, 0, 2);
+    const int fd = ::shm_open(owner.shmNameForTest().c_str(), O_RDWR | O_CLOEXEC, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::ftruncate(fd, 1), 0);
+    EXPECT_THROW((EpWorkSignal(id, 1, 2)), std::runtime_error);
+    const int still_named = ::shm_open(owner.shmNameForTest().c_str(), O_RDWR | O_CLOEXEC, 0600);
+    EXPECT_GE(still_named, 0);
+    if (still_named >= 0) {
+        EXPECT_EQ(::close(still_named), 0);
+    }
+    EXPECT_EQ(::close(fd), 0);
+}
+
+TEST_F(FIFOSchedulerTest, adaptiveFakeWakeupRejectsUnsupportedGeometry) {
+    ModelConfig model;
+    model.max_seq_len = 8192;
+    RuntimeConfig runtime;
+    runtime.fifo_scheduler_config.dp_adaptive_fake_wakeup    = true;
+    runtime.fifo_scheduler_config.dp_adaptive_fake_wakeup_id = "geometry-test";
+    PDSepConfig pd;
+    pd.role_type = RoleType::DECODE;
+    ParallelismConfig parallel;
+    parallel.dp_size          = 8;
+    parallel.ep_size          = 4;
+    parallel.world_size       = 8;
+    parallel.local_world_size = 8;
+    ModelSpecificConfig specific;
+    EXPECT_THROW(FIFOScheduler(runtime, model, pd, parallel, specific, nullptr), std::invalid_argument);
+}
+
+TEST_F(FIFOSchedulerTest, adaptiveSchedulerStaysIdleUntilPeerWorkAndStopWakeIt) {
+    auto cache_manager = std::make_shared<KVCacheManager>(
+        makeMhaCacheConfig(1, 4, 1, 4, 8, rtp_llm::DataType::TYPE_FP16));
+    ASSERT_TRUE(cache_manager->init());
+    ResourceContext resource_context;
+    resource_context.cache_manager = cache_manager;
+    ModelConfig model;
+    model.max_seq_len = 8192;
+    RuntimeConfig runtime;
+    runtime.fifo_scheduler_config.dp_fake_wait_ms            = 1;
+    runtime.fifo_scheduler_config.dp_adaptive_fake_wakeup    = true;
+    runtime.fifo_scheduler_config.dp_adaptive_fake_wakeup_id =
+        "fifo_adaptive_" + std::to_string(::getpid()) + "_" +
+        std::to_string(autil::TimeUtility::currentTimeInMicroSeconds());
+    PDSepConfig pd;
+    pd.role_type = RoleType::DECODE;
+    ParallelismConfig rank0_parallel;
+    rank0_parallel.dp_size          = 2;
+    rank0_parallel.ep_size          = 2;
+    rank0_parallel.world_size       = 2;
+    rank0_parallel.local_world_size = 2;
+    rank0_parallel.dp_rank          = 0;
+    ParallelismConfig rank1_parallel = rank0_parallel;
+    rank1_parallel.dp_rank            = 1;
+    rank1_parallel.world_rank         = 1;
+    ModelSpecificConfig specific;
+
+    FIFOScheduler rank0(runtime, model, pd, rank0_parallel, specific, cache_manager);
+    FIFOScheduler rank1(runtime, model, pd, rank1_parallel, specific, nullptr);
+    auto first_wait = std::async(std::launch::async, [&] { return rank1.schedule(); });
+    // The legacy 1 ms timeout must not create work while the whole EP group is idle.
+    EXPECT_EQ(first_wait.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
+    auto query             = std::make_shared<GenerateInput>();
+    query->input_ids       = torch::tensor({1}, torch::kInt32);
+    query->generate_config = makeTestGenerateConfig();
+    auto stream = std::make_shared<NormalGenerateStream>(query, model, runtime, resource_context, nullptr);
+    ASSERT_TRUE(rank0.enqueue(stream).ok());
+    EXPECT_EQ(first_wait.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    ASSERT_TRUE(first_wait.get().ok());
+
+    rank0.onExecutionComplete();
+    rank1.onExecutionComplete();
+    auto second_wait = std::async(std::launch::async, [&] { return rank1.schedule(); });
+    EXPECT_EQ(second_wait.wait_for(std::chrono::milliseconds(50)), std::future_status::timeout);
+    ASSERT_TRUE(rank1.stop().ok());
+    EXPECT_EQ(second_wait.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    ASSERT_TRUE(second_wait.get().ok());
 }
 
 TEST_F(FIFOSchedulerTest, testSimple) {

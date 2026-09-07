@@ -88,6 +88,7 @@ private:
     std::unique_ptr<ProposeModelEngineInitParams> propose_params_;
     StepWindowProfiler                            step_profiler_;
     int                                           reserve_step_ = 0;
+    uint64_t                                      schedule_cycle_id_ = 0;
     // Keep the outer EP Decode shape fixed after this worker first enters the
     // configured high-load regime. The scheduler can temporarily return few
     // or no streams while PD KV-transfer tasks remain KV_ALLOCATED.

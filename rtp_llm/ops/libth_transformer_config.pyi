@@ -395,6 +395,9 @@ class EplbMode:
         ...
 class FIFOSchedulerConfig:
     cp_force_single_prefill: bool
+    dp_adaptive_fake_wakeup: bool
+    dp_adaptive_fake_wakeup_id: str
+    dp_fake_wait_ms: int
     decode_prefill_ratio: str
     max_batch_tokens_size: int
     max_batch_tokens_without_cache: int
