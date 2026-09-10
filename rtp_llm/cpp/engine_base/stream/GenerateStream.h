@@ -253,6 +253,23 @@ public:
     int64_t prefillRemoteReuseLen() const;
     int64_t prefillMemoryReuseLen() const;
 
+    // ---- chunked prefill (PREFILL / PDFUSION roles) ----
+    // reuse_length_ is the current chunk start, and advances after each middle chunk.
+    // When useChunkWindow() is true, contextLength() returns the current chunk length.
+    // initial_reuse_length_ stays frozen for cache-hit metrics.
+    void setChunkSize(int chunk_size) { chunk_size_ = chunk_size; }
+    bool chunkedPrefillEnabled() const { return chunk_size_ > 0; }
+    void enableWarmupChunkWindow() { warmup_chunk_window_ = true; }
+    bool useChunkWindow() const;       // enabled + RUNNING/warmup + context -> window funcs return chunk view
+    int  currentChunkLen() const;      // tokens to compute in the current chunk
+    bool isLastChunk() const;          // current chunk reaches seqLength()
+    bool isMiddleChunk() const; // chunked + context + !last → no sample / no output row
+    bool checkChunkAlignment() const;
+    void advanceChunk();               // reuse_length_ += currentChunkLen()
+    // Prompt token right after the current chunk; valid only for middle chunks.
+    // Used as speculative draft prefill tail instead of a sampled token.
+    int  nextChunkBoundaryToken() const;
+
     bool                 isContextStream() const;
     const torch::Tensor& cumLogProbs() const;
 
@@ -279,6 +296,7 @@ public:
     torch::Tensor              multimodalLocations() const;
 
     int64_t getTimeoutMs() const;
+    void    checkTimeout();
     void    recordWaitLatency();
     void    recordSchedulerEnqueueTime(int64_t time_us);
     void    recordCanRunTime();
@@ -887,18 +905,23 @@ protected:
     // Prefill-to-decode transition is committed by the output/bookkeeping
     // worker and observed by the scheduler thread. Keep this flag atomic; the
     // shared_ptr preserves the existing CopyOnWrite sharing semantics.
-    std::shared_ptr<std::atomic<bool>> is_context_stream_;
-    size_t                             iter_count_    = 0;
-    size_t                             sp_iter_count_ = 0;
-    std::vector<int32_t>               speculative_accepted_tokens_per_pos_;
-    size_t                             last_output_pos_      = 0;
-    int                                initial_reuse_length_ = 0;
-    int                                reuse_length_         = 0;
-    int                                local_reuse_length_   = 0;
-    int                                device_reuse_length_  = 0;
-    int                                remote_reuse_length_  = 0;
-    int                                host_reuse_length_    = 0;
-    int                                disk_reuse_length_    = 0;
+    std::shared_ptr<std::atomic<bool>>    is_context_stream_;
+    size_t                                iter_count_    = 0;
+    size_t                                sp_iter_count_ = 0;
+    std::vector<int32_t>                  speculative_accepted_tokens_per_pos_;
+    size_t                                last_output_pos_      = 0;
+    int                                   initial_reuse_length_ = 0;
+    int                                   reuse_length_         = 0;
+    int                                   local_reuse_length_   = 0;
+    int                                   device_reuse_length_  = 0;
+    int                                   remote_reuse_length_  = 0;
+    int                                   memory_reuse_length_  = 0;
+    int                                   host_reuse_length_    = 0;
+    int                                   disk_reuse_length_    = 0;
+    // Chunked prefill normally gates on RUNNING so admission-time calls keep whole-segment
+    // semantics. Prefill warmup explicitly opts in because it bypasses the scheduler.
+    int                                   chunk_size_          = 0;
+    bool                                  warmup_chunk_window_ = false;
     // prefill reuse info (PD-sep); read/write only under output_mutex_
     int64_t prefill_total_reuse_len_  = 0;
     int64_t prefill_local_reuse_len_  = 0;

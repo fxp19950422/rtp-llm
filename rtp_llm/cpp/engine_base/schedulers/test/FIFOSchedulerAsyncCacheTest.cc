@@ -69,15 +69,30 @@ protected:
         DeviceTestBase::TearDown();
     }
 
+    void setupMockCoordinator() {
+        mock_coord_ = std::make_shared<NiceMock<MockKVCacheConnectorCoordinator>>(cache_manager_->config_,
+                                                                                  cache_manager_->kv_cache_config_,
+                                                                                  cache_manager_->runtime_config_,
+                                                                                  cache_manager_->allocator_,
+                                                                                  nullptr);
+        ON_CALL(*mock_coord_, hasActiveConnectors()).WillByDefault(Return(true));
+        cache_manager_->coordinator_ = mock_coord_;
+    }
+
     std::shared_ptr<FIFOScheduler> createScheduler(size_t max_generate_batch_size     = 100,
-                                                   size_t max_inited_kv_cache_streams = 0) {
+                                                   size_t max_inited_kv_cache_streams = 0,
+                                                   int    prefill_chunk_size          = 0) {
         ModelConfig model_config;
         model_config.max_seq_len = 8192;
         RuntimeConfig runtime_config;
         runtime_config.max_generate_batch_size                           = max_generate_batch_size;
         runtime_config.fifo_scheduler_config.max_batch_tokens_size       = 8192;
+        runtime_config.fifo_scheduler_config.prefill_chunk_size          = prefill_chunk_size;
         runtime_config.fifo_scheduler_config.max_inited_kv_cache_streams = max_inited_kv_cache_streams;
         PDSepConfig         pd_sep_config;
+        if (prefill_chunk_size > 0) {
+            pd_sep_config.role_type = RoleType::PDFUSION;
+        }
         ParallelismConfig   parallelism_config;
         ModelSpecificConfig model_specific_config;
         return std::make_shared<FIFOScheduler>(
@@ -103,7 +118,8 @@ protected:
                                    bool                    enable_memory_cache = false,
                                    int                     max_new_tokens      = 1,
                                    const std::vector<int>& variable_num_beams  = {},
-                                   RoleType                role_type           = RoleType::PDFUSION) {
+                                   RoleType                role_type           = RoleType::PDFUSION,
+                                   int                     prefill_chunk_size  = 0) {
         ResourceContext resource_context;
         resource_context.cache_manager       = cache_manager_;
         resource_context.reuse_cache         = reuse_cache;
@@ -113,6 +129,7 @@ protected:
         ModelConfig model_config;
         model_config.max_seq_len = 8192;
         RuntimeConfig runtime_config;
+        runtime_config.fifo_scheduler_config.prefill_chunk_size = prefill_chunk_size;
 
         auto query                           = std::make_shared<GenerateInput>();
         auto generate_config                 = std::make_shared<GenerateConfig>();
@@ -192,6 +209,7 @@ protected:
     int64_t                                                  next_request_id_{1};
     KVCacheAllocatorPtr                                      real_allocator_;
     std::shared_ptr<testing::NiceMock<MockKVCacheAllocator>> mock_allocator_;
+    std::shared_ptr<NiceMock<MockKVCacheConnectorCoordinator>> mock_coord_;
     size_t                                                   initial_malloc_calls_{0};
     size_t                                                   free_calls_{0};
     size_t                                                   insert_calls_{0};
@@ -884,6 +902,68 @@ TEST_F(FIFOSchedulerAsyncCacheTest, testPDFusionPendingAllocatorLoadsCountToward
     ASSERT_EQ(scheduler->waitingStreamsSize(), 1);
     ASSERT_EQ(scheduler->pendingDecodeStreamsSize(), 0);
     ASSERT_EQ(initial_malloc_calls_, 2);
+}
+
+TEST_F(FIFOSchedulerAsyncCacheTest, testFIFOChunkedLoadDoneDefersWaiterAtInitedKVLimit) {
+    setupMockCoordinator();
+
+    auto mock_ctx = createDoneAsyncContext();
+    EXPECT_CALL(*mock_coord_, asyncRead(_)).WillOnce(Return(std::static_pointer_cast<AsyncContext>(mock_ctx)));
+
+    constexpr int prefill_chunk_size = 4;
+    auto          scheduler          = createScheduler(
+        /*max_generate_batch_size=*/100, /*max_inited_kv_cache_streams=*/2, prefill_chunk_size);
+    auto          loading_stream     = createStream({1, 2, 3, 4, 5, 6},
+                                       /*reuse_cache=*/true,
+                                       /*enable_memory_cache=*/true,
+                                       /*max_new_tokens=*/4,
+                                       /*variable_num_beams=*/{},
+                                       /*role_type=*/RoleType::PDFUSION,
+                                       prefill_chunk_size);
+    auto direct_stream               = createStream({7, 8},
+                                      /*reuse_cache=*/false,
+                                      /*enable_memory_cache=*/false,
+                                      /*max_new_tokens=*/4,
+                                      /*variable_num_beams=*/{},
+                                      /*role_type=*/RoleType::PDFUSION,
+                                      prefill_chunk_size);
+    auto new_waiter                  = createStream({9, 10},
+                                      /*reuse_cache=*/false,
+                                      /*enable_memory_cache=*/false,
+                                      /*max_new_tokens=*/4,
+                                      /*variable_num_beams=*/{},
+                                      /*role_type=*/RoleType::PDFUSION,
+                                      prefill_chunk_size);
+
+    ASSERT_TRUE(scheduler->enqueue(loading_stream).ok());
+    ASSERT_TRUE(scheduler->enqueue(direct_stream).ok());
+
+    auto direct_prefill = scheduler->schedule();
+    ASSERT_TRUE(direct_prefill.ok());
+    ASSERT_EQ(direct_prefill->size(), 1);
+    ASSERT_EQ(direct_prefill->front().get(), direct_stream.get());
+    ASSERT_EQ(direct_stream->currentChunkLen(), 2);
+    ASSERT_EQ(loading_stream->getStatus(), StreamState::LOADING_CACHE);
+
+    ASSERT_GT(loading_stream->curBlocksNum(), 0);
+    direct_stream->setIsContextStream(false);
+    direct_stream->setSeqLength(direct_stream->seqLength() + 1);
+    direct_stream->setReserveStep(1);
+    const size_t direct_blocks_before_load_done = direct_stream->curBlocksNum();
+    ASSERT_GT(direct_blocks_before_load_done, 0);
+    ASSERT_TRUE(scheduler->enqueue(new_waiter).ok());
+
+    auto loaded_prefill = scheduler->schedule();
+    ASSERT_TRUE(loaded_prefill.ok());
+    ASSERT_EQ(loaded_prefill->size(), 1);
+    ASSERT_EQ(loaded_prefill->front().get(), loading_stream.get());
+    ASSERT_TRUE(loaded_prefill->front()->isContextStream());
+    ASSERT_EQ(loaded_prefill->front()->currentChunkLen(), prefill_chunk_size);
+    ASSERT_EQ(direct_stream->curBlocksNum(), direct_blocks_before_load_done);
+    ASSERT_EQ(scheduler->runningStreamsSize(), 1);
+    ASSERT_EQ(scheduler->pending_decode_streams_.size(), 1);
+    ASSERT_EQ(new_waiter->getStatus(), StreamState::WAITING);
+    ASSERT_EQ(new_waiter->curBlocksNum(), 0);
 }
 
 }  // namespace rtp_llm
