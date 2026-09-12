@@ -22,9 +22,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional, Tuple
 
 import torch
-
 from rtp_llm.models_py.modules.dsv4 import _forward_tensor_debug as _fwd_dbg
-from rtp_llm.models_py.modules.dsv4 import _profiler
 from rtp_llm.models_py.modules.dsv4 import _record_tensor as _rt
 from rtp_llm.models_py.modules.dsv4.fp8._kv_cache_utils import (
     require_pool_tokens_per_block,
@@ -323,7 +321,7 @@ def forward_layers(
             _rt_on = False
 
     if prepare_hidden_fn is None:
-        h = v4.embed(input_ids).view(B, q_len, -1)  # [B, q_len, dim]
+        h = v4._embed(input_ids).view(B, q_len, -1)  # [B, q_len, dim]
         if _rt_on:
             _rt.record("decode_embed_out", h)
         h = h.unsqueeze(2).repeat(1, 1, v4.hc_mult, 1)  # [B, q_len, hc, dim]
@@ -332,14 +330,12 @@ def forward_layers(
     if _rt_on:
         _rt.record("decode_embed_hc_expanded", h)
     capture_ids = frozenset(v4.capture_aux_hidden_layer_ids)
-    layer_forward_range = _profiler.make_layer_forward_range()
     for layer_idx, layer in enumerate(v4.layers):
-        with layer_forward_range(layer_idx):
-            h = layer.forward_decode(h, attn_metadata, input_ids, kv_cache=kv_cache)
-            if layer_idx in capture_ids:
-                v4.capture_aux_hidden(layer_idx, h)
-            if _rt_on:
-                _rt.record(f"decode_layer{layer.layer_id:02d}_out", h)
+        h = layer.forward_decode(h, attn_metadata, input_ids, kv_cache=kv_cache)
+        if layer_idx in capture_ids:
+            v4.capture_aux_hidden(layer_idx, h)
+        if _rt_on:
+            _rt.record(f"decode_layer{layer.layer_id:02d}_out", h)
     if v4._mtp_hidden_buffer is not None:
         if capture_ids:
             # DSpARK mode: the buffer already holds this forward's aux rows
@@ -357,7 +353,7 @@ def forward_layers(
         _rt.record("decode_hc_reduced", h)
     # Framework RMSNorm wants 2D — collapse [B, q_len, dim] then view back.
     bsz, q_len, dim_ = h.shape
-    h = v4.norm(h.reshape(bsz * q_len, dim_)).view(bsz, q_len, dim_)
+    h = v4._norm(h.reshape(bsz * q_len, dim_)).view(bsz, q_len, -1)
     if _rt_on:
         _rt.record("decode_final_norm", h)
         step = getattr(v4, "_dbg_step", 0)

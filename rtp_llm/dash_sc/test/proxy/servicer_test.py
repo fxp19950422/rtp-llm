@@ -1396,19 +1396,6 @@ class ChannelPoolTest(unittest.IsolatedAsyncioTestCase):
         await servicer.close()
 
 
-# Wall-clock budgets for StreamCloseTimingTest. Absolute elapsed time on shared
-# CI executors is jitter-dominated (a loaded A10 was observed draining in 67ms),
-# so _DRAIN_BUDGET_MS is deliberately generous and exists only to catch a stream
-# that fails to stop at the finished frame — such a stream drains for the full
-# 5s leak sleep below. The *ordering* of close vs the outer return is a
-# different kind of claim: aclose/cancel propagates synchronously, making it a
-# deterministic property of the implementation rather than a timing race, so
-# _CLOSE_ORDER_SLACK_MS stays tight enough that a real half-closed window still
-# fails, absorbing only clock granularity and a scheduler hop.
-_DRAIN_BUDGET_MS = 2000.0  # finished frame -> outer StopAsyncIteration
-_CLOSE_ORDER_SLACK_MS = 25.0  # how far after the outer return close may fire
-
-
 class StreamCloseTimingTest(unittest.IsolatedAsyncioTestCase):
     """Measures the gap between *receiving the finished frame downstream* and
     *the entire stream being torn down* across the four code paths the proxy
@@ -1506,27 +1493,23 @@ class StreamCloseTimingTest(unittest.IsolatedAsyncioTestCase):
             leaked,
             f"[{scenario}] downstream was iterated past the finished frame",
         )
-        # Outer return gates upstream trailers. On shared CI executors this is
-        # jitter-dominated, so the bound is generous: a stream that fails to
-        # stop at the finished frame drains for the full 5s leak sleep, which
-        # this still catches.
+        # Outer return gates upstream trailers — must be sub-50ms.
         self.assertLess(
             outer_delta_ms,
-            _DRAIN_BUDGET_MS,
+            50.0,
             f"[{scenario}] outer return took {outer_delta_ms:.1f}ms after "
-            "finished — stream did not drain promptly",
+            "finished — gateway will see this as a late close",
         )
         # Downstream close must be deterministic, not GC-deferred.
         self.assertIsNotNone(
             close_ts,
             f"[{scenario}] downstream close was never observed — leak via GC",
         )
-        # Ordering contract: close must not outlive the outer return by more than
-        # clock slack, otherwise the backend sees a half-closed gap that registers
-        # as a client-cancel race.
+        # And must complete no later than the outer returns (5ms slack for
+        # clock granularity) — otherwise the backend sees a half-closed gap.
         self.assertLessEqual(
             order_delta_ms,
-            _CLOSE_ORDER_SLACK_MS,
+            5.0,
             f"[{scenario}] downstream close fired {order_delta_ms:.1f}ms AFTER "
             "outer returned — backend will log a client-cancel race",
         )
@@ -1740,7 +1723,8 @@ class StreamCloseTimingTest(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_close_timing_manual_api_invocation(self) -> None:
-        """Manual close finishes downstream teardown before returning and is
+        """Direct call of the public-ish ``_close_downstream`` helper. Measures
+        ``t_close - t_invoke`` to confirm the manual path is also prompt and
         idempotent (calling it twice is a no-op)."""
         loop = asyncio.get_running_loop()
         close_ts: list[float] = []
@@ -1761,11 +1745,7 @@ class StreamCloseTimingTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(first is not None)
 
         invoke_ts = loop.time()
-        await asyncio.wait_for(
-            DashScProxyServicer._close_downstream(gen, gen),
-            timeout=_DRAIN_BUDGET_MS / 1000,
-        )
-        returned_ts = loop.time()
+        await DashScProxyServicer._close_downstream(gen, gen)
         delta_ms = (close_ts[0] - invoke_ts) * 1000 if close_ts else None
         print(
             f"\n[StreamCloseTimingTest:manual_api]\n"
@@ -1773,14 +1753,11 @@ class StreamCloseTimingTest(unittest.IsolatedAsyncioTestCase):
             f"{('%.3f ms' % delta_ms) if delta_ms is not None else 'NOT OBSERVED'}",
             flush=True,
         )
-        self.assertEqual(len(close_ts), 1, "manual close did not close downstream")
-        self.assertLessEqual(close_ts[0], returned_ts)
+        self.assertIsNotNone(close_ts and close_ts[0])
+        self.assertLess(delta_ms, 5.0, "manual close did not fire promptly")
 
         # Idempotency: second call on the already-closed gen must not raise.
-        await asyncio.wait_for(
-            DashScProxyServicer._close_downstream(gen, gen),
-            timeout=_DRAIN_BUDGET_MS / 1000,
-        )
+        await DashScProxyServicer._close_downstream(gen, gen)
         self.assertEqual(
             len(close_ts), 1, "second close re-entered GeneratorExit handler"
         )

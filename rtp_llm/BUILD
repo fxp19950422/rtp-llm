@@ -4,6 +4,23 @@ exports_files([
     "ops/librtp_compute_ops/__init__.pyi",
 ])
 
+# Deferred model adapters and registry primitives are also available without
+# the model/kernel dependency closure. Runtime clients provide those dependencies.
+py_library(
+    name = "module_dispatch_support",
+    srcs = [
+        "__init__.py",
+        "model_factory_register.py",
+        "models/__init__.py",
+        "device/__init__.py",
+        "device/device_type.py",
+        "device/runtime.py",
+        "config/module_dispatch_config.py",
+        "utils/import_util.py",
+        "utils/backend_registry.py",
+    ] + glob(["models/dsv4/*.py"]),
+)
+
 load("@rules_python//python:packaging.bzl", "py_package", "py_wheel")
 # make different torch for different device when in compiling
 load("//bazel:defs.bzl", "upload_pkg", "copy_target_to", "upload_wheel", "rename_wheel", "rename_wheel_aarch64")
@@ -157,6 +174,7 @@ _JIT_CACHE_SRCS = [
 
 py_library(
     name = "utils",
+    data = ["//rtp_llm/platforms:platform_sources"],
     srcs = glob([
         "utils/**/*.py",
     ], exclude = _JIT_CACHE_SRCS + [
@@ -306,9 +324,9 @@ py_library(
         "//conditions:default": []
     }) + select({
         # cuda13 locks ship flashinfer-python (+apache-tvm-ffi, nvidia-cutlass-dsl)
-        # and flash-mla + tilelang, but not flashinfer-cubin/jit-cache or
+        # and flash-mla (+tilelang on arm), but not flashinfer-cubin/jit-cache or
         # fast-hadamard; those rebuilds for torch 2.11+cu130 are tracked separately.
-        "@//:using_cuda13_x86": flashinfer + ["nvidia-cutlass-dsl", "flash-mla", "tilelang"],
+        "@//:using_cuda13_x86": flashinfer + ["nvidia-cutlass-dsl", "flash-mla"],
         "@//:using_cuda13_arm": flashinfer + ["nvidia-cutlass-dsl", "flash-mla", "tilelang"],
         "@//:using_cuda12_9_x86": flashinfer_with_cache + flashmla,
         "@//:using_cuda12_arm": flashinfer_with_cache + ["flash-mla", "fast-hadamard-transform"],
