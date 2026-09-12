@@ -80,6 +80,37 @@ class SharedWeightPartitionTest(unittest.TestCase):
                 )
             )
 
+    def test_tp8_reconstructs_shared_weights_and_scales_without_overlap(self):
+        pieces = [
+            self.shard(
+                self.weights,
+                dim=self.dim,
+                inter_dim=self.inter,
+                tp_size=8,
+                tp_rank=rank,
+            )
+            for rank in range(8)
+        ]
+        for key, original in self.weights.items():
+            values = [
+                p[key] if key.endswith("_s") else p[key].view(torch.uint8)
+                for p in pieces
+            ]
+            for part in values:
+                self.assertEqual(part.numel() * 8, original.numel())
+                self.assertTrue(part.is_contiguous())
+            if key.startswith("w13"):
+                halves = [v.chunk(2, 0) for v in values]
+                restored = torch.cat([h[0] for h in halves] + [h[1] for h in halves], 0)
+            else:
+                restored = torch.cat(values, 1)
+            expected = (
+                original.to(torch.float32)
+                if key.endswith("_s")
+                else original.view(torch.uint8)
+            )
+            self.assertTrue(torch.equal(restored, expected))
+
     def test_loader_quarters_do_not_retain_or_mutate_full_checkpoint_storage(self):
         before = {k: v.view(torch.uint8).clone() for k, v in self.weights.items()}
         pieces = self.shard(

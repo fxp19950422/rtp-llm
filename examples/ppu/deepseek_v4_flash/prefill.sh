@@ -2,6 +2,10 @@
 set -euo pipefail
 : "${CHECKPOINT_PATH:?Set CHECKPOINT_PATH to the Flash checkpoint directory}"
 
+TP_SIZE=${TP_SIZE:-8}
+case "$TP_SIZE" in 4|8) ;; *) echo "Prefill requires TP_SIZE=4 or 8" >&2; exit 2 ;; esac
+unset SP_TYPE SP_MODEL_TYPE SP_CHECKPOINT_PATH
+
 export DSV4_HC_IMPL=hybrid
 export DSV4_MHC_PRE_GEMM_BACKEND=deepgemm_deterministic
 export DSV4_MHC_POST_BACKEND=tilelang
@@ -18,12 +22,12 @@ exec python3 -m rtp_llm.start_server \
   --start_port "${START_PORT:-8088}" \
   --model_type deepseek_v4 \
   --act_type BF16 \
-  --role_type PDFUSION \
-  --tp_size 4 \
+  --role_type "${ROLE_TYPE:-PREFILL}" \
+  --tp_size "$TP_SIZE" \
   --ep_size 1 \
   --dp_size 1 \
-  --world_size 4 \
-  --local_world_size 4 \
+  --world_size "$TP_SIZE" \
+  --local_world_size "$TP_SIZE" \
   --prefill_cp_size 1 \
   --prefill_cp_kv_cache_sharded 0 \
   --load_method scratch \
@@ -34,12 +38,14 @@ exec python3 -m rtp_llm.start_server \
   --use_deepep_internode 0 \
   --use_deepep_low_latency 0 \
   --fp8_kv_cache 1 \
-  --max_seq_len 16384 \
+  --seq_size_per_block 256 \
+  --kernel_seq_size_per_block 256 \
+  --cache_store_rdma_mode 1 \
+  --max_seq_len 10240 \
   --max_batch_tokens_size 8192 \
-  --concurrency_limit 4 \
-  --max_context_batch_size 4 \
-  --kv_cache_mem_mb 4096 \
-  --reserver_runtime_mem_mb 32768 \
+  --concurrency_limit 640 \
+  --max_context_batch_size 8 \
+  --reserver_runtime_mem_mb 16384 \
   --warm_up 0 \
   --enable_cuda_graph 0 \
   --frontend_server_count 1 \

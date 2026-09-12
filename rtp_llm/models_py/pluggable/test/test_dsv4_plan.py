@@ -292,13 +292,35 @@ class Dsv4PlanTest(unittest.TestCase):
             digests.add(ctx.prepare([request_for("model", ctx.selection)]))
         self.assertEqual(len(digests), 1)
 
+    def test_prefill_tp4_tp8_pd_plans_cover_all_ranks(self):
+        for tp in (4, 8):
+            for role in ("PDFUSION", "PREFILL"):
+                with self.subTest(tp=tp, role=role):
+                    digests = set()
+                    for rank in range(tp):
+                        ctx = ModuleBuildContext(
+                            get_module_registry(),
+                            selection(rank, tp_size=tp, world_size=tp, role=role),
+                            explicit_config(),
+                            world_size=tp,
+                        )
+                        digests.add(ctx.prepare([request_for("model", ctx.selection)]))
+                        self.assertEqual(len(ctx.bindings), 130)
+                        self.assertTrue(
+                            all(
+                                b.request.required_capabilities
+                                == frozenset({"prefill"})
+                                for b in ctx.bindings
+                            )
+                        )
+                    self.assertEqual(len(digests), 1)
+
     def test_unqualified_modes_rejected_by_real_predicate(self):
         for change in [
             {"tp_size": 8},
             {"ep_size": 8},
             {"cp_enabled": True},
             {"role": "DECODE"},
-            {"role": "PREFILL"},
             {"speculative": True},
             {"cuda_graph": True},
             {"reuse_cache": True},

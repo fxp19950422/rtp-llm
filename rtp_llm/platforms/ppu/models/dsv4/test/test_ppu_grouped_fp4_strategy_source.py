@@ -70,7 +70,8 @@ class PpuGroupedFP4SourceContractTest(unittest.TestCase):
         self.assertTrue(supports(_cfg(tp_size=4, ep_size=1)))
         self.assertFalse(supports(_cfg(tp_size=1, ep_size=1)))
         self.assertFalse(supports(_cfg(tp_size=4, ep_size=8)))
-        self.assertFalse(supports(_cfg(tp_size=8, ep_size=1)))
+        self.assertTrue(supports(_cfg(tp_size=8, ep_size=1)))
+        self.assertFalse(supports(_cfg(tp_size=2, ep_size=1)))
 
         strategy = next(
             node
@@ -154,6 +155,13 @@ class PpuGroupedFP4SourceContractTest(unittest.TestCase):
             derive(_cfg(), *bad)
         with self.assertRaises(RuntimeError):
             derive(_cfg(tp_size=1), *_shapes(2048))
+
+    def test_tp8_flash_packed_weight_geometry(self):
+        derive = self.helpers["_derive_inter_local_and_tp"]
+        config = _cfg(tp_size=8, inter=2048, dim=4096)
+        self.assertEqual(derive(config, *_shapes(256, dim=4096)), (256, 8))
+        with self.assertRaises(ValueError):
+            derive(config, *_shapes(512, dim=4096))
 
     def test_hidden_dim_rejects_exact_gather_incompatible_alignment(self):
         derive = self.helpers["_derive_inter_local_and_tp"]

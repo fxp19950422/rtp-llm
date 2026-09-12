@@ -78,7 +78,7 @@ class M890PDsv4Provider:
 
     Construction factories preserve provider identity while delegating to the
     supplied factory. Attention uses the verified public rich-FlashMLA path;
-    EP1/TP4 MoE forces the PPU grouped-FP4 strategy, while TP1/EP8 keeps the
+    EP1/TP4/TP8 MoE forces the PPU grouped-FP4 strategy, while TP1/EP8 keeps the
     DeepEP normal-mode dispatch/combine path. Other topologies fail closed.
     """
 
@@ -216,7 +216,7 @@ class M890PDsv4Provider:
                 platform_provider=self,
                 **kwargs,
             )
-        if ep_size == 1 and tp_size == 4:
+        if ep_size == 1 and tp_size in (4, 8):
             from .ppu_tp_moe import PpuTPMoE
 
             return PpuTPMoE(*args, platform_provider=self, **kwargs)

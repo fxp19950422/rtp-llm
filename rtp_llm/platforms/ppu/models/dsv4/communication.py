@@ -1,4 +1,4 @@
-"""Startup-only PCCL workspace preparation for the validated TP4 prefill path."""
+"""Startup-only PCCL workspace preparation for the TP4/TP8 prefill paths."""
 
 import logging
 import os
@@ -27,8 +27,8 @@ def maybe_warmup_ppu_tp_communication(parallelism_config, *, options=None) -> bo
         return False
     if (
         parallelism_config.role_type not in (RoleType.PREFILL, RoleType.PDFUSION)
-        or parallelism_config.tp_size != 4
-        or parallelism_config.world_size != 4
+        or parallelism_config.tp_size not in (4, 8)
+        or parallelism_config.world_size != parallelism_config.tp_size
         or parallelism_config.prefill_cp_config.prefill_cp_size != 1
         or get_device_type() != DeviceType.Ppu
     ):

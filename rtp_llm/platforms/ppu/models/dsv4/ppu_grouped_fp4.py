@@ -1,4 +1,4 @@
-"""M890P grouped-MXFP4 routed experts for the DSV4 TP4/EP1 topology.
+"""M890P grouped-MXFP4 routed experts for the DSV4 TP4-or-TP8/EP1 topology.
 
 This strategy is deliberately separate from the CUDA ``grouped_fp4`` backend.
 It consumes the checkpoint's packed MXFP4 tensors, executes two PPU nopad
@@ -58,9 +58,9 @@ def _module_path(module: object) -> str:
 
 
 def _supports_topology(cfg: MoeCfg) -> bool:
-    """The provider seam is intentionally limited to the TP4/EP1 pivot."""
+    """The provider seam is intentionally limited to the TP4-or-TP8/EP1 pivot."""
 
-    return int(cfg.tp_size) == 4 and int(cfg.ep_size) == 1
+    return int(cfg.tp_size) in (4, 8) and int(cfg.ep_size) == 1
 
 
 def _runtime_eligible() -> bool:
@@ -90,7 +90,7 @@ def _derive_inter_local_and_tp(
     """Validate packed MXFP4 geometry and derive the routed TP contract."""
 
     if not _supports_topology(cfg):
-        raise RuntimeError("ppu_grouped_fp4 requires exactly tp_size=4 and ep_size=1")
+        raise RuntimeError("ppu_grouped_fp4 requires tp_size in (4, 8) and ep_size=1")
 
     experts = int(cfg.n_local_experts)
     dim = int(cfg.dim)
@@ -150,7 +150,7 @@ def _derive_inter_local_and_tp(
 
 
 class PpuGroupedFP4Strategy(torch.nn.Module):
-    """Strict M890P packed-MXFP4 strategy for DSV4 TP4/EP1."""
+    """Strict M890P packed-MXFP4 strategy for DSV4 TP4-or-TP8/EP1."""
 
     name = "ppu_grouped_fp4"
     route_weight_contract = _ROUTE_WEIGHT_CONTRACT
@@ -185,7 +185,7 @@ class PpuGroupedFP4Strategy(torch.nn.Module):
 
         if not _supports_topology(self.cfg):
             raise RuntimeError(
-                "ppu_grouped_fp4 setup rejected a non-TP4/EP1 configuration"
+                "ppu_grouped_fp4 setup rejected a non-TP4-or-TP8/EP1 configuration"
             )
 
         from rtp_llm.utils.model_weight import W

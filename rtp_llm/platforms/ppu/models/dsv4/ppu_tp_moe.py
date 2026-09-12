@@ -1,4 +1,4 @@
-"""PPU TP4 MoE: local shared/routed compute followed by one BF16 reduction."""
+"""PPU TP4/TP8 MoE: local shared/routed compute followed by one BF16 reduction."""
 
 import logging
 from functools import partial
@@ -47,8 +47,8 @@ class PpuTPMoE(nn.Module):
         record_function_scope=None,
     ):
         super().__init__()
-        if tp_size != 4 or ep_size != 1 or ep_rank != 0 or is_decode_role:
-            raise ValueError("PPU TP MoE requires eager Prefill TP4/EP1")
+        if tp_size not in (4, 8) or ep_size != 1 or ep_rank != 0 or is_decode_role:
+            raise ValueError("PPU TP MoE requires eager Prefill TP4/TP8 with EP1")
         if n_shared_experts != 1 or int(max_tokens_per_rank) <= 0:
             raise ValueError(
                 "PPU TP MoE requires one shared expert and positive capacity"

@@ -92,6 +92,14 @@ class PrefillCommunicationTest(unittest.TestCase):
         self.torch.cuda.empty_cache.assert_not_called()
         self.torch.manual_seed.assert_not_called()
 
+    def test_tp8_prepares_the_same_real_tp_communicator(self):
+        self.cfg.tp_size = self.cfg.world_size = 8
+        self.cfg.local_rank = 7
+        self.assertTrue(self.run_warmup())
+        self.torch.device.assert_called_once_with("cuda", 7)
+        self.reduce.assert_called_once_with(self.tensor, self.group)
+        self.assertEqual(self.events, ["allocate", "reduce", "synchronize"])
+
     def test_fused_service_prepares_the_same_prefill_communicator(self):
         self.cfg.role_type = "pdfusion"
         self.assertTrue(self.run_warmup())

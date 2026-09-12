@@ -62,8 +62,9 @@ def _supports_ppu_prefill(selection, request, cache_mode):
             "requires DeepSeek-V4 target model",
         ),
         (
-            metadata.get("tp_size") == 4 and metadata.get("world_size") == 4,
-            "requires TP4 world4",
+            metadata.get("tp_size") in (4, 8)
+            and metadata.get("world_size") == metadata.get("tp_size"),
+            "requires TP4 or TP8 with matching world size",
         ),
         (
             metadata.get("ep_size") == 1
@@ -86,7 +87,10 @@ def _supports_ppu_prefill(selection, request, cache_mode):
             "requires TileLang POST without PDL",
         ),
         (not metadata.get("cp_enabled"), "CP is not qualified"),
-        (metadata.get("role") == "PDFUSION", "PD/decode roles are not qualified"),
+        (
+            metadata.get("role") in ("PDFUSION", "PREFILL"),
+            "requires a Prefill or PD-fused role",
+        ),
         (not metadata.get("speculative"), "MTP/speculation is not qualified"),
         (not metadata.get("cuda_graph"), "graph execution is not qualified"),
         (not metadata.get("reuse_cache"), "prefix reuse is not qualified"),
