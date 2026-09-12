@@ -3,6 +3,7 @@ load("@arch_config//:arch_select.bzl", "torch_deps")
 
 cc_library(
     name = "ppu_silu_mul_mxfp4_op",
+    visibility = ["//visibility:public"],
     srcs = ["PpuSiluMulMxfp4Op.cc"],
     hdrs = ["PpuSiluMulMxfp4Op.h"],
     copts = cuda_copts(),
