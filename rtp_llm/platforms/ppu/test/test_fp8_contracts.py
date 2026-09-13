@@ -22,7 +22,9 @@ class Fp8CpuContractTest(unittest.TestCase):
     def scale(self, shape=(1, 1)):
         return torch.full(shape, 127, dtype=torch.uint8).view(torch.float8_e8m0fnu)
 
-    @unittest.skipUnless(hasattr(torch, "float8_e8m0fnu"), "Torch lacks UE8M0 dtype")
+    @unittest.skipUnless(
+        hasattr(torch, "float8_e8m0fnu"), "Torch lacks UE8M0 dtype"
+    )
     def test_checkpoint_scale_preserves_encoded_power_of_two(self):
         raw = torch.tensor([[0, 120, 127, 130, 254]], dtype=torch.uint8)
         with mock.patch.object(MODULE, "_require_m890p"):
@@ -131,6 +133,45 @@ class Fp8CpuContractTest(unittest.TestCase):
             output = layer(torch.zeros((3, 2, 128), dtype=torch.bfloat16))
             self.assertEqual(tuple(output.shape), (3, 2, 128))
             self.assertEqual(len(calls), 1)
+
+    @unittest.skipUnless(hasattr(torch, "float8_e8m0fnu"), "Torch lacks UE8M0 dtype")
+    def test_wo_a_tp8_single_group_uses_dense_gemm(self):
+        calls = []
+
+        def dense(lhs, rhs, out):
+            calls.append("dense")
+            self.assertEqual(tuple(lhs[0].shape), (3, 128))
+            self.assertEqual(tuple(lhs[1].shape), (3, 1))
+            self.assertEqual(tuple(rhs[0].shape), (128, 128))
+            self.assertEqual(tuple(rhs[1].shape), (1, 1))
+            self.assertEqual(tuple(out.shape), (3, 128))
+            out.zero_()
+
+        def resolve(name):
+            if name == "fp8_gemm_nt":
+                return dense
+            self.fail(f"TP8 wo_a unexpectedly resolved {name}")
+
+        quant = (
+            torch.zeros((3, 128), dtype=torch.float8_e4m3fn),
+            torch.ones((3, 1)),
+        )
+        with mock.patch.object(MODULE, "_require_m890p"), mock.patch.object(
+            WO_A, "_require_m890p"
+        ), mock.patch.object(
+            WO_A, "_resolve_deep_gemm_symbol", side_effect=resolve
+        ), mock.patch.object(
+            WO_A, "quantize_ppu_fp8_activation", return_value=quant
+        ):
+            layer = WO_A.PpuWoAFp8Linear(
+                torch.zeros((128, 128), dtype=torch.float8_e4m3fn),
+                self.scale((1, 1)),
+                groups=1,
+                k_local=128,
+            )
+            output = layer(torch.zeros((3, 1, 128), dtype=torch.bfloat16))
+            self.assertEqual(tuple(output.shape), (3, 1, 128))
+            self.assertEqual(calls, ["dense"])
 
     def test_missing_deepgemm_symbol_fails_without_fallback(self):
         with mock.patch.object(

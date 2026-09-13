@@ -99,7 +99,19 @@ class PpuWoAFp8Linear(nn.Module):
             ),
             persistent=False,
         )
-        self._einsum = _resolve_deep_gemm_symbol("fp8_einsum")
+        # TP8 has a single local attention group.  In that topology wo_a is a
+        # normal 2-D projection, so routing it through the batched DeepGEMM
+        # kernel only adds a degenerate group dimension.  Besides being
+        # unnecessary, the M890P batched kernel has a separate JIT/config
+        # surface from the already-qualified dense FP8 path.  Keep batched
+        # einsum for the genuinely grouped TP1/2/4 topologies and use the
+        # ordinary dense kernel for groups=1.
+        if self.groups == 1:
+            self._dense_gemm = _resolve_deep_gemm_symbol("fp8_gemm_nt")
+            self._einsum = None
+        else:
+            self._dense_gemm = None
+            self._einsum = _resolve_deep_gemm_symbol("fp8_einsum")
 
     def forward(
         self,
@@ -139,6 +151,28 @@ class PpuWoAFp8Linear(nn.Module):
         x_fp8 = x_fp8.view(m, self.groups, self.k_local)
         x_scale = x_scale.view(m, self.groups, self.k_local // FP8_BLOCK_SIZE)
         output_3d = output.view(m, self.groups, self.rank)
+        if self.groups == 1:
+            try:
+                self._dense_gemm(
+                    (
+                        x_fp8.view(m, self.k_local),
+                        x_scale.view(m, self.k_local // FP8_BLOCK_SIZE),
+                    ),
+                    (
+                        self.weight.view(self.rank, self.k_local),
+                        self.weight_scale.view(
+                            self.rank // FP8_BLOCK_SIZE,
+                            self.k_local // FP8_BLOCK_SIZE,
+                        ),
+                    ),
+                    output_3d.view(m, self.rank),
+                )
+            except TypeError as exc:
+                raise RuntimeError(
+                    "deep_gemm.fp8_gemm_nt ABI mismatch for the M890P DSV4 "
+                    "TP8 wo_a contract; expected (lhs_pair, rhs_pair, out)"
+                ) from exc
+            return output
         if self.sglang_layout:
             from deep_gemm.jit_kernels.einsum import fp8_bmm
             from rtp_llm.platforms.ppu.kernels.cuda.ppu_sglang_permute import (
