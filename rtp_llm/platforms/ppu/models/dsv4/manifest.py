@@ -8,7 +8,10 @@ from rtp_llm.models_py.pluggable.spec import ModuleImplSpec, SupportResult
 # Existing ModuleDispatchConfig snapshots and rank digests own the configuration.
 PREFILL_EXECUTION_OPTIONS = {
     "DSV4_HC_IMPL": "hybrid",
-    "DSV4_MHC_PRE_GEMM_BACKEND": "deepgemm_deterministic",
+    # The qualified M890P TP4 Prefill deployment uses the production
+    # DeepGEMM reduction.  The deterministic partials path is reserved for
+    # the TP1 Decode graph and can stall on the first eager TP request.
+    "DSV4_MHC_PRE_GEMM_BACKEND": "deepgemm",
     "DSV4_MHC_POST_BACKEND": "tilelang",
     "DSV4_MHC_POST_PDL": "0",
     "DSV4_PPU_SGLANG_MOE": "1",
