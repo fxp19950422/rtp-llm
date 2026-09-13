@@ -8,9 +8,8 @@ from rtp_llm.models_py.pluggable.spec import ModuleImplSpec, SupportResult
 # Existing ModuleDispatchConfig snapshots and rank digests own the configuration.
 PREFILL_EXECUTION_OPTIONS = {
     "DSV4_HC_IMPL": "hybrid",
-    # The qualified M890P TP4 Prefill deployment uses the production
-    # DeepGEMM reduction.  The deterministic partials path is reserved for
-    # the TP1 Decode graph and can stall on the first eager TP request.
+    # TP4 is the default published Prefill candidate.  The predicate below
+    # selects the separately qualified deterministic reduction for TP8.
     "DSV4_MHC_PRE_GEMM_BACKEND": "deepgemm",
     "DSV4_MHC_POST_BACKEND": "tilelang",
     "DSV4_MHC_POST_PDL": "0",
@@ -119,8 +118,18 @@ def supports_ppu_fp4_prefill(selection, request):
     result = _supports_ppu_prefill(selection, request, "fp4")
     if not result.supported:
         return result
+    # The qualified M890P launch paths intentionally differ by topology:
+    # TP4 uses the production DeepGEMM reduction, while the existing TP8
+    # service uses deterministic partials.  Checking this dynamically keeps
+    # both qualified paths valid without silently rewriting either launch.
+    required = dict(PREFILL_EXECUTION_OPTIONS)
+    required["DSV4_MHC_PRE_GEMM_BACKEND"] = (
+        "deepgemm"
+        if selection.model_metadata.get("tp_size") == 4
+        else "deepgemm_deterministic"
+    )
     return _check_execution_options(
-        selection.model_metadata.get("execution_options", {}), PREFILL_EXECUTION_OPTIONS
+        selection.model_metadata.get("execution_options", {}), required
     )
 
 
