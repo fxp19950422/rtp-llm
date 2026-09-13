@@ -1125,6 +1125,39 @@ class BackendTest(JitCacheTestBase):
         self.assertIn("KeyboardInterrupt", status.call_args[0][3])
         self.assertIn("signal 15 during startup", status.call_args[0][3])
 
+    def test_fake_gang_multi_rank_still_reports_ready_and_monitors(self):
+        configs = self.make_configs(remote="/r")
+        configs.distribute_config.fake_gang_env = True
+        proc = mock.Mock()
+        proc.name, proc.pid = "rank-0", 123
+        reader = mock.Mock()
+        status = mock.Mock()
+        manager = mock.Mock()
+
+        def fake_create(_gc, _cfg, _ctx, processes, readers):
+            processes.append(proc)
+            readers.append(reader)
+
+        with mock.patch.object(
+            backend.multiprocessing, "get_context"
+        ), mock.patch.object(
+            backend, "_create_rank_processes", side_effect=fake_create
+        ), mock.patch.object(
+            backend, "_wait_for_ranks_startup"
+        ) as wait_for_ranks, mock.patch.object(
+            backend, "_send_pipe_status", status
+        ), mock.patch.object(
+            backend, "ProcessManager", return_value=manager
+        ):
+            backend.multi_rank_start(None, configs, pipe_writer=object())
+
+        wait_for_ranks.assert_called_once_with([proc], [reader], 1)
+        self.assertEqual(status.call_args[0][1], "success")
+        manager.set_processes.assert_called_once_with(
+            [proc], shutdown_group="backend"
+        )
+        manager.monitor_and_release_processes.assert_called_once_with()
+
     def test_spawn_failure_terminates_already_started_ranks(self):
         configs = self.make_configs(remote="/r")
         configs.distribute_config.fake_gang_env = False
