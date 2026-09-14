@@ -3,6 +3,7 @@ load("@arch_config//:arch_select.bzl", "torch_deps")
 
 cc_library(
     name = "ppu_silu_mul_mxfp4_op",
+    visibility = ["//internal_source/RTP_LLM-PPU/rtp_llm/models_py/bindings:__pkg__"],
     srcs = ["PpuSiluMulMxfp4Op.cc"],
     hdrs = ["PpuSiluMulMxfp4Op.h"],
     copts = cuda_copts(),
