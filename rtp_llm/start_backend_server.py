@@ -296,12 +296,9 @@ def multi_rank_start(
         )
         local_world_size = len(processes)
 
-        if py_env_configs.distribute_config.fake_gang_env:
-            # Test-only path: returning releases the manager, which publishes one
-            # last snapshot; the caller-owned ranks keep serving from the local tree.
-            _close_readers(rank_pipe_readers)
-            return processes
-
+        # FAKE_GANG_ENV controls gang discovery, not process ownership. Whale
+        # also enables it: all ranks must report readiness before we close their
+        # pipes, publish backend readiness, and enter process supervision.
         # Wait for all ranks to report startup status
         _wait_for_ranks_startup(processes, rank_pipe_readers, local_world_size)
 
