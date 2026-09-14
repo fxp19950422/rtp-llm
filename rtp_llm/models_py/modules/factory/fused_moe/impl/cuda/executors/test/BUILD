@@ -1,5 +1,4 @@
 load("//rtp_llm/test/utils:cuda13_sm100_test.bzl", "cuda13_sm100_py_test")
-load("//rtp_llm/models_py/modules/dsv4/test:defs.bzl", "dsv4_sm100_py_test")
 
 py_library(
     name = "fused_moe_executor_test_util",
@@ -181,13 +180,14 @@ cuda13_sm100_py_test(
     visibility = ["//visibility:public"],
 )
 
-dsv4_sm100_py_test(
+cuda13_sm100_py_test(
     name = "test_grouped_fp4_strategy_cuda_graph",
-    src = "test_grouped_fp4_strategy_perf.py",
-    args = ["-k", "test_cuda_graph_capture_bs1_matches_eager"],
+    srcs = ["test_grouped_fp4_strategy_perf.py"],
+    env_inherit = ["HOME"],
+    main = "test_grouped_fp4_strategy_perf.py",
+    args = ["GroupedFP4StrategyPerfTest.test_cuda_graph_capture_bs1_matches_eager"],
     deps = [
         "//rtp_llm/models_py:modules",
         "//rtp_llm:testlib",
     ],
-    visibility = ["//visibility:public"],
 )

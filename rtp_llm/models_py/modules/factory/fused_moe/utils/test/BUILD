@@ -1,4 +1,4 @@
-load("//rtp_llm/models_py/modules/dsv4/test:defs.bzl", "dsv4_py_test", "dsv4_sm100_py_test")
+load("//rtp_llm/test/utils:cuda13_sm100_test.bzl", "cuda13_sm100_py_test")
 
 _CUDA13_ONLY = select({
     "@//:using_cuda13_x86": [],
@@ -66,29 +66,30 @@ py_test(
     target_compatible_with = _CUDA13_ONLY,
 )
 
-dsv4_py_test(
+py_test(
     name = "test_chunked_moe",
+    srcs = ["test_chunked_moe.py"],
     deps = [
         "//rtp_llm/models_py:modules",
         "//rtp_llm:testlib",
     ],
-    visibility = ["//visibility:public"],
+    target_compatible_with = _CUDA13_ONLY,
 )
 
-dsv4_sm100_py_test(
+cuda13_sm100_py_test(
     name = "test_shared_expert_executor",
+    srcs = ["test_shared_expert_executor.py"],
     deps = [
         "//rtp_llm/models_py:modules",
         "//rtp_llm:testlib",
     ],
-    visibility = ["//visibility:public"],
 )
 
-dsv4_sm100_py_test(
+cuda13_sm100_py_test(
     name = "test_mega_moe_input_packer",
+    srcs = ["test_mega_moe_input_packer.py"],
     deps = [
         "//rtp_llm/models_py:modules",
         "//rtp_llm:testlib",
     ],
-    visibility = ["//visibility:public"],
 )

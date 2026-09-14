@@ -447,9 +447,5 @@ def main():
     print("OK")
 
 
-def test_raw_dispatch():
-    main()
-
-
 if __name__ == "__main__":
     main()

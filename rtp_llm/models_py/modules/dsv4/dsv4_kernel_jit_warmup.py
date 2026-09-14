@@ -8,14 +8,12 @@ cold compiles are otherwise likely to happen after the health gate opens.
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import time
-from datetime import timedelta
 from functools import lru_cache, partial
 from importlib import import_module
-from typing import Any, Callable, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Iterable, Optional, Tuple
 
 import torch
 
@@ -72,9 +70,6 @@ _MHC_PRENORM_GEMM_JIT_WARMED_KEYS: set[tuple] = set()
 _MHC_HEAD_FUSED_JIT_WARMED_KEYS: set[tuple] = set()
 _FP8_MQA_LOGITS_JIT_WARMED_KEYS: set[tuple] = set()
 _SWA_SLOT_DEQUANT_JIT_WARMED_KEYS: set[tuple] = set()
-_CP_METADATA_JIT_WARMED_KEYS: set[tuple] = set()
-_CP_METADATA_WARMUP_EPOCH = 0
-_CP_METADATA_WARMUP_TIMEOUT_SECONDS = 600
 _DEEPGEMM_WARMUP_COMPILE_RETRIES = 2
 _TILELANG_WARMUP_COMPILE_RETRIES = 2
 _TRITON_WARMUP_COMPILE_RETRIES = 2
@@ -122,261 +117,6 @@ def _swa_slot_metadata_batch_warmup_sizes(
 ) -> tuple[int, ...]:
     """Represent each SWA slot-metadata batch bucket through 1024."""
     return _batch_bucket_warmup_sizes(max_batch_size, max_supported_batch=1024)
-
-
-def _run_cp_metadata_warmup(local_warmup: Callable[[], bool]) -> bool:
-    """Agree on local JIT outcomes without issuing work on a failed CUDA device."""
-    import torch.distributed as dist
-
-    if (
-        not dist.is_available()
-        or not dist.is_initialized()
-        or dist.get_world_size() <= 1
-    ):
-        return local_warmup()
-
-    global _CP_METADATA_WARMUP_EPOCH
-    _CP_METADATA_WARMUP_EPOCH += 1
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    store = dist.distributed_c10d._get_default_store()
-    prefix = f"rtp_llm/dsv4/cp_metadata/{_CP_METADATA_WARMUP_EPOCH}/"
-    local_error: Optional[Exception] = None
-    completed = False
-    try:
-        completed = local_warmup()
-    except Exception as error:
-        local_error = error
-
-    outcome = {
-        "completed": completed,
-        "error": (
-            f"{type(local_error).__name__}: {local_error}"
-            if local_error is not None
-            else None
-        ),
-    }
-    try:
-        store.set(prefix + str(rank), json.dumps(outcome).encode("utf-8"))
-        keys = [prefix + str(peer) for peer in range(world_size)]
-        store.wait(keys, timedelta(seconds=_CP_METADATA_WARMUP_TIMEOUT_SECONDS))
-        outcomes = [json.loads(store.get(key)) for key in keys]
-    except Exception as status_error:
-        if local_error is not None:
-            logging.exception("CP metadata JIT warmup status exchange also failed")
-            raise local_error
-        raise RuntimeError(
-            "CP metadata JIT warmup could not collect all rank outcomes "
-            f"within {_CP_METADATA_WARMUP_TIMEOUT_SECONDS}s"
-        ) from status_error
-
-    failures = [
-        f"rank {peer}: {status['error']}"
-        for peer, status in enumerate(outcomes)
-        if status["error"] is not None
-    ]
-    if failures:
-        message = "CP metadata JIT warmup failed: " + "; ".join(failures)
-        logging.error(message)
-        if local_error is not None:
-            raise local_error
-        raise RuntimeError(message)
-    if any(status["completed"] != completed for status in outcomes):
-        raise RuntimeError("CP metadata fusion support differs across ranks")
-    return completed
-
-
-@torch.inference_mode()
-def warmup_prefill_cp_metadata_jit(
-    *,
-    is_decode_role: bool,
-    cp_enabled: bool,
-    cp_size: int,
-    max_batch_size: int,
-    fp8_kv_cache: bool,
-    kv_cache_sharded: bool,
-    device: torch.device,
-) -> None:
-    """Compile the metadata and indexer gather signatures used by CP prefill."""
-    if not model_warm_up_enabled():
-        return
-    device = torch.device(device)
-    if (
-        is_decode_role
-        or not cp_enabled
-        or int(cp_size) <= 1
-        or not _is_cuda_device(device)
-    ):
-        return
-    _assert_not_capturing()
-    batches = _batch_bucket_warmup_sizes(max_batch_size, max_supported_batch=64)
-    key = (
-        int(cp_size),
-        batches,
-        bool(fp8_kv_cache),
-        bool(kv_cache_sharded),
-        str(device),
-    )
-    if key in _CP_METADATA_JIT_WARMED_KEYS:
-        return
-    started = time.time()
-    completed = _run_cp_metadata_warmup(
-        partial(
-            _warmup_prefill_cp_metadata_kernels,
-            batches=batches,
-            cp_size=cp_size,
-            fp8_kv_cache=fp8_kv_cache,
-            kv_cache_sharded=kv_cache_sharded,
-            device=device,
-        )
-    )
-    if not completed:
-        return
-    logging.info(
-        "[DSV4 CPMetadata] JIT warmup batches=%s done in %.2fs",
-        batches,
-        time.time() - started,
-    )
-    _CP_METADATA_JIT_WARMED_KEYS.add(key)
-
-
-def _warmup_prefill_cp_metadata_kernels(
-    *,
-    batches: tuple[int, ...],
-    cp_size: int,
-    fp8_kv_cache: bool,
-    kv_cache_sharded: bool,
-    device: torch.device,
-) -> bool:
-    from rtp_llm.models_py.modules.dsv4 import _cp_metadata_triton as cp_meta
-    from rtp_llm.models_py.modules.dsv4.cp import cp_padded_local_kv_len
-    from rtp_llm.models_py.modules.dsv4.fp8._fused_compressor_meta_triton import (
-        fused_compressor_slot_mapping,
-    )
-    from rtp_llm.models_py.modules.dsv4.fp8._indexer_cp_gather_triton import (
-        try_gather_indexer_k_to_padded,
-    )
-    from rtp_llm.models_py.modules.dsv4.fp8._indexer_quant_triton import (
-        INDEXER_ENTRY_BYTES,
-        INDEXER_HEAD_DIM,
-    )
-
-    if not cp_meta.cp_metadata_fusion_supported():
-        return False
-    for batch_size in batches:
-        lengths = torch.full((batch_size,), 2, dtype=torch.int64, device=device)
-        prefixes = torch.zeros(batch_size, dtype=torch.int64, device=device)
-        chunks = torch.full((batch_size,), 2, dtype=torch.int32, device=device)
-        forward_lengths = lengths.to(torch.int32)
-        forward_prefixes = prefixes.to(torch.int32)
-        total = 2 * batch_size
-        local_kv = cp_padded_local_kv_len(2, cp_size, 4) * batch_size
-        padding = torch.zeros(
-            (batch_size, 2 * cp_size), dtype=torch.int32, device=device
-        )
-        padding[:, :2] = 1
-        padding = padding.flatten()
-        restore = torch.arange(padding.numel(), dtype=torch.int32, device=device)
-        shuffle = torch.tensor(
-            [0, 2 * cp_size - 1] * batch_size, dtype=torch.int32, device=device
-        )
-        indexer_cache = torch.zeros(
-            (2, 4, INDEXER_ENTRY_BYTES), dtype=torch.uint8, device=device
-        )
-        indexer_table = torch.ones((batch_size, 1), dtype=torch.int32, device=device)
-        actual_lens = torch.ones(batch_size, dtype=torch.int64, device=device)
-        indexer_q = torch.empty(
-            (total, INDEXER_HEAD_DIM), dtype=torch.float8_e4m3fn, device=device
-        )
-        indexer_s = torch.empty((total, 4), dtype=torch.uint8, device=device)
-
-        def launch() -> None:
-            forward = cp_meta.try_build_cp_forward_metadata(
-                forward_lengths,
-                chunks,
-                forward_prefixes,
-                padding,
-                restore,
-                shuffle,
-                cp_size=cp_size,
-                cp_rank=0,
-                chunk_length=total,
-                seq_len_full=total,
-            )
-            if forward is None:
-                raise RuntimeError("CP forward metadata warmup used the fallback")
-            if batch_size > 1:
-                positions = cp_meta.try_build_cp_full_prefill_positions(
-                    lengths, prefixes, total_tokens=total
-                )
-                if positions is None:
-                    raise RuntimeError("CP positions warmup used the fallback")
-            if kv_cache_sharded:
-                restored = cp_meta.try_build_cp_restore_indices(
-                    lengths,
-                    cp_size=cp_size,
-                    owner_block_size=4,
-                    total_tokens=total,
-                    total_local_kv=local_kv,
-                )
-                if restored is None:
-                    raise RuntimeError("CP restore metadata warmup used the fallback")
-                if fp8_kv_cache and not try_gather_indexer_k_to_padded(
-                    indexer_cache,
-                    indexer_table,
-                    lengths,
-                    actual_lens,
-                    indexer_q,
-                    indexer_s,
-                    total_actual_tokens=batch_size,
-                ):
-                    raise RuntimeError("CP indexer gather warmup used the fallback")
-
-        _run_triton_warmup_launch_with_retry(
-            "DSV4 CPMetadata",
-            f"batch_size={batch_size} cp_size={cp_size}",
-            launch,
-            device=device,
-        )
-
-    if fp8_kv_cache:
-        # Geometry is runtime-valued, while the host/device length paths can
-        # carry either integer pointer type into the compressor metadata ABI.
-        positions = torch.arange(2, dtype=torch.int64, device=device)
-        requests = torch.zeros(2, dtype=torch.int64, device=device)
-        table = torch.ones((1, 2), dtype=torch.int32, device=device)
-        for start_dtype in (torch.int32, torch.int64):
-            for cu_dtype in (torch.int32, torch.int64):
-                starts = torch.zeros(1, dtype=start_dtype, device=device)
-                cu = torch.tensor([0, 2], dtype=cu_dtype, device=device)
-
-                def launch_compressor() -> None:
-                    fused_compressor_slot_mapping(
-                        positions,
-                        requests,
-                        table,
-                        4,
-                        table,
-                        1,
-                        4,
-                        starts,
-                        cu,
-                        4,
-                        pool_rows=2,
-                        kv_tokens_per_block=4,
-                        cp_size=cp_size if kv_cache_sharded else 1,
-                        cp_rank=0,
-                        kv_owner_tokens_per_block=4,
-                    )
-
-                _run_triton_warmup_launch_with_retry(
-                    "DSV4 CPCompressorMetadata",
-                    f"start={start_dtype} cu={cu_dtype}",
-                    launch_compressor,
-                    device=device,
-                )
-    _sync_cuda(device)
-    return True
 
 
 def _compute_state_ring_entries(
@@ -1163,11 +903,16 @@ def _collect_dsv4_dense_gemm_shapes(model: Any) -> Dict[tuple[str, int, int], di
 
 
 def _collect_dsv4_mhc_prenorm_shapes(model: Any) -> Dict[tuple[int, int], dict]:
-    """Collect mHC DeepGEMM prenorm GEMM shapes from live TileLang HC units."""
+    """Collect mHC DeepGEMM prenorm GEMM shapes from live HC units."""
 
     shapes: Dict[tuple[int, int], dict] = {}
+    unit_classes = {"TileLangHCUnit", "HybridHCUnit"}
+    requested_backend = os.environ.get("DSV4_MHC_PRE_GEMM_BACKEND", "").strip().lower()
+    if requested_backend in {"deepgemm", "dg"}:
+        unit_classes.add("FallbackHCUnit")
     for module_name, module in model.named_modules():
-        if module.__class__.__name__ != "TileLangHCUnit":
+        class_name = module.__class__.__name__
+        if class_name not in unit_classes:
             continue
         fn = getattr(module, "fn", None)
         if not isinstance(fn, torch.Tensor) or fn.dim() != 2:
@@ -1194,6 +939,7 @@ def _collect_dsv4_mhc_prenorm_shapes(model: Any) -> Dict[tuple[int, int], dict]:
                 "hc_sinkhorn_iters": int(
                     getattr(module, "hc_sinkhorn_iters", 20) or 20
                 ),
+                "projection_only": class_name == "FallbackHCUnit",
             }
 
     logging.info(
@@ -1935,14 +1681,16 @@ def warmup_mhc_prenorm_gemm_jit(
     num_sms = _get_deep_gemm_num_sms(device)
     shape_keys = tuple(sorted(shapes.keys()))
     if deepgemm_enabled:
-        specs_by_shape = {
-            key: _generate_mhc_prenorm_warmup_specs(
+        specs_by_shape = {}
+        for key in shape_keys:
+            specs = _generate_mhc_prenorm_warmup_specs(
                 max_m=int(max_m),
                 k_value=int(key[1]),
                 num_sms=num_sms,
             )
-            for key in shape_keys
-        }
+            if bool(shapes[key].get("projection_only", False)):
+                specs = tuple((1, m_value) for _, m_value in specs)
+            specs_by_shape[key] = specs
     else:
         specs_by_shape = {key: ((1, 1),) for key in shape_keys if int(max_m) > 0}
     specs_by_shape = {key: specs for key, specs in specs_by_shape.items() if specs}
@@ -1994,19 +1742,20 @@ def warmup_mhc_prenorm_gemm_jit(
                         ),
                         device=device,
                     )
-                    _run_tilelang_warmup_launch_with_retry(
-                        "DSV4 mHC TileLangFuse",
-                        f"shape={key} num_splits={num_splits} m={m_value}",
-                        partial(
-                            _launch_dummy_mhc_pre_big_fuse,
-                            key=key,
-                            info=info,
-                            m_value=m_value,
-                            num_splits=num_splits,
+                    if not bool(info.get("projection_only", False)):
+                        _run_tilelang_warmup_launch_with_retry(
+                            "DSV4 mHC TileLangFuse",
+                            f"shape={key} num_splits={num_splits} m={m_value}",
+                            partial(
+                                _launch_dummy_mhc_pre_big_fuse,
+                                key=key,
+                                info=info,
+                                m_value=m_value,
+                                num_splits=num_splits,
+                                device=device,
+                            ),
                             device=device,
-                        ),
-                        device=device,
-                    )
+                        )
                 else:
                     _run_tilelang_warmup_launch_with_retry(
                         "DSV4 mHC TileLangPre",
@@ -2504,6 +2253,8 @@ def _launch_dummy_mhc_prenorm_gemm(
 
     n_value, k_value = key
     x = torch.zeros((m_value, k_value), dtype=torch.bfloat16, device=device)
+    # This launcher warms the CUDA wrapper: it produces one plane per split.
+    # PPU HC units own their reduced-output producer and warmup separately.
     out = torch.empty(
         (num_splits, m_value, n_value), dtype=torch.float32, device=device
     )
@@ -2535,6 +2286,7 @@ def _launch_dummy_mhc_pre_big_fuse(
     hc_eps = float(info.get("hc_eps", 1.0e-6))
     sinkhorn_iters = int(info.get("hc_sinkhorn_iters", 20) or 20)
 
+    # Match the partial planes produced by the CUDA prenorm launcher above.
     gemm_out_mul = torch.zeros(
         (num_splits, m_value, n_value), dtype=torch.float32, device=device
     )
@@ -2568,7 +2320,7 @@ def _launch_dummy_mhc_pre_big_fuse(
         hc_eps,
         2.0,
         sinkhorn_iters,
-        n_splits=int(num_splits),
+        n_splits=num_splits,
         mhc_mult=mhc_mult,
     )(
         gemm_out_mul,
@@ -2579,6 +2331,7 @@ def _launch_dummy_mhc_pre_big_fuse(
         post_mix,
         comb_mix,
         layer_input,
+        layer_input.view(-1)[:0],
     )
     del (
         gemm_out_mul,

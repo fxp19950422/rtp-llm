@@ -14,7 +14,6 @@ import sys
 import types
 from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import patch
 
 import torch
 
@@ -265,14 +264,13 @@ def test_assemble_indexer_k_cp1_passthrough():
     local_s = torch.arange(10 * 2, dtype=torch.uint8).reshape(10, 2) + 100
     out_q = torch.zeros((10, 4), dtype=torch.uint8)
     out_s = torch.zeros((10, 2), dtype=torch.uint8)
-    with patch.object(A, "all_gather", side_effect=lambda local, group: local):
-        A.assemble_indexer_k(
-            plan=plan,
-            local_k_quant=local_q,
-            local_k_scale=local_s,
-            out_k_quant=out_q,
-            out_k_scale=out_s,
-        )
+    A.assemble_indexer_k(
+        plan=plan,
+        local_k_quant=local_q,
+        local_k_scale=local_s,
+        out_k_quant=out_q,
+        out_k_scale=out_s,
+    )
     assert torch.equal(out_q, local_q)
     assert torch.equal(out_s, local_s)
 

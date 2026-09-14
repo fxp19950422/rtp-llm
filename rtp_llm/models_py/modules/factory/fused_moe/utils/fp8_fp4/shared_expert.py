@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import os
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
 
 import torch
 import torch.nn as nn
@@ -29,31 +28,9 @@ from rtp_llm.models_py.modules.factory.fused_moe.utils.profiler import (
 from .expert import require_silu_mul_split
 from .quantized_linear import create_fp8_linear
 
-
-@dataclass(frozen=True)
-class _SharedExpertWorkspaceViews:
-    x_fp8: torch.Tensor
-    x_scale: torch.Tensor
-    gate_up_bf16: torch.Tensor
-    hidden_fp8: torch.Tensor
-    hidden_scale: torch.Tensor
-    out_bf16: torch.Tensor
-
-
-@dataclass
-class _SharedExpertWorkspace:
-    capacity: int
-    device: torch.device
-    x_fp8: torch.Tensor
-    x_scale_storage: torch.Tensor
-    gate_up_bf16: torch.Tensor
-    hidden_fp8: torch.Tensor
-    hidden_scale_storage: torch.Tensor
-    out_bf16: torch.Tensor
-    views: dict[int, _SharedExpertWorkspaceViews] = field(default_factory=dict)
-
-
-_SHARED_EXPERT_WORKSPACE_CACHE: dict[tuple, _SharedExpertWorkspace] = {}
+_SHARED_EXPERT_WORKSPACE_CACHE: dict[
+    tuple, dict[str, torch.Tensor | int | torch.device]
+] = {}
 _SHARED_EXPERT_STREAM_CACHE: dict[int, torch.cuda.Stream] = {}
 
 
@@ -130,6 +107,8 @@ class W13SharedExpert(nn.Module):
         inter_dim: int,
         expert_weights: dict[str, torch.Tensor],
         swiglu_limit: float = 0.0,
+        *,
+        linear_factory=None,
     ) -> None:
         super().__init__()
         w13_w = expert_weights["w13_w"]
@@ -141,8 +120,9 @@ class W13SharedExpert(nn.Module):
                 "shared w13 weight shape mismatch: "
                 f"got {tuple(w13_w.shape)}, expected {(2 * inter_dim, dim)}"
             )
-        self.w13 = create_fp8_linear(w13_w, w13_s)
-        self.w2 = create_fp8_linear(expert_weights["w2_w"], expert_weights["w2_s"])
+        factory = create_fp8_linear if linear_factory is None else linear_factory
+        self.w13 = factory(w13_w, w13_s)
+        self.w2 = factory(expert_weights["w2_w"], expert_weights["w2_s"])
         self.swiglu_limit = swiglu_limit
 
     def _apply_layer(self, layer: nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -192,10 +172,14 @@ class FusedSharedExpertFastPath:
         self.dim = dim
         self.inter_dim = inter_dim
         self.swiglu_limit = swiglu_limit
-        self._workspace: _SharedExpertWorkspace | None = None
-        self._prepared_shared_experts: nn.Module | None = None
-        self._w13_parts: tuple[torch.Tensor, torch.Tensor] | None = None
-        self._w2_parts: tuple[torch.Tensor, torch.Tensor] | None = None
+        self._device: torch.device | None = None
+        self._capacity = 0
+        self._x_fp8: torch.Tensor | None = None
+        self._x_scale_storage: torch.Tensor | None = None
+        self._gate_up_bf16: torch.Tensor | None = None
+        self._hidden_fp8: torch.Tensor | None = None
+        self._hidden_scale_storage: torch.Tensor | None = None
+        self._out_bf16: torch.Tensor | None = None
 
     @staticmethod
     def _linear_parts(linear: nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
@@ -206,10 +190,22 @@ class FusedSharedExpertFastPath:
         return weight, scale
 
     @staticmethod
+    def _has_linear_parts(linear: nn.Module) -> bool:
+        return isinstance(getattr(linear, "weight", None), torch.Tensor) and isinstance(
+            getattr(linear, "weight_scales", None), torch.Tensor
+        )
+
+    @staticmethod
     def can_run(shared_experts: nn.Module, x: torch.Tensor) -> bool:
         if not (x.is_cuda and x.dtype == torch.bfloat16 and x.dim() == 2):
             return False
-        return all(hasattr(shared_experts, name) for name in ("w13", "w2"))
+        return all(
+            hasattr(shared_experts, name)
+            and FusedSharedExpertFastPath._has_linear_parts(
+                getattr(shared_experts, name)
+            )
+            for name in ("w13", "w2")
+        )
 
     @classmethod
     def has_merged_w13(cls, shared_experts: nn.Module) -> bool:
@@ -233,20 +229,24 @@ class FusedSharedExpertFastPath:
     def prepare(self, shared_experts: nn.Module) -> None:
         """Validate the loader-prepared merged w13; no runtime concatenation."""
         if not hasattr(shared_experts, "w13"):
-            raise RuntimeError("shared expert requires loader-prepared w13")
+            raise RuntimeError("DSV4 shared expert requires loader-prepared w13")
+        # Platform linears such as M890P PpuFp8Linear own their quantization
+        # and GEMM ABI and expose ``weight_scale`` rather than the CUDA
+        # factory's packed ``weight_scales``.  They must use Expert.forward,
+        # not this CUDA/Triton fused workspace path.
+        if not all(
+            hasattr(shared_experts, name)
+            and self._has_linear_parts(getattr(shared_experts, name))
+            for name in ("w13", "w2")
+        ):
+            return
         w13_w, w13_s = self._linear_parts(shared_experts.w13)
-        w2_w, w2_s = self._linear_parts(shared_experts.w2)
         if w13_w.dim() != 2:
             raise RuntimeError(f"shared w13 weight must be 2D, got {w13_w.dim()}D")
         if w13_s.dim() != 2:
             raise RuntimeError(f"shared w13 scale must be 2D, got {w13_s.dim()}D")
         if w13_w.shape[0] % 2 != 0:
             raise RuntimeError(f"shared w13 rows must be even, got {w13_w.shape[0]}")
-        inferred_inter_dim = int(w13_w.shape[0]) // 2
-        self.inter_dim = inferred_inter_dim
-        self._prepared_shared_experts = shared_experts
-        self._w13_parts = (w13_w, w13_s)
-        self._w2_parts = (w2_w, w2_s)
 
     @staticmethod
     def _tma_aligned_rows(rows: int, element_size: int) -> int:
@@ -281,7 +281,7 @@ class FusedSharedExpertFastPath:
             (1, aligned_tokens),
         )
 
-    def _ensure_workspace(self, x: torch.Tensor) -> _SharedExpertWorkspace:
+    def _ensure_workspace(self, x: torch.Tensor) -> None:
         T, D = x.shape
         if self.dim is None:
             self.dim = D
@@ -289,96 +289,74 @@ class FusedSharedExpertFastPath:
             raise RuntimeError(
                 f"shared expert dim mismatch: got {D}, expected {self.dim}"
             )
+        if self.inter_dim is None:
+            w13, _ = self._linear_parts(self._shared.w13)  # type: ignore[attr-defined]
+            self.inter_dim = w13.shape[0] // 2
         inter = self.inter_dim
         assert inter is not None
         capacity = max(T, self.max_tokens_per_rank or 0, 1)
-        workspace = self._workspace
         if (
-            workspace is not None
-            and workspace.device == x.device
-            and workspace.capacity >= capacity
-            and workspace.hidden_fp8.size(1) == inter
+            self._device == x.device
+            and self._capacity >= capacity
+            and self._x_fp8 is not None
         ):
-            return workspace
+            return
         if D % 128 != 0 or inter % 128 != 0:
             raise RuntimeError(
                 f"shared expert fused path requires D/inter divisible by 128, got {D}/{inter}"
             )
         key = (x.device, D, inter)
-        workspace = _SHARED_EXPERT_WORKSPACE_CACHE.get(key)
-        if workspace is not None and workspace.capacity >= capacity:
-            self._workspace = workspace
-            return workspace
-
-        x_fp8 = torch.empty(
+        cached = _SHARED_EXPERT_WORKSPACE_CACHE.get(key)
+        if cached is not None and int(cached["capacity"]) >= capacity:
+            self._device = x.device
+            self._capacity = int(cached["capacity"])
+            self._x_fp8 = cached["x_fp8"]  # type: ignore[assignment]
+            self._x_scale_storage = cached["x_scale_storage"]  # type: ignore[assignment]
+            self._gate_up_bf16 = cached["gate_up_bf16"]  # type: ignore[assignment]
+            self._hidden_fp8 = cached["hidden_fp8"]  # type: ignore[assignment]
+            self._hidden_scale_storage = cached["hidden_scale_storage"]  # type: ignore[assignment]
+            self._out_bf16 = cached["out_bf16"]  # type: ignore[assignment]
+            return
+        self._device = x.device
+        self._capacity = capacity
+        self._x_fp8 = torch.empty(
             (capacity, D),
             dtype=torch.float8_e4m3fn,
             device=x.device,
         )
-        x_scale_storage = self._scale_storage((D // 128 + 3) // 4, capacity, x.device)
-        gate_up_bf16 = torch.empty(
+        self._x_scale_storage = self._scale_storage(
+            (D // 128 + 3) // 4, capacity, x.device
+        )
+        self._gate_up_bf16 = torch.empty(
             (capacity, 2 * inter),
             dtype=torch.bfloat16,
             device=x.device,
         )
-        hidden_fp8 = torch.empty(
+        self._hidden_fp8 = torch.empty(
             (capacity, inter),
             dtype=torch.float8_e4m3fn,
             device=x.device,
         )
-        hidden_scale_storage = self._scale_storage(
+        self._hidden_scale_storage = self._scale_storage(
             (inter // 128 + 3) // 4,
             capacity,
             x.device,
         )
-        out_bf16 = torch.empty(
+        self._out_bf16 = torch.empty(
             (capacity, D),
             dtype=torch.bfloat16,
             device=x.device,
         )
-        # Replace the cache entry as one versioned unit. Executors or captured
-        # graphs that still reference the prior workspace keep its buffers
-        # alive; each executor adopts this version when it next needs capacity.
-        workspace = _SharedExpertWorkspace(
-            capacity=capacity,
-            device=x.device,
-            x_fp8=x_fp8,
-            x_scale_storage=x_scale_storage,
-            gate_up_bf16=gate_up_bf16,
-            hidden_fp8=hidden_fp8,
-            hidden_scale_storage=hidden_scale_storage,
-            out_bf16=out_bf16,
-        )
-        _SHARED_EXPERT_WORKSPACE_CACHE[key] = workspace
-        self._workspace = workspace
-        return workspace
-
-    def _workspace_views(
-        self,
-        workspace: _SharedExpertWorkspace,
-        tokens: int,
-    ) -> _SharedExpertWorkspaceViews:
-        cached = workspace.views.get(tokens)
-        if cached is not None:
-            return cached
-        if tokens < 0 or tokens > workspace.capacity:
-            raise RuntimeError(
-                f"shared expert workspace tokens={tokens} exceed capacity={workspace.capacity}"
-            )
-        # All MoE layers in one forward use the same token count. Keep only
-        # that shape so variable-length traffic cannot accumulate view objects
-        # for every historical T over the process lifetime.
-        workspace.views.clear()
-        cached = _SharedExpertWorkspaceViews(
-            x_fp8=workspace.x_fp8[:tokens],
-            x_scale=self._scale_view(workspace.x_scale_storage, tokens),
-            gate_up_bf16=workspace.gate_up_bf16[:tokens],
-            hidden_fp8=workspace.hidden_fp8[:tokens],
-            hidden_scale=self._scale_view(workspace.hidden_scale_storage, tokens),
-            out_bf16=workspace.out_bf16[:tokens],
-        )
-        workspace.views[tokens] = cached
-        return cached
+        _SHARED_EXPERT_WORKSPACE_CACHE[key] = {
+            "capacity": capacity,
+            "device": x.device,
+            "x_fp8": self._x_fp8,
+            "x_scale_storage": self._x_scale_storage,
+            "gate_up_bf16": self._gate_up_bf16,
+            "hidden_fp8": self._hidden_fp8,
+            "hidden_scale_storage": self._hidden_scale_storage,
+            "out_bf16": self._out_bf16,
+        }
 
     def run(self, shared_experts: nn.Module, x: torch.Tensor) -> torch.Tensor:
         if not self.can_run(shared_experts, x):
@@ -386,24 +364,24 @@ class FusedSharedExpertFastPath:
                 "fused shared expert requires CUDA bf16 2D input and FP8 "
                 "loader-merged shared w13/w2 weights"
             )
-        return self._run_prepared(shared_experts, x)
-
-    def _run_prepared(self, shared_experts: nn.Module, x: torch.Tensor) -> torch.Tensor:
-        if self._prepared_shared_experts is not shared_experts:
-            self.prepare(shared_experts)
-        w13_parts = self._w13_parts
-        w2_parts = self._w2_parts
-        assert w13_parts is not None and w2_parts is not None
-        workspace = self._ensure_workspace(x)
+        self._shared = shared_experts
+        self._ensure_workspace(x)
         T = x.size(0)
+        assert self._x_fp8 is not None
+        assert self._x_scale_storage is not None
+        assert self._gate_up_bf16 is not None
+        assert self._hidden_fp8 is not None
+        assert self._hidden_scale_storage is not None
+        assert self._out_bf16 is not None
+        if not self.has_merged_w13(shared_experts):
+            raise RuntimeError("fused shared expert requires loader-prepared w13")
 
-        views = self._workspace_views(workspace, T)
-        x_fp8 = views.x_fp8
-        x_scale = views.x_scale
-        gate_up = views.gate_up_bf16
-        hidden_fp8 = views.hidden_fp8
-        hidden_scale = views.hidden_scale
-        out = views.out_bf16
+        x_fp8 = self._x_fp8[:T]
+        x_scale = self._scale_view(self._x_scale_storage, T)
+        gate_up = self._gate_up_bf16[:T]
+        hidden_fp8 = self._hidden_fp8[:T]
+        hidden_scale = self._scale_view(self._hidden_scale_storage, T)
+        out = self._out_bf16[:T]
         if T == 0:
             return out
 
@@ -416,12 +394,9 @@ class FusedSharedExpertFastPath:
         )
 
         quant_bf16_fp8_packed_ue8m0(x, x_fp8, x_scale, group_size=128, eps=1.0e-4)
-        fp8_gemm_nt(
-            (x_fp8, x_scale),
-            w13_parts,
-            gate_up,
-            disable_ue8m0_cast=False,
-        )
+        w13 = self._linear_parts(shared_experts.w13)
+        w2 = self._linear_parts(shared_experts.w2)
+        fp8_gemm_nt((x_fp8, x_scale), w13, gate_up, disable_ue8m0_cast=False)
         silu_mul_fp8_quant_packed(
             gate_up,
             clamp_limit=self.swiglu_limit,
@@ -429,12 +404,7 @@ class FusedSharedExpertFastPath:
             output_q=hidden_fp8,
             output_scale=hidden_scale,
         )
-        fp8_gemm_nt(
-            (hidden_fp8, hidden_scale),
-            w2_parts,
-            out,
-            disable_ue8m0_cast=False,
-        )
+        fp8_gemm_nt((hidden_fp8, hidden_scale), w2, out, disable_ue8m0_cast=False)
         return out
 
 
@@ -444,6 +414,8 @@ class FusedSharedExpertExecutor(FusedSharedExpertFastPath):
 
 class SharedExpertExecutor(ABC):
     name: str
+    # The executor must fence the input producer and join its output consumer.
+    start_before_routing = False
 
     def prepare(self, shared_experts: nn.Module) -> None:
         return None
@@ -507,18 +479,16 @@ class OverlapSharedExpertExecutor(SharedExpertExecutor):
     def _can_overlap(self, x: torch.Tensor) -> bool:
         if not (x.is_cuda and torch.cuda.is_available()):
             return False
-        threshold = int(
-            os.environ.get("MOE_SHARED_EXPERT_STREAM_TOKEN_THRESHOLD", "4096")
-        )
-        if x.shape[0] > threshold:
-            return False
         if torch.cuda.is_current_stream_capturing():
             return False
         if cuda_graph_warmup_forward_enabled():
             return False
         if os.environ.get("MOEDBG", "0") != "0":
             return False
-        return True
+        threshold = int(
+            os.environ.get("MOE_SHARED_EXPERT_STREAM_TOKEN_THRESHOLD", "4096")
+        )
+        return x.shape[0] <= threshold
 
     def start(self, shared_experts: nn.Module, x: torch.Tensor) -> None:
         if not self._can_overlap(x):
@@ -569,7 +539,7 @@ def _run_shared_expert(
 ) -> torch.Tensor:
     if fast_path is not None and fast_path.can_run(shared_experts, x):
         try:
-            return fast_path._run_prepared(shared_experts, x)
+            return fast_path.run(shared_experts, x)
         except Exception:
             if strict_fused_moe_enabled():
                 raise
@@ -578,7 +548,11 @@ def _run_shared_expert(
             "MOE_STRICT_FUSED=1 forbids the generic Expert.forward "
             "shared-expert fallback"
         )
-    return shared_experts(x).float()
+    shared = shared_experts(x)
+    if getattr(shared_experts, "preserve_output_dtype", False):
+        # fused_moe_epilogue converts BF16 to FP32 in registers before adding.
+        return shared
+    return shared.float()
 
 
 def get_shared_expert_executor(

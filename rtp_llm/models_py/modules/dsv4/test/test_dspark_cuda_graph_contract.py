@@ -15,9 +15,9 @@ def _dspark_harness(gamma: int = 5) -> DeepSeekV4DSparkModel:
     model._gen_num_per_cycle = gamma
     model._dspark_commit_cp_enabled = False
     model._dspark_kv_cache_sharded = False
-    model.kv_cache = None
     model.tp_size = 2
     model.tp_rank = 0
+    model.kv_cache = None
     model._v4_args = type(
         "Args", (), {"window_size": 128, "dim": 8, "vocab_size": 17}
     )()

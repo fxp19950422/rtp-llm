@@ -5,6 +5,16 @@ def clean_dep(dep):
 
 def http_deps():
     http_archive(
+        name = "torch_2.9_py310_ppu",
+        sha256 = "f58af1af2f7bfba035b66a14e1ae75fdc21d5c03ee7ac0b4c842a1088d06b0e0",
+        urls = [
+            "https://rtp-maga.oss-cn-zhangjiakou.aliyuncs.com/ppu_sdk/v2.1.0_cu130/torch-2.9.0%2Bv0.1.0.ppu2.1.0.oe-cp310-cp310-linux_x86_64.whl",
+        ],
+        type = "zip",
+        build_file = clean_dep("@rtp_llm//:BUILD.pytorch"),
+    )
+
+    http_archive(
         name = "rules_pkg",
         urls = [
             "https://mirror.bazel.build/github.com/bazelbuild/rules_pkg/releases/download/0.6.0/rules_pkg-0.6.0.tar.gz",
@@ -81,8 +91,6 @@ def http_deps():
 
     http_archive(
         name = "aiter",
-        patches = ["@rtp_llm//patches/aiter:0001-gdr-decode-zero-padding.patch"],
-        patch_args = ["-p1"],
         sha256 = "b6bce60a81cbc2de6eda78c3f75506337cec921e62224d0d2a5e0475a2aba9a1",
         urls = [
             "https://sinian-metrics-platform.oss-cn-hangzhou.aliyuncs.com/kis/AMD/aiter/aiter-0.1.21.dev80%2Bg987203ba5.d20260825-cp310-cp310-linux_x86_64.whl",
