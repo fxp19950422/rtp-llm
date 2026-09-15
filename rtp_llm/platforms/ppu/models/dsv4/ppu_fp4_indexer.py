@@ -57,27 +57,39 @@ class PpuFP4Compressor(CompressorFP8):
         ):
             raise ValueError("FP4 compressor requires the fused KV/score projection")
         fused = kv_flat.as_strided((n, 512), (512, 1))
-        c, w, slots = build_plans(
-            meta,
-            self._state_block_table,
-            self._state_eb,
-            self._state_tokens_per_block,
-            seq_start,
-        )
-        with record_function_range("dsv4.ppu.fp4.indexer.compress"):
-            compressed = compress4(self._state_pool_3d, fused, self.ape, c, w)
+        # PlanC packs ragged_id into 16 bits. Retain eight preceding raw
+        # rows at each boundary so compression reads the same causal window;
+        # overlap rows must not write cache or ring state a second time.
+        step = 65528 if n > 65536 else max(n, 1)
         freqs = torch.view_as_real(self.freqs_cis).flatten(-2)
-        with record_function_range("dsv4.ppu.fp4.indexer.norm_rope_store"):
-            norm_rope_store(
-                compressed,
-                c,
-                self.norm.weight,
-                self.norm_eps,
-                freqs,
-                slots,
-                self._kv_pool_view,
-                self._kv_eb,
+        for emit_start in range(0, n, step):
+            row_start = max(0, emit_start - 8)
+            row_end = min(n, emit_start + step)
+            c, w, slots = build_plans(
+                meta,
+                self._state_block_table,
+                self._state_eb,
+                self._state_tokens_per_block,
+                seq_start,
+                row_start=row_start,
+                row_end=row_end,
+                skip_rows=emit_start - row_start,
             )
+            with record_function_range("dsv4.ppu.fp4.indexer.compress"):
+                compressed = compress4(
+                    self._state_pool_3d, fused[row_start:row_end], self.ape, c, w
+                )
+            with record_function_range("dsv4.ppu.fp4.indexer.norm_rope_store"):
+                norm_rope_store(
+                    compressed,
+                    c,
+                    self.norm.weight,
+                    self.norm_eps,
+                    freqs,
+                    slots,
+                    self._kv_pool_view,
+                    self._kv_eb,
+                )
 
     def forward_decode_vectorized(self, x, start_pos, meta=None, position_ids=None):
         if x.ndim != 3 or x.shape[1] != 1:

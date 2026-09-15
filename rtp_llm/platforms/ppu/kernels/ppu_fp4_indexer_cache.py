@@ -23,6 +23,7 @@ def _plans(
     STATE_ENTRIES: tl.constexpr,
     VARLEN: tl.constexpr,
     SEQ_START: tl.constexpr,
+    SKIP_ROWS: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -34,7 +35,8 @@ def _plans(
     else:
         start = tl.full((BLOCK,), SEQ_START, tl.int32)
     seq_len = pos + 1
-    valid = live & (seq_len % 4 == 0)
+    emit = live & (i >= SKIP_ROWS)
+    valid = emit & (seq_len % 4 == 0)
     slots = tl.load(KV_SLOTS + i, live, -1).to(tl.int32)
     valid = valid & (slots >= 0)
     buffer_len = tl.minimum(tl.maximum(start - (seq_len - 8), 0), 8)
@@ -50,13 +52,29 @@ def _plans(
     tl.store(C + i * 4, tl.where(valid, seq_len, -1), live)
     tl.store(C + i * 4 + 1, i | (buffer_len << 16), live)
     state_slot = tl.load(STATE_SLOTS + i, live, -1).to(tl.int32)
-    tl.store(W + i * 2, tl.where(state_slot >= 0, i, -1), live)
+    tl.store(W + i * 2, tl.where(emit & (state_slot >= 0), i, -1), live)
     tl.store(W + i * 2 + 1, state_slot, live)
-    tl.store(OUT + i, slots, live)
+    tl.store(OUT + i, tl.where(emit, slots, -1), live)
 
 
-def build_plans(meta, state_bt, state_entries, state_tokens, seq_start):
-    n = meta.positions.numel()
+def build_plans(
+    meta,
+    state_bt,
+    state_entries,
+    state_tokens,
+    seq_start,
+    *,
+    row_start=0,
+    row_end=None,
+    skip_rows=0,
+):
+    total = meta.positions.numel()
+    row_end = total if row_end is None else row_end
+    if not (0 <= row_start <= row_end <= total):
+        raise ValueError("Invalid FP4 C4 plan row range")
+    n = row_end - row_start
+    if not (0 <= skip_rows <= min(8, n)):
+        raise ValueError("FP4 C4 overlap must contain at most 8 rows")
     if (
         n > 65536
         or state_entries not in (8, 12)
@@ -74,11 +92,11 @@ def build_plans(meta, state_bt, state_entries, state_tokens, seq_start):
     slots = torch.empty((n,), dtype=torch.int32, device=meta.positions.device)
     if n:
         _plans[(triton.cdiv(n, 128),)](
-            meta.positions,
-            meta.b_idx,
+            meta.positions[row_start:row_end],
+            meta.b_idx[row_start:row_end],
             meta.seq_start_per_req if varlen else meta.positions,
-            meta.state_slots,
-            meta.kv_slots,
+            meta.state_slots[row_start:row_end],
+            meta.kv_slots[row_start:row_end],
             state_bt,
             c,
             w,
@@ -90,6 +108,7 @@ def build_plans(meta, state_bt, state_entries, state_tokens, seq_start):
             state_entries,
             varlen,
             int(seq_start or 0),
+            skip_rows,
             128,
         )
     return c.view(torch.uint8), w.view(torch.uint8), slots
