@@ -581,6 +581,8 @@ class Block(nn.Module):
                 block_tables_by_type=block_tables_by_type,
             )
         x = attn_hc_post(attn_out, residual, post, comb)
+        # Release the consumed activation before allocating the FFN HC-pre result.
+        del attn_out, x_pre, post, comb
         self._sync_after_first_cp_prefill_attention()
 
         residual = x

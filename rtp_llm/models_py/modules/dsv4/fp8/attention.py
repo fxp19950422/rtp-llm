@@ -823,6 +823,7 @@ class PrefillMeta(NamedTuple):
     # by ``build_and_propagate_prefill_meta_fp8`` from the forward's local
     # ``PrefillWorkspace``; non-None for every production prefill call.
     workspace: Optional[PrefillWorkspace] = None
+    reusable_output: Optional[torch.Tensor] = None
 
 
 class PrefillQKV(NamedTuple):
@@ -2742,6 +2743,15 @@ class AttentionFP8(nn.Module):
         """
         with record_function_range("dsv4.fp8.attn.prefill.common_setup"):
             common = self._prefill_common_setup(x, positions)
+            # The fast HC caller owns a disposable normalized activation.
+            # Reuse it only after Q/K and every compressor have consumed it.
+            if (
+                os.environ.get("DSV4_PREFILL_REUSE_ATTN_INPUT", "0") == "1"
+                and x.shape[0] > 32768
+                and not common.cp_on
+                and not torch.is_grad_enabled()
+            ):
+                common = common._replace(reusable_output=x)
         with record_function_range("dsv4.fp8.attn.prefill.compute_qkv"):
             qkv = self._prefill_compute_qkv(
                 x, common, shared_input_quant=shared_input_quant
@@ -3388,12 +3398,14 @@ class AttentionFP8(nn.Module):
             # stream, so moving pure CPU/view/allocation work here lets it run
             # while the GPU drains the pre-combine dependency chain.
             kv_view = workspace.view(B * wm.M, 1, D)
-            projected_out = torch.empty(
-                qkv.q.shape[0],
-                self.dim,
-                dtype=torch.bfloat16,
-                device=qkv.q.device,
-            )
+            projected_out = common.reusable_output
+            if projected_out is None:
+                projected_out = torch.empty(
+                    qkv.q.shape[0],
+                    self.dim,
+                    dtype=torch.bfloat16,
+                    device=qkv.q.device,
+                )
 
             if common.cp_on:
                 # Phase F2/Phase-2: kernel ``combine_topk_swa_indices`` derives
@@ -5474,6 +5486,7 @@ class AttentionFP8(nn.Module):
             freqs_cis=common.freqs_cis,
             prefill_workspace=common.workspace,
             profile_name="dsv4.fp8.attn.swa.flash_mla_kv_full",
+            out=common.reusable_output,
         )
         # kv_full has no remaining consumer after all attention chunks drain.
         dispose_tensor(qkv.kv_full)
@@ -5590,6 +5603,7 @@ class AttentionFP8(nn.Module):
             freqs_cis=common.freqs_cis,
             prefill_workspace=common.workspace,
             profile_name="dsv4.fp8.attn.swa_concat.flash_mla",
+            out=common.reusable_output,
         )
 
     # ------------------------------------------------------------------

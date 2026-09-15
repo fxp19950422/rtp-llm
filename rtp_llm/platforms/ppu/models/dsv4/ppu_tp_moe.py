@@ -1,6 +1,7 @@
 """PPU TP4 MoE: local shared/routed compute followed by one BF16 reduction."""
 
 import logging
+import os
 from functools import partial
 
 import torch
@@ -171,7 +172,14 @@ class PpuTPMoE(nn.Module):
         if flat.shape[0] <= self.max_tokens_per_rank:
             return self._forward_local_chunk(flat, ids).view(shape)
         # One per-call result; never reuse another layer/model's global buffer.
-        out = torch.empty_like(flat)
+        reuse_input = (
+            os.environ.get("DSV4_PREFILL_REUSE_MOE_INPUT", "0") == "1"
+            and flat.shape[0] > 32768
+            and not torch.is_grad_enabled()
+        )
+        # Each chunk is fully consumed, including TP reduction, before its
+        # result replaces the disposable normalized input from the HC caller.
+        out = flat if reuse_input else torch.empty_like(flat)
         for start in range(0, flat.shape[0], self.max_tokens_per_rank):
             end = min(start + self.max_tokens_per_rank, flat.shape[0])
             out[start:end].copy_(

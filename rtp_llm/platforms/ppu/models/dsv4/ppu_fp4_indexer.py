@@ -161,13 +161,17 @@ class PpuFP4Indexer(IndexerFP8):
             return torch.empty((*x.shape[:-1], 0), device=x.device, dtype=torch.int32)
         self.compressor.freqs_cis = self.freqs_cis
         self._propagate_pool_to_nested()
+        stream_queries = meta.M > 32768
         try:
-            with record_function_range("dsv4.ppu.fp4.indexer.q_projection"):
-                q = (
-                    self._compute_indexer_q(qr, meta.freqs_cis_slice, apply_rope=False)
-                    .reshape(meta.M, self.n_heads, 128)
-                    .contiguous()
-                )
+            if not stream_queries:
+                with record_function_range("dsv4.ppu.fp4.indexer.q_projection"):
+                    q = (
+                        self._compute_indexer_q(
+                            qr, meta.freqs_cis_slice, apply_rope=False
+                        )
+                        .reshape(meta.M, self.n_heads, 128)
+                        .contiguous()
+                    )
             self.compressor(
                 x, meta.sp_int, meta=meta.compressor_meta, workspace=workspace
             )
@@ -175,15 +179,16 @@ class PpuFP4Indexer(IndexerFP8):
                 return torch.empty(
                     (*x.shape[:-1], 0), device=x.device, dtype=torch.int32
                 )
-            with record_function_range("dsv4.ppu.fp4.indexer.weights_quant_q"):
-                weights = F.linear(x.reshape(meta.M, -1), self.weights_proj)
-                q, qs, weights = quantize_q(
-                    q,
-                    weights,
-                    self.weight_scale,
-                    torch.view_as_real(self.freqs_cis).flatten(-2),
-                    meta.compressor_meta.positions,
-                )
+            if not stream_queries:
+                with record_function_range("dsv4.ppu.fp4.indexer.weights_quant_q"):
+                    weights = F.linear(x.reshape(meta.M, -1), self.weights_proj)
+                    q, qs, weights = quantize_q(
+                        q,
+                        weights,
+                        self.weight_scale,
+                        torch.view_as_real(self.freqs_cis).flatten(-2),
+                        meta.compressor_meta.positions,
+                    )
             with record_function_range("dsv4.ppu.fp4.indexer.gather_k"):
                 k, ks = gather_k(
                     self._kv_pool_view,
@@ -198,11 +203,34 @@ class PpuFP4Indexer(IndexerFP8):
             chunk = self._prefill_score_chunk_rows or meta.M
             for start in range(0, meta.M, chunk):
                 end = min(meta.M, start + chunk)
+                if stream_queries:
+                    with record_function_range("dsv4.ppu.fp4.indexer.q_projection"):
+                        q = (
+                            self._compute_indexer_q(
+                                qr[start:end], None, apply_rope=False
+                            )
+                            .reshape(end - start, self.n_heads, 128)
+                            .contiguous()
+                        )
+                    with record_function_range("dsv4.ppu.fp4.indexer.weights_quant_q"):
+                        weights = F.linear(
+                            x.reshape(meta.M, -1)[start:end], self.weights_proj
+                        )
+                        q, qs, weights = quantize_q(
+                            q,
+                            weights,
+                            self.weight_scale,
+                            torch.view_as_real(self.freqs_cis).flatten(-2),
+                            meta.compressor_meta.positions[start:end],
+                        )
+                q_chunk = q if stream_queries else q[start:end]
+                qs_chunk = qs if stream_queries else qs[start:end]
+                weights_chunk = weights if stream_queries else weights[start:end]
                 with record_function_range("dsv4.ppu.fp4.indexer.score"):
                     logits = self._score(
-                        (q[start:end], qs[start:end]),
+                        (q_chunk, qs_chunk),
                         (k, ks),
-                        weights[start:end],
+                        weights_chunk,
                         meta.ks[start:end],
                         meta.ke[start:end],
                         clean_logits=False,
@@ -216,9 +244,9 @@ class PpuFP4Indexer(IndexerFP8):
                     and _rt.should_record_layer(int(label[1:3]))
                 ):
                     for suffix, tensor in (
-                        ("q", q[start:end]),
-                        ("q_scale", qs[start:end]),
-                        ("w", weights[start:end]),
+                        ("q", q_chunk),
+                        ("q_scale", qs_chunk),
+                        ("w", weights_chunk),
                         ("k", k),
                         ("k_scale", ks),
                         ("ks", meta.ks[start:end]),
@@ -234,7 +262,9 @@ class PpuFP4Indexer(IndexerFP8):
                     topk_bf16(
                         logits, meta.ks[start:end], meta.ke[start:end], out[start:end]
                     )
-                del logits
+                del logits, q_chunk, qs_chunk, weights_chunk
+                if stream_queries:
+                    del q, qs, weights
             return out.view(*x.shape[:-1], self.index_topk)
         finally:
             self._clear_nested_pool()
