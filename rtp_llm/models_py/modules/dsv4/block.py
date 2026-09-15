@@ -39,6 +39,19 @@ def _prefill_fast_norm(
     tp_size: int = 1,
     tp_rank: int = 0,
 ) -> torch.Tensor:
+    chunk_rows = int(os.environ.get("DSV4_PREFILL_NORM_CHUNK_TOKENS", "0"))
+    if chunk_rows < 0:
+        raise ValueError("DSV4_PREFILL_NORM_CHUNK_TOKENS must be nonnegative")
+    if chunk_rows and x.shape[0] > chunk_rows:
+        # HC pre produces a disposable activation. Normalize independent token
+        # rows in bounded scratch, then reuse that activation as the result.
+        # Preserve TP reductions for hidden-sharded layouts.
+        for lo in range(0, x.shape[0], chunk_rows):
+            chunk = x[lo : lo + chunk_rows]
+            output = tp_rms_norm(norm, chunk, tp_size=tp_size, tp_rank=tp_rank)
+            chunk.copy_(output)
+            del output
+        return x
     if tp_size > 1:
         return tp_rms_norm(norm, x, tp_size=tp_size, tp_rank=tp_rank)
     if (

@@ -155,11 +155,24 @@ def topk_decode(scores, lengths, out):
 def topk_bf16(scores, starts, ends, out):
     if scores.dtype != torch.bfloat16 or scores.shape[1] >= 2**31:
         raise ValueError("BF16 TopK requires BF16 scores with fewer than 2**31 columns")
-    # Both frozen SG and this port fail in the PPU >16K two-pass kernel.
+    # The PPU BF16 two-pass kernel is not qualified above 16K columns.
+    # Widening BF16 scores to FP32 is exact. Reuse the existing FP32 selector
+    # over bounded row batches instead of changing scores or candidate ranges.
     if scores.shape[1] > 16384:
-        raise ValueError(
-            "PPU SG BF16 TopK above 16384 candidate columns is not qualified"
-        )
+        from rtp_llm.platforms.ppu.kernels.cuda.ppu_sglang_topk import topk_prefill
+
+        if out.shape[1] != 512:
+            raise ValueError("Long PPU BF16 TopK requires K=512")
+        row_batch = max(1, (256 * 1024 * 1024) // (4 * scores.shape[1]))
+        for begin in range(0, scores.shape[0], row_batch):
+            end = min(scores.shape[0], begin + row_batch)
+            topk_prefill(
+                scores[begin:end].float(),
+                starts[begin:end],
+                ends[begin:end],
+                out[begin:end],
+            )
+        return out
     if not scores.shape[0]:
         return out
     pages = _identity_page(scores.device).expand(scores.shape[0], 1)
