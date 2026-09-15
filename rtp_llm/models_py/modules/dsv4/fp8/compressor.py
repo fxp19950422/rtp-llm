@@ -37,6 +37,7 @@ import weakref
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
+import os
 import torch
 import torch.nn as nn
 from rtp_llm.models_py.distributed.collective_torch import Group, all_gather
@@ -54,7 +55,11 @@ def _default_bf16_fp32_linear(activation, linear_weight):
 
 
 def _linear_bf16_bf16_fp32(
-    x: torch.Tensor, weight: torch.Tensor, *, linear_op=_default_bf16_fp32_linear
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    linear_op=_default_bf16_fp32_linear,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """F.linear(x, weight) with BF16 operands and FP32 accumulation/output."""
     assert x.dtype == torch.bfloat16, f"expected BF16 input, got {x.dtype}"
@@ -63,7 +68,9 @@ def _linear_bf16_bf16_fp32(
     assert weight.is_contiguous(), "expected contiguous weight"
     leading_shape = x.shape[:-1]
     x_2d = x.reshape(-1, x.shape[-1])
-    out_2d = linear_op(x_2d, weight)
+    out_2d = (
+        linear_op(x_2d, weight) if out is None else linear_op(x_2d, weight, out=out)
+    )
     expected_shape = (int(x_2d.shape[0]), int(weight.shape[0]))
     if out_2d.dtype != torch.float32 or tuple(out_2d.shape) != expected_shape:
         raise RuntimeError(
@@ -1201,11 +1208,33 @@ class CompressorFP8(PoolBackedModule):
         device = x.device
         out_dim = (1 + self.overlap) * self.head_dim
         with record_function_range("dsv4.fp8.compressor.prefill.fused_linear"):
-            fused_out = _linear_bf16_bf16_fp32(
-                x, self._wkv_wgate_fused, linear_op=self._bf16_fp32_linear
-            )
             N = bsz * seqlen
-            fused_flat = fused_out.reshape(N, -1)
+            reuse_workspace = (
+                os.environ.get("DSV4_PREFILL_REUSE_COMPRESSOR_WORKSPACE", "0") == "1"
+                and N > 32768
+                and (self._cp_ctx is None or self._cp_ctx.cp_size == 1)
+                and workspace is not None
+            )
+            if reuse_workspace:
+                # Q is materialized only after both compressors finish. The
+                # non-CP path may use its union storage for this projection.
+                scratch = workspace.prefill_q(N).view(torch.float32).reshape(-1)
+                columns = self._wkv_wgate_fused.shape[0]
+                assert (
+                    scratch.numel() >= N * columns
+                ), "compressor union workspace too small"
+                fused_flat = scratch[: N * columns].view(N, columns)
+                _linear_bf16_bf16_fp32(
+                    x,
+                    self._wkv_wgate_fused,
+                    linear_op=self._bf16_fp32_linear,
+                    out=fused_flat,
+                )
+            else:
+                fused_out = _linear_bf16_bf16_fp32(
+                    x, self._wkv_wgate_fused, linear_op=self._bf16_fp32_linear
+                )
+                fused_flat = fused_out.reshape(N, -1)
 
         cp_ctx = self._cp_ctx
         cp_gather = cp_should_gather(cp_ctx, start_pos)

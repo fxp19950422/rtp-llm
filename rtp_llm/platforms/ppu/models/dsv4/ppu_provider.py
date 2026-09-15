@@ -253,7 +253,7 @@ class M890PDsv4Provider:
         else:
             x = kwargs["x"]
             weight = kwargs["weight"]
-        return torch.mm(x, weight.t(), out_dtype=torch.float32)
+        return torch.mm(x, weight.t(), out_dtype=torch.float32, out=kwargs.get("out"))
 
     def run_fp8_mqa_logits(
         self, default_factory: Callable[..., Any], *args: Any, **kwargs: Any
