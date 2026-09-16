@@ -140,7 +140,15 @@ public:
         baseline_free_bytes_ = getGpuExecStatus().device_memory_status.free_bytes;
         const auto stats    = c10::cuda::CUDACachingAllocator::getDeviceStats(device_);
         baseline_allocated_ = stats.allocated_bytes[0].current;
+        baseline_active_    = stats.active_bytes[0].current;
         baseline_reserved_  = stats.reserved_bytes[0].current;
+        c10::cuda::CUDACachingAllocator::resetPeakStats(device_);
+    }
+
+    void resetPeakStats() {
+        at::cuda::CUDAGuard device_guard(device_);
+        // Keep the pre-executor baseline: live executor buffers still need a runtime
+        // reservation. Only discard peaks from initialization and the cold shape pass.
         c10::cuda::CUDACachingAllocator::resetPeakStats(device_);
     }
 
@@ -152,10 +160,23 @@ public:
         const auto positive_delta = [](int64_t peak, int64_t baseline) -> size_t {
             return peak > baseline ? static_cast<size_t>(peak - baseline) : 0;
         };
-        const size_t driver_consumed = baseline_free_bytes_ - std::min(baseline_free_bytes_, current_free_bytes);
+        const int64_t driver_delta = static_cast<int64_t>(baseline_free_bytes_)
+                                     - static_cast<int64_t>(current_free_bytes);
+        const int64_t allocator_delta = stats.reserved_bytes[0].current - baseline_reserved_;
+        const size_t non_allocator_consumed = positive_delta(driver_delta, allocator_delta);
         const size_t allocated_peak = positive_delta(stats.allocated_bytes[0].peak, baseline_allocated_);
-        const size_t reserved_peak  = positive_delta(stats.reserved_bytes[0].peak, baseline_reserved_);
-        return std::max({driver_consumed, allocated_peak, reserved_peak});
+        // active_bytes also covers blocks awaiting asynchronous frees. Inactive cached
+        // segments can be released before KV allocation and must not become a permanent
+        // runtime reservation, even if growing chunk shapes accumulate them on every pass.
+        const size_t active_peak   = positive_delta(stats.active_bytes[0].peak, baseline_active_);
+        const size_t reserved_peak = positive_delta(stats.reserved_bytes[0].peak, baseline_reserved_);
+        RTP_LLM_LOG_INFO("warmup memory tracker: non_allocator_delta=%zu MiB, allocated_peak_delta=%zu MiB, "
+                         "active_peak_delta=%zu MiB, reserved_peak_delta=%zu MiB",
+                         non_allocator_consumed / 1024 / 1024,
+                         allocated_peak / 1024 / 1024,
+                         active_peak / 1024 / 1024,
+                         reserved_peak / 1024 / 1024);
+        return std::max(allocated_peak, active_peak) + non_allocator_consumed;
     }
 
 private:
@@ -165,6 +186,7 @@ private:
     c10::DeviceIndex             device_;
     size_t                       baseline_free_bytes_ = 0;
     int64_t                      baseline_allocated_  = 0;
+    int64_t                      baseline_active_     = 0;
     int64_t                      baseline_reserved_   = 0;
 };
 #endif
@@ -588,37 +610,51 @@ WarmUpResult NormalEngine::prefillWarmUp(const EngineInitParams& params) {
             rtp_llm::setTraceMemory(true);
             auto memory_tracker = std::make_unique<WarmupMemoryTracker>();
             executor_.reset(new NormalExecutor(params, warmup_cache_manager, true, false, 0, mla_ops_type_));
-            auto token_heavy_result = runPrefillWarmupShape(fake_input, warmup_resource_context, 0, token_budget);
-            THROW_IF_STATUSOR_ERROR(token_heavy_result);
+            const auto run_shapes = [&]() {
+                auto token_heavy_result = runPrefillWarmupShape(fake_input, warmup_resource_context, 0, token_budget);
+                THROW_IF_STATUSOR_ERROR(token_heavy_result);
+                token_heavy_result.value().reset();
+
+                const int64_t block_size = model_config_.attn_config.tokens_per_block;
+                const int64_t row_count =
+                    std::min(token_budget, runtime_config.fifo_scheduler_config.max_context_batch_size);
+                const int64_t row_heavy_reuse = (token_heavy_seq_len - 1) / block_size * block_size;
+                auto          row_heavy_input = makeFakeInput(static_cast<size_t>(row_heavy_reuse + 1));
+                row_heavy_input->generate_config->num_return_sequences = static_cast<int>(row_count);
+
+                // Maximize runtime-admissible final rows while retaining a long block-aligned prefix.
+                auto row_heavy_result = runPrefillWarmupShape(
+                    row_heavy_input, warmup_resource_context, static_cast<int>(row_heavy_reuse), token_budget);
+                THROW_IF_STATUSOR_ERROR(row_heavy_result);
+                row_heavy_result.value().reset();
+
+                const auto longest_system_prompt = std::max_element(
+                    kv_cache_config.multi_task_prompt_tokens.begin(),
+                    kv_cache_config.multi_task_prompt_tokens.end(),
+                    [](const auto& lhs, const auto& rhs) { return lhs.second.size() < rhs.second.size(); });
+                if (longest_system_prompt != kv_cache_config.multi_task_prompt_tokens.end()
+                    && !longest_system_prompt->second.empty()) {
+                    auto system_prompt_input = makeFakeInput(longest_system_prompt->second.size());
+                    auto system_prompt_result =
+                        runPrefillWarmupShape(system_prompt_input, warmup_resource_context, 0, 0);
+                    THROW_IF_STATUSOR_ERROR(system_prompt_result);
+                }
+            };
+            // The first pass initializes operators/JIT and exercises every admitted shape.
+            // Its allocator high-water mark is startup overhead, not the memory required
+            // again after the production KV cache has been allocated. Release unused
+            // segments before measuring the same shapes with warm operators.
+            run_shapes();
+            cudaDeviceSynchronize();
+            const auto initialization_peak = memory_tracker->maxConsumedBytes();
+            c10::cuda::CUDACachingAllocator::emptyCache();
+            memory_tracker->resetPeakStats();
+            run_shapes();
+            cudaDeviceSynchronize();
             max_consumed = memory_tracker->maxConsumedBytes();
-            token_heavy_result.value().reset();
-
-            const int64_t block_size = model_config_.attn_config.tokens_per_block;
-            const int64_t row_count =
-                std::min(token_budget, runtime_config.fifo_scheduler_config.max_context_batch_size);
-            const int64_t row_heavy_reuse = (token_heavy_seq_len - 1) / block_size * block_size;
-            auto          row_heavy_input = makeFakeInput(static_cast<size_t>(row_heavy_reuse + 1));
-            row_heavy_input->generate_config->num_return_sequences = static_cast<int>(row_count);
-
-            // Maximize runtime-admissible final rows while retaining a long block-aligned prefix.
-            auto row_heavy_result = runPrefillWarmupShape(
-                row_heavy_input, warmup_resource_context, static_cast<int>(row_heavy_reuse), token_budget);
-            THROW_IF_STATUSOR_ERROR(row_heavy_result);
-            max_consumed = std::max(max_consumed, memory_tracker->maxConsumedBytes());
-            row_heavy_result.value().reset();
-
-            const auto longest_system_prompt = std::max_element(
-                kv_cache_config.multi_task_prompt_tokens.begin(),
-                kv_cache_config.multi_task_prompt_tokens.end(),
-                [](const auto& lhs, const auto& rhs) { return lhs.second.size() < rhs.second.size(); });
-            if (longest_system_prompt != kv_cache_config.multi_task_prompt_tokens.end()
-                && !longest_system_prompt->second.empty()) {
-                auto system_prompt_input = makeFakeInput(longest_system_prompt->second.size());
-                auto system_prompt_result =
-                    runPrefillWarmupShape(system_prompt_input, warmup_resource_context, 0, 0);
-                THROW_IF_STATUSOR_ERROR(system_prompt_result);
-                max_consumed = std::max(max_consumed, memory_tracker->maxConsumedBytes());
-            }
+            RTP_LLM_LOG_INFO("chunk prefill warmup memory: initialization_peak=%zu MiB, runtime_peak=%zu MiB",
+                             initialization_peak / 1024 / 1024,
+                             max_consumed / 1024 / 1024);
 
             if (warmup_cache_manager && !params.py_model.is_none()) {
                 // PyWrappedModel initializes the shared Python model in place, so destroying the
