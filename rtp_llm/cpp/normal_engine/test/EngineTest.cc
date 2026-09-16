@@ -13,6 +13,9 @@
 #include "gmock/gmock-function-mocker.h"
 #include "gtest/gtest.h"
 #include <memory>
+#if USING_CUDA
+#include "c10/cuda/CUDACachingAllocator.h"
+#endif
 
 using namespace std;
 namespace W = rtp_llm::W;
@@ -201,9 +204,16 @@ TEST_F(NormalEngineTest, testChunkedPrefillWarmupStartup) {
 
     // Token-heavy: one row walks the 19-token prompt in budget-4 chunks. Row-heavy: four rows
     // each execute one final token after a block-aligned 18-token synthetic prefix. The 7-token
-    // whole-segment shape runs once during warmup and once while constructing the system prompt.
+    // whole-segment shape runs in both warmup passes and once while constructing the system prompt.
     ASSERT_EQ(*config.forward_shapes,
               (std::vector<ForwardShape>{
+                  {4, 0, 1},
+                  {4, 4, 1},
+                  {4, 8, 1},
+                  {4, 12, 1},
+                  {3, 16, 1},
+                  {4, 18, 4},
+                  {7, 0, 1},
                   {4, 0, 1},
                   {4, 4, 1},
                   {4, 8, 1},
@@ -215,6 +225,59 @@ TEST_F(NormalEngineTest, testChunkedPrefillWarmupStartup) {
     ASSERT_EQ(engine->resourceContext().cache_manager->cacheConfig().block_num, 100);
 }
 
+#if USING_CUDA
+TEST_F(NormalEngineTest, testChunkedPrefillWarmupExcludesColdPeakButKeepsLiveAndRuntimeBuffers) {
+    class ColdAllocationModel: public MockModel {
+    public:
+        explicit ColdAllocationModel(size_t vocab_size):
+            MockModel(vocab_size), live_(torch::empty({16 * 1024 * 1024}, options())) {}
+
+        GptModelOutputs forward(const GptModelInputs& inputs) override {
+            // Simulate a one-time JIT/operator workspace alongside buffers used on every call.
+            // Six forward calls per pass. Increasing sizes leave inactive cached
+            // segments behind, so reserved memory exceeds the peak live working set.
+            auto runtime = torch::empty({static_cast<int64_t>((++calls_ - 1) % 6 + 1) * 8 * 1024 * 1024}, options());
+            if (cold_) {
+                auto initialization = torch::empty({128 * 1024 * 1024}, options());
+                cold_ = false;
+                return MockModel::forward(inputs);
+            }
+            return MockModel::forward(inputs);
+        }
+
+    private:
+        static torch::TensorOptions options() {
+            return torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCUDA);
+        }
+        torch::Tensor live_;
+        bool          cold_ = true;
+        size_t        calls_ = 0;
+    };
+
+    CustomConfig config;
+    config.prefill_chunk_size = 4;
+    auto engine = createMockEngine(config);
+    ASSERT_TRUE(engine->stop().ok());
+
+    ModelConfig model_config;
+    RuntimeConfig runtime_config;
+    KVCacheConfig kv_cache_config;
+    auto params = createEngineInitParams(config, model_config, runtime_config, kv_cache_config);
+    NormalExecutor::test_model_factory = [vocab = model_config.vocab_size](const GptModelInitParams&) {
+        return std::make_unique<ColdAllocationModel>(vocab);
+    };
+    struct FactoryResetGuard {
+        ~FactoryResetGuard() { NormalExecutor::test_model_factory = nullptr; }
+    } factory_reset_guard;
+    c10::cuda::CUDACachingAllocator::emptyCache();
+    const auto result = engine->prefillWarmUp(params);
+    // Retain the 16 MiB executor buffer and the largest 48 MiB recurring activation,
+    // but exclude both the 128 MiB cold allocation and inactive cached segments.
+    EXPECT_GE(result.max_used_memory, 64u * 1024 * 1024);
+    EXPECT_LT(result.max_used_memory, 80u * 1024 * 1024);
+}
+#endif
+
 TEST_F(NormalEngineTest, testChunkedPrefillWarmupCapsIntMaxBudgetByContextBatchSize) {
     CustomConfig config;
     config.warm_up                = true;
@@ -225,6 +288,8 @@ TEST_F(NormalEngineTest, testChunkedPrefillWarmupCapsIntMaxBudgetByContextBatchS
 
     ASSERT_EQ(*config.forward_shapes,
               (std::vector<ForwardShape>{
+                  {19, 0, 1},
+                  {8, 18, 8},
                   {19, 0, 1},
                   {8, 18, 8},
               }));
