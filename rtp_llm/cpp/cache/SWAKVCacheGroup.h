@@ -22,12 +22,15 @@ public:
         KVCacheGroup(layer_ids, kvcache_spec, block_pool, group_id, policy),
         linear_step_(linear_step) {}
 
+    bool preparePrefillChunk(BlockIds& block_ids, int chunk_end,
+                             std::vector<size_t>* backfilled_positions) override;
+    void releaseBeforePrefillChunk(BlockIds& block_ids, int chunk_start, bool enable_reuse_cache) override;
     bool        malloc(BlockIds&                  block_ids,
                        int                        seq_len,
                        bool                       enable_reuse_cache   = false,
                        int                        reserve_step         = 0,
                        std::vector<size_t>*       backfilled_positions = nullptr,
-                       const RequiredPositions&  required_positions = {}) override;
+                       const RequiredPositions&   required_positions = {}) override;
     void removeSkippedBlocks(BlockIds& block_ids, bool enable_reuse_cache = false, int reserve_step = 0) override;
     int  needBlocksNum(int seq_len, int current_blocks, int reserve_step = 0) const override;
     int  estimatePeakNeedBlocks(int                     seq_len,

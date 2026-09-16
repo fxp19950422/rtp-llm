@@ -335,15 +335,23 @@ MallocResult HybridKVCacheAllocator::incrMalloc(const MallocInfo& malloc_info) {
     int  failed_group       = -1;
     int  failed_need_blocks = -1;
     for (int b = 0; b < batch_size; ++b) {
-        for (int group_id = 0; group_id < kv_resource->groupNums(); ++group_id) {
-            auto&     block_ids        = kv_resource->mutableBlockIds(b, group_id);
-            const int group_seq_len    = cpEffectiveSeqLenForGroup(cp_mapper, config_, group_id, raw_seq_len);
-            auto&     filled_positions = backfilled_positions[static_cast<size_t>(b)][static_cast<size_t>(group_id)];
-            if (!kv_cache_groups_[static_cast<size_t>(group_id)]->malloc(
-                    block_ids, group_seq_len, malloc_info.reuse_cache, reserve_step, &filled_positions)) {
-                all_success  = false;
-                failed_batch = b;
-                failed_group = group_id;
+        for (int gid = 0; gid < kv_resource->groupNums(); ++gid) {
+            auto&     block_ids        = kv_resource->mutableBlockIds(b, gid);
+            const int group_seq_len    = cpEffectiveSeqLenForGroup(cp_mapper, config_, gid, raw_seq_len);
+            auto&     filled_positions = backfilled_positions[static_cast<size_t>(b)][static_cast<size_t>(gid)];
+            // Snapshot the slot count before the call so a failure can report this
+            // group's exact physical request in the error_code=602 record.
+            const int blocks_before = static_cast<int>(block_ids.blocksNum());
+            auto& group = kv_cache_groups_[static_cast<size_t>(gid)];
+            const bool allocated = malloc_info.prefill_chunk_start >= 0 ?
+                group->preparePrefillChunk(block_ids, group_seq_len, &filled_positions) :
+                group->malloc(block_ids, group_seq_len, malloc_info.reuse_cache, reserve_step, &filled_positions);
+            if (!allocated) {
+                all_success        = false;
+                failed_batch       = b;
+                failed_group       = gid;
+                failed_need_blocks = kv_cache_groups_[static_cast<size_t>(gid)]->needBlocksNum(
+                    group_seq_len, blocks_before, reserve_step);
                 break;
             }
         }
@@ -353,6 +361,17 @@ MallocResult HybridKVCacheAllocator::incrMalloc(const MallocInfo& malloc_info) {
     }
 
     if (all_success) {
+        if (malloc_info.prefill_chunk_start >= 0) {
+            for (int b = 0; b < batch_size; ++b) {
+                for (int gid = 0; gid < kv_resource->groupNums(); ++gid) {
+                    const int start = cpEffectiveSeqLenForGroup(cp_mapper, config_, gid,
+                                                                malloc_info.prefill_chunk_start);
+                    kv_cache_groups_[static_cast<size_t>(gid)]->releaseBeforePrefillChunk(
+                        kv_resource->mutableBlockIds(b, gid), start, malloc_info.reuse_cache);
+                }
+            }
+            return {true, 0};
+        }
         if (!malloc_info.enable_remove_skipped_blocks) {
             return {true, 0};
         }
