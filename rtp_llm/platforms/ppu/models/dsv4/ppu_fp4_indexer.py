@@ -184,45 +184,57 @@ class PpuFP4Indexer(IndexerFP8):
                 (meta.M, self.index_topk), device=x.device, dtype=torch.int32
             )
             chunk = self._prefill_score_chunk_rows or meta.M
-            for start in range(0, meta.M, chunk):
-                end = min(meta.M, start + chunk)
-                with record_function_range("dsv4.ppu.fp4.indexer.score"):
-                    logits = self._score(
-                        (q[start:end], qs[start:end]),
-                        (k, ks),
-                        weights[start:end],
-                        meta.ks[start:end],
-                        meta.ke[start:end],
-                        clean_logits=False,
-                        logits_dtype=torch.bfloat16,
-                    )
-                label = getattr(self.compressor, "_profile_label", "")
-                if (
-                    _rt.LEVEL >= 2
-                    and label.startswith("L")
-                    and label[1:3].isdigit()
-                    and _rt.should_record_layer(int(label[1:3]))
-                ):
-                    for suffix, tensor in (
-                        ("q", q[start:end]),
-                        ("q_scale", qs[start:end]),
-                        ("w", weights[start:end]),
-                        ("k", k),
-                        ("k_scale", ks),
-                        ("ks", meta.ks[start:end]),
-                        ("ke", meta.ke[start:end]),
-                        ("logits", logits),
-                    ):
-                        _rt.record_if_level(
-                            2,
-                            f"{label.replace('.', '_')}_score_{start}_{suffix}",
-                            tensor,
+            # Varlen K is gathered once in request-concatenated order, but score
+            # each request against only its own K slice. Besides matching the
+            # per-request index contract, this avoids a B-times-wider logits
+            # tensor for B long contexts (SGLang uses the same request-bounded
+            # sparse-indexer chunking strategy). Graph capture keeps the legacy
+            # fixed-shape global path through request_score_slices=None.
+            request_slices = meta.request_score_slices or (
+                (0, meta.M, 0, meta.T),
+            )
+            for q_begin, q_end, k_begin, k_end in request_slices:
+                request_k = k[k_begin:k_end]
+                request_k_scale = ks[k_begin:k_end]
+                for start in range(q_begin, q_end, chunk):
+                    end = min(q_end, start + chunk)
+                    local_ks = meta.ks[start:end] - k_begin
+                    local_ke = meta.ke[start:end] - k_begin
+                    with record_function_range("dsv4.ppu.fp4.indexer.score"):
+                        logits = self._score(
+                            (q[start:end], qs[start:end]),
+                            (request_k, request_k_scale),
+                            weights[start:end],
+                            local_ks,
+                            local_ke,
+                            clean_logits=False,
+                            logits_dtype=torch.bfloat16,
                         )
-                with record_function_range("dsv4.ppu.fp4.indexer.topk"):
-                    topk_bf16(
-                        logits, meta.ks[start:end], meta.ke[start:end], out[start:end]
-                    )
-                del logits
+                    label = getattr(self.compressor, "_profile_label", "")
+                    if (
+                        _rt.LEVEL >= 2
+                        and label.startswith("L")
+                        and label[1:3].isdigit()
+                        and _rt.should_record_layer(int(label[1:3]))
+                    ):
+                        for suffix, tensor in (
+                            ("q", q[start:end]),
+                            ("q_scale", qs[start:end]),
+                            ("w", weights[start:end]),
+                            ("k", request_k),
+                            ("k_scale", request_k_scale),
+                            ("ks", local_ks),
+                            ("ke", local_ke),
+                            ("logits", logits),
+                        ):
+                            _rt.record_if_level(
+                                2,
+                                f"{label.replace('.', '_')}_score_{start}_{suffix}",
+                                tensor,
+                            )
+                    with record_function_range("dsv4.ppu.fp4.indexer.topk"):
+                        topk_bf16(logits, local_ks, local_ke, out[start:end])
+                    del logits
             return out.view(*x.shape[:-1], self.index_topk)
         finally:
             self._clear_nested_pool()

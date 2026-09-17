@@ -363,6 +363,10 @@ class IndexerFP8PrepareVarlenTest(unittest.TestCase):
         self.assertEqual(meta.M, 28)
         self.assertEqual(meta.T, 9)  # 4 + 5
         self.assertEqual(meta.cu_kv_seqlens.tolist(), [0, 4, 9])
+        self.assertEqual(
+            meta.request_score_slices,
+            ((0, 16, 0, 4), (16, 28, 4, 9)),
+        )
         self.assertEqual(meta.positions_d.shape, (28,))
         self.assertEqual(meta.positions_d[0].item(), 0)
         self.assertEqual(meta.positions_d[15].item(), 15)
@@ -411,6 +415,7 @@ class IndexerFP8PrepareVarlenTest(unittest.TestCase):
         self.assertTrue(torch.equal(wrapped.ks, flat.ks))
         self.assertTrue(torch.equal(wrapped.ke, flat.ke))
         self.assertTrue(torch.equal(wrapped.cu_kv_seqlens, flat.cu_kv_seqlens))
+        self.assertEqual(wrapped.request_score_slices, flat.request_score_slices)
 
     def test_b2_ke_clamps_per_request_T_b(self) -> None:
         """ke[t] = ``cu_kv_seqlens[b] + clamp_max((pos+1)//ratio, T_b)`` —
