@@ -106,12 +106,13 @@ except BaseException as e:
     logging.info(f"Exception: {e}, traceback: {traceback.format_exc()}")
 
 # The frontend extension links against the active interpreter's shared library.
-import sysconfig
+# Some conda builds report the static archive in LDLIBRARY even though ctypes
+# can only load a dynamic library.
 from ctypes import cdll
 
-cdll.LoadLibrary(
-    os.path.join(sysconfig.get_config_var("LIBDIR"), sysconfig.get_config_var("LDLIBRARY"))
-)
+from rtp_llm.utils.python_shared_library import find_python_shared_library
+
+cdll.LoadLibrary(find_python_shared_library())
 
 try:
     from libth_transformer_config import (
