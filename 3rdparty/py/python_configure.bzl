@@ -253,7 +253,28 @@ def _get_python_import_lib_name(repository_ctx, python_bin):
 def _get_python_shared_library(repository_ctx, python_bin):
   result = _execute(
       repository_ctx,
-      [python_bin, "-c", "import os, sysconfig; print(os.path.join(sysconfig.get_config_var('LIBDIR'), sysconfig.get_config_var('LDLIBRARY')))"] ,
+      [python_bin, "-c", """
+import glob
+import os
+import sys
+import sysconfig
+
+version = "%s.%s" % (sys.version_info[0], sys.version_info[1])
+libdir = sysconfig.get_config_var("LIBDIR")
+ldlibrary = sysconfig.get_config_var("LDLIBRARY")
+candidates = []
+if libdir:
+    for suffix in (".so", ".dylib"):
+        candidates.extend(sorted(glob.glob(os.path.join(libdir, "libpython%s%s*" % (version, suffix)))))
+    if ldlibrary:
+        candidates.append(os.path.join(libdir, ldlibrary))
+for path in candidates:
+    if path and os.path.isfile(path):
+        print(path)
+        break
+else:
+    raise SystemExit("could not find a Python shared library")
+"""] ,
       error_msg = "Problem locating the Python shared library.",
   )
   path = result.stdout.splitlines()[0]
