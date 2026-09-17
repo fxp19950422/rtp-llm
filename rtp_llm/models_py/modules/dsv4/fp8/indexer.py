@@ -301,6 +301,11 @@ class _IndexerFP8PrefillMeta(NamedTuple):
     # varlen so ``forward()`` can convert global TopK indices back to
     # request-local in one ``torch.where(idx >= 0, idx - off, idx)`` launch.
     cu_kv_per_token: Optional[torch.Tensor]
+    # Eager varlen-only request boundaries for request-local score/top-k.
+    # Each tuple is ``(q_begin, q_end, k_begin, k_end)`` in the flat Q/K
+    # axes. PPU FP4 scoring uses these slices to avoid materializing a logits
+    # width equal to the sum of every request's compressed context.
+    request_score_slices: Optional[tuple[tuple[int, int, int, int], ...]]
 
     # ── Nested CompressorFP8 metadata, hoisted out of the per-call hot
     # path. Without this, ``CompressorFP8.forward(meta=None)`` rebuilds
@@ -943,6 +948,25 @@ class IndexerFP8(PoolBackedModule):
                 )
                 cu_kv_per_token = cu_kv_per_token_i64.to(torch.int32).contiguous()
 
+            # Keep the hot scoring path host-sync free. SGLang similarly plans
+            # sparse-indexer chunks from CPU request lengths: one request-local
+            # K width at a time prevents B long contexts from becoming one
+            # B-times-wider logits tensor. Graph capture retains the fixed-shape
+            # global path because request lengths are device-updated there.
+            request_score_slices: Optional[
+                tuple[tuple[int, int, int, int], ...]
+            ] = None
+            if not capturing:
+                q_bounds = tuple(int(v) for v in cu_seqlens.detach().cpu().tolist())
+                k_bounds = tuple(
+                    int(v) for v in cu_kv_seqlens.detach().cpu().tolist()
+                )
+                request_score_slices = tuple(
+                    (q_bounds[b], q_bounds[b + 1], k_bounds[b], k_bounds[b + 1])
+                    for b in range(batch_size)
+                    if q_bounds[b] < q_bounds[b + 1]
+                )
+
             # ``freqs_cis_slice`` per-token gather — RoPE angles for ``q``
             # in ``_compute_indexer_q``. Equivalent to ``self.freqs_cis[
             # sp:sp+S]`` for B == 1 contiguous range; per-token gather is
@@ -1014,6 +1038,7 @@ class IndexerFP8(PoolBackedModule):
             # subtract in ``forward()`` becomes a no-op so we leave this
             # field as ``None`` to skip the launch entirely on the legacy path.
             cu_kv_per_token = None
+            request_score_slices = None
 
         indexer_cp_plan: Optional[Any] = None
         indexer_cp_local_cu: Optional[torch.Tensor] = None
@@ -1139,6 +1164,7 @@ class IndexerFP8(PoolBackedModule):
             block_table_i32=block_table_i32,
             cu_kv_seqlens=cu_kv_seqlens,
             cu_kv_per_token=cu_kv_per_token,
+            request_score_slices=request_score_slices,
             compressor_meta=compressor_meta,
             indexer_cp_plan=indexer_cp_plan,
             indexer_cp_local_cu=indexer_cp_local_cu,
