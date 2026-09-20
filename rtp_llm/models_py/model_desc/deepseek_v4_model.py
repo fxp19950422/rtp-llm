@@ -67,6 +67,13 @@ from rtp_llm.ops import RoleType
 from rtp_llm.utils.warmup import model_warm_up_enabled
 
 
+def _env_flag_enabled(name: str, default: bool = True) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
 def _materialize_meta_buffers(module: torch.nn.Module, device: str) -> int:
     """Walk the module tree and replace any meta-device buffer with a
     zeroed real-device tensor of the same shape/dtype. Factory-mode
@@ -881,7 +888,11 @@ class DeepSeekV4Model(GptModelBase):
                 _run_triton_warmup_launch_with_retry,
             )
 
-            if len(self.v4.layers) > 2 and self.v4.layers[2].attn.indexer is not None:
+            if (
+                _env_flag_enabled("DSV4_INDEXER_SCORE_WARMUP", True)
+                and len(self.v4.layers) > 2
+                and self.v4.layers[2].attn.indexer is not None
+            ):
                 _idx = self.v4.layers[2].attn.indexer  # first CSA layer (ratio=4)
                 _H = int(_idx.n_heads)
                 _D = int(_idx.head_dim)
@@ -923,6 +934,11 @@ class DeepSeekV4Model(GptModelBase):
                         compress_ratio=_ratio,
                     ),
                     device=_torch.device(device_str),
+                )
+            elif not _env_flag_enabled("DSV4_INDEXER_SCORE_WARMUP", True):
+                logging.info(
+                    "[DeepSeekV4Model] skip DSV4IndexerScore Triton warmup: "
+                    "DSV4_INDEXER_SCORE_WARMUP=0"
                 )
 
             try:
