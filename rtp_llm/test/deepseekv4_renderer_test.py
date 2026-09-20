@@ -216,6 +216,38 @@ class DeepseekV4ToolChoiceConstraintTest(TestCase):
         )
         self.assertIs(tag["format"]["content"]["stop_after_first"], False)
 
+    def test_parallel_tool_calls_false_stops_after_first_required_tool(self):
+        request = ChatCompletionRequest(
+            messages=[{"role": "user", "content": "Search weather"}],
+            tools=_rtp_two_tools(),
+            tool_choice="required",
+            parallel_tool_calls=False,
+        )
+        config = GenerateConfig()
+
+        self.renderer.apply_chat_completion_constraints(request, config)
+
+        tag = json.loads(config.structural_tag)
+        get_info = DeepSeekV4Detector().structure_info()
+        self.assertEqual(
+            [item["begin"] for item in tag["format"]["content"]["tags"]],
+            [get_info("get_weather").begin, get_info("search").begin],
+        )
+        self.assertIs(tag["format"]["content"]["stop_after_first"], True)
+
+    def test_parallel_tool_calls_false_does_not_force_auto_tool_choice(self):
+        request = ChatCompletionRequest(
+            messages=[{"role": "user", "content": "Search weather"}],
+            tools=_rtp_two_tools(),
+            tool_choice="auto",
+            parallel_tool_calls=False,
+        )
+        config = GenerateConfig()
+
+        self.renderer.apply_chat_completion_constraints(request, config)
+
+        self.assertIsNone(config.structural_tag)
+
     def test_forced_tool_choice_rejects_existing_grammar_constraints(self):
         request = ChatCompletionRequest(
             messages=[{"role": "user", "content": "Weather?"}],
