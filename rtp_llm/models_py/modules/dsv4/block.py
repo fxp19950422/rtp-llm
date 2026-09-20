@@ -503,7 +503,12 @@ class Block(nn.Module):
         )
         if _dbg_layer:
             _rt.record_if_level(2, f"L{self.layer_id:02d}_decode_ffn_in", x_pre)
-        ffn_out = self.ffn(x_pre, input_ids, is_decode_forward=True)
+        active_token_mask = getattr(attn_metadata, "active_token_mask", None)
+        ffn_kwargs = (
+            {"active_token_mask": active_token_mask}
+            if active_token_mask is not None else {}
+        )
+        ffn_out = self.ffn(x_pre, input_ids, is_decode_forward=True, **ffn_kwargs)
         if _dbg_layer:
             _rt.record_if_level(2, f"L{self.layer_id:02d}_decode_ffn_out", ffn_out)
         x = self.ffn_hc.post(ffn_out, residual, post, comb)

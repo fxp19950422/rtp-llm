@@ -32,12 +32,28 @@
 #if USING_CUDA
 #include "rtp_llm/models_py/bindings/cuda/kernels/mtp_target_verify_prepare.h"
 #include <ATen/cuda/CUDAContext.h>
+#include <ATen/cuda/CUDAGeneratorImpl.h>
 #endif
 
 namespace rtp_llm {
 
 using namespace std;
 namespace spec = speculative;
+
+TEST(MtpExecutorPolicyTest, AcceptedHiddenStatesPreservePreHcBranches) {
+    const auto indices = torch::tensor({1, 0, 3}, torch::kInt64);
+    for (const auto& shape : std::vector<std::vector<int64_t>>{{12, 16}, {12, 4, 16}}) {
+        int64_t elements = 1;
+        for (auto dim : shape) {
+            elements *= dim;
+        }
+        auto hidden = torch::arange(elements, torch::kFloat32).reshape(shape);
+        auto selected = MtpExecutor::selectAcceptedHiddenStates(hidden, indices, 3, 4);
+        auto expected = torch::stack({hidden[1], hidden[4], hidden[11]});
+        EXPECT_EQ(selected.sizes(), expected.sizes());
+        EXPECT_TRUE(torch::equal(selected, expected));
+    }
+}
 
 TEST(MtpExecutorPolicyTest, DSparkPrefillCPRequiresPrefillRole) {
     PrefillCPConfig prefill_cp_config;
@@ -1808,6 +1824,101 @@ TEST_F(MtpExecutorTest, testDSparkReducedVocabFeedsMappedTargetTokenIntoMarkovCh
     EXPECT_TRUE(torch::allclose(output.all_probs[0][1].cpu(), expected_second_q));
 }
 
+#if USING_CUDA
+TEST_F(MtpExecutorTest, testGreedyRngElisionMatchesLegacyTokensAndGeneratorState) {
+    for (const int gamma : {1, 2, 3}) {
+        MtpExecutorTestConfig config;
+        config.gen_num_per_cycle = gamma;
+        config.vocab_size_override = 4;
+        auto components = createMtpExecutorComponents(config);
+        const int batch = gamma + 1;
+        const int width = gamma + 1;
+        for (const int sampling_mode : {0, 1, 2}) {  // greedy, mixed, stochastic
+            for (const bool force_first : {false, true}) {
+                for (const bool point_mass : {false, true}) {
+                    SCOPED_TRACE(::testing::Message() << "gamma=" << gamma << " sampling=" << sampling_mode
+                                 << " force=" << force_first << " point_mass=" << point_mass);
+                    std::list<GenerateStreamPtr> streams;
+                    std::vector<torch::Tensor> initial_states;
+                    auto target_ids = torch::ones({batch, width}, torch::kInt32);
+                    for (int row = 0; row < batch; ++row) {
+                        auto input = std::make_shared<GenerateInput>();
+                        input->input_ids = torch::tensor({0, 1}, torch::kInt32);
+                        input->generate_config = std::make_shared<GenerateConfig>();
+                        input->generate_config->random_seed = 123 + row;
+                        input->generate_config->do_sample = true;
+                        const bool stochastic = sampling_mode == 2 || (sampling_mode == 1 && row == 0);
+                        input->generate_config->top_k = stochastic ? 0 : 1;
+                        input->generate_config->force_sp_accept = force_first && row == 0;
+                        auto stream = std::make_shared<NormalGenerateStream>(
+                            input, components.model_config, components.runtime_config,
+                            components.resource_context, nullptr);
+                        ASSERT_FALSE(stream->hasError());
+                        initial_states.push_back(stream->getGenerator().get_state().clone());
+                        streams.push_back(stream);
+                        target_ids[row][gamma] = 2;
+                        if (row < gamma) {
+                            target_ids[row][row] = 3;  // each rejection position, plus one all-accept row
+                        }
+                    }
+                    SamplerOutput draft, target;
+                    draft.token_ids = torch::ones({batch, gamma}, torch::kInt32).to(torch::kCUDA);
+                    draft.token_ids_are_point_mass = point_mass;
+                    if (!point_mass) {
+                        draft.all_probs = torch::zeros({batch, gamma, 4},
+                            torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+                        draft.all_probs.select(2, 1).fill_(1.0f);
+                    }
+                    target.token_ids = target_ids.reshape({batch * width, 1}).to(torch::kCUDA);
+                    target.all_probs = torch::full({batch, width, 4}, 0.3f,
+                        torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCUDA));
+                    target.all_probs.select(2, 1).fill_(0.1f);
+                    auto global_generator = at::cuda::detail::getDefaultCUDAGenerator();
+                    auto global_initial = global_generator.get_state().clone();
+                    spec::SpeculativeSampler legacy(torch::Tensor(), gamma, false);
+                    auto reference = legacy.forward(streams, draft, target);
+                    reference.transfer_done_event->synchronize();
+                    auto global_after_legacy = global_generator.get_state().clone();
+                    std::vector<torch::Tensor> legacy_states;
+                    int row = 0;
+                    for (const auto& stream : streams) {
+                        auto generator = stream->getGenerator();
+                        legacy_states.push_back(generator.get_state().clone());
+                        EXPECT_FALSE(torch::equal(initial_states[row], legacy_states.back()));
+                        generator.set_state(initial_states[row++]);
+                    }
+                    global_generator.set_state(global_initial);
+                    spec::SpeculativeSampler optimized(torch::Tensor(), gamma, true);
+                    auto actual = optimized.forward(streams, draft, target);
+                    actual.transfer_done_event->synchronize();
+                    EXPECT_TRUE(torch::equal(actual.accept_tokens_cpu, reference.accept_tokens_cpu));
+                    EXPECT_TRUE(torch::equal(actual.accept_len_cpu, reference.accept_len_cpu));
+                    EXPECT_TRUE(torch::equal(global_generator.get_state(),
+                        sampling_mode == 0 ? global_initial : global_after_legacy));
+                    row = 0;
+                    for (const auto& stream : streams) {
+                        EXPECT_TRUE(torch::equal(stream->getGenerator().get_state(),
+                            sampling_mode == 0 ? initial_states[row] : legacy_states[row]));
+                        if (sampling_mode == 0) {
+                            const int accepted = force_first && row == 0 ? width : row + 1;
+                            EXPECT_EQ(actual.accept_len_cpu[row].item<int>(), accepted);
+                            for (int column = 0; column < width; ++column) {
+                                const int expected = column >= accepted ? 0 :
+                                    column == gamma ? 2 :
+                                    column == row && !(force_first && row == 0) ? 3 : 1;
+                                EXPECT_EQ(actual.accept_tokens_cpu[row][column].item<int>(), expected);
+                            }
+                        }
+                        ++row;
+                    }
+                }
+            }
+        }
+    }
+}
+
+#endif
+
 TEST_F(MtpExecutorTest, testDecodeOneStepSpecLogitsCapReplacesInvalidDraftWithTargetToken) {
     size_t propose_step = 1;
     size_t vocab_size   = 4;
@@ -1982,6 +2093,11 @@ TEST_F(MtpExecutorTest, testMultiBatchDecode) {
 
     next_draft_input.last_hidden_states =
         torch::cat({target_output.all_hidden_states.narrow(0, 0, 1), target_output.all_hidden_states.narrow(0, 5, 5)});
+
+    // DSv4 exposes a dense pre-HC verify buffer. After stream 0 rejects,
+    // stream 1 must still consume rows 5..9, not the dense prefix rows 1..5.
+    // Exercise the real executor hand-off, not just the compaction helper.
+    components.fake_target_model->setMtpTargetHiddenStates(target_output.all_hidden_states);
 
     components.fake_draft_model->setInputs({draft_input_1, draft_input_2, draft_input_3, next_draft_input});
     components.fake_draft_model->setOutputs({draft_output_1, draft_output_2, draft_output_3, next_draft_output});

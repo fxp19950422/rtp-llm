@@ -185,6 +185,27 @@ class CacheResourceTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.validate(self.cache(metadata))
 
+    def test_fp4_mtp1_state_ring_alignment(self):
+        from rtp_llm.models.dsv4.specs import cache_description_snapshot
+        from rtp_llm.models.dsv4_kv_cache import (
+            Dsv4IndexerCacheMode, build_dsv4_kv_cache_spec_descs,
+        )
+        import pickle
+
+        descs = build_dsv4_kv_cache_spec_descs(
+            3, [0, 4, 128], True, 512, 128,
+            indexer_cache_mode=Dsv4IndexerCacheMode.FP4,
+        )
+        # Descriptors cross worker processes by pickle; alignment must survive.
+        descriptions = cache_description_snapshot(pickle.loads(pickle.dumps(descs)))
+        for gamma, expected in ((0, 8), (1, 12), (2, 12), (3, 12)):
+            metadata = copy.deepcopy(self.metadata)
+            metadata["cache_descriptions"] = descriptions
+            metadata["cache_geometry"]["gen_num_per_cycle"] = gamma
+            report = self.validate(self.cache(metadata), metadata)
+            self.assertEqual(report["groups"]["indexer_state"]["entries_per_view"], expected)
+            self.assertEqual(report["groups"]["csa_state"]["entries_per_view"], (8 + gamma + 1) & ~1)
+
     def test_draft_projection_preserves_declared_target_group_ids(self):
         metadata = copy.deepcopy(self.metadata)
         metadata["allocator_group_tags"] = self.cache().group_tags

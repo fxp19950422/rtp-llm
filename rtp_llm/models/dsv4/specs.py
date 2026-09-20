@@ -57,6 +57,7 @@ def cache_description_snapshot(layer_descriptions):
         "explicit_entry_count",
         "compression_ratio",
         "state_ring_overlap",
+        "state_ring_entry_alignment",
         "state_ring_include_gen_num_per_cycle",
         "block_stride_bytes_override",
         "block_stride_bytes_alignment",

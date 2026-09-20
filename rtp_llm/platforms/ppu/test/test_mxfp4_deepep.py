@@ -67,7 +67,8 @@ def run_rank(rank, world, rendezvous):
             local_expert_end=(rank + 1) * local,
             max_tokens_per_rank=capacity,
             tp_size=1,
-        )
+        ),
+        expected_m_policy=os.environ.get("RTP_PPU_MOE_TEST_HINT", "capacity"),
     )
     # Each nibble denotes exactly 1. W1/W3 use 2**-8; W2 uses an
     # expert-specific power of two, making route/EP-shard mistakes observable.
@@ -92,6 +93,14 @@ def run_rank(rank, world, rendezvous):
     indices = torch.empty((batch, topk), dtype=torch.int64, device=device)
     weights = torch.empty((batch, topk), dtype=torch.float32, device=device)
 
+    masked = os.environ.get("RTP_PPU_MOE_TEST_MASK", "0") == "1"
+    active_token_mask = torch.ones(batch, dtype=torch.bool, device=device)
+
+    def compute():
+        if masked:
+            return strategy(x, weights, indices, active_token_mask=active_token_mask)
+        return strategy(x, weights, indices)
+
     def inputs(step, hot, active):
         # W13 outputs 0.25, 0.75, 1 or 3. Masked SwiGLU/MXFP4 outputs
         # 1/32, 3/8, 3/4 or 8; unscaled W2 sums give 1, 12, 24 or 256.
@@ -102,11 +111,15 @@ def run_rank(rank, world, rendezvous):
         if not hot:
             ids += (torch.arange(batch) + rank * batch)[:, None] * topk
         ids %= experts
-        ids[active:] = -1
+        if not masked:
+            ids[active:] = -1
+        active_token_mask.copy_(torch.arange(batch, device=device) < active)
         route_weights = torch.full((batch, topk), 0.125)
-        route_weights[active:] = 0
         indices.copy_(ids)
         weights.copy_(route_weights)
+        route_weights[active:] = 0
+        if not masked:
+            weights.copy_(route_weights)
         multipliers = (2.0 ** (ids.clamp_min(0) % 4)) * route_weights
         reference = (1, 12, 24, 256)[case] * multipliers.sum(-1)
         return reference.to(torch.bfloat16).float().to(device)
@@ -119,7 +132,7 @@ def run_rank(rank, world, rendezvous):
         )
 
     expected = inputs(0, True, batch)
-    check(strategy(x, weights, indices), expected)
+    check(compute(), expected)
     # All four/eight ranks route their 80 tokens to the same six experts:
     # 320/640 valid rows per expert must survive dispatch and combine.
     assert batch * world > 128
@@ -127,13 +140,13 @@ def run_rank(rank, world, rendezvous):
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         for _ in range(3):
-            strategy(x, weights, indices)
+            compute()
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
     dist.barrier()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        output = strategy(x, weights, indices)
+        output = compute()
     torch.cuda.current_stream().wait_stream(stream)
     for step, hot, active in (
         (0, True, batch),

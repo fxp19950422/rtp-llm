@@ -56,7 +56,7 @@ def _supports_flash_model(metadata):
     speculative = metadata.get("speculative", False)
     if speculative and (
         metadata.get("speculative_type") != "MTP"
-        or metadata.get("gen_num_per_cycle") != 3
+        or metadata.get("gen_num_per_cycle") not in (1, 2, 3)
         or metadata.get("role") not in ("PREFILL", "DECODE")
     ):
         return False
@@ -79,7 +79,7 @@ def _supports_ppu_prefill(selection, request, cache_mode):
         (selection.platform.device_name == "ZW-M890P", "requires ZW-M890P"),
         (
             _supports_flash_model(metadata),
-            "requires Flash target or its MTP3 SWA draft in PD mode",
+            "requires Flash target or its MTP1/MTP2/MTP3 SWA draft in PD mode",
         ),
         (
             metadata.get("tp_size") == 4 and metadata.get("world_size") == 4,
@@ -169,7 +169,7 @@ def supports_ppu_fp4_decode(selection, request):
         (selection.platform.device_name == "ZW-M890P", "requires ZW-M890P"),
         (
             _supports_flash_model(metadata),
-            "requires Flash target or its MTP3 SWA draft in PD mode",
+            "requires Flash target or its MTP1/MTP2/MTP3 SWA draft in PD mode",
         ),
         (
             tuple(

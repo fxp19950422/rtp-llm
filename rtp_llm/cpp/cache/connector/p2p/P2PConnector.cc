@@ -381,6 +381,7 @@ grpc::Status P2PConnector::fillResponseWithStreamInfo(const std::shared_ptr<P2PC
     payload->set_local_reuse_len(data.local_reuse_len);
     payload->set_remote_reuse_len(data.remote_reuse_len);
     payload->set_memory_reuse_len(data.memory_reuse_len);
+    payload->set_proposal_is_point_mass(data.proposal_is_point_mass);
 
     if (!data.propose_tokens.empty()) {
         auto& propose_tensor = (*payload->mutable_tensors())["propose_tokens"];
@@ -390,8 +391,8 @@ grpc::Status P2PConnector::fillResponseWithStreamInfo(const std::shared_ptr<P2PC
         std::vector<int32_t> int32_tokens(data.propose_tokens.begin(), data.propose_tokens.end());
         tokens_pb->set_int32_data(int32_tokens.data(), int32_tokens.size() * sizeof(int32_t));
     }
-    if (data.propose_probs.data_type() != TensorPB::FP32 && data.propose_probs.fp16_data().empty()
-        && data.propose_probs.bf16_data().empty() && data.propose_probs.fp32_data().empty()) {
+    if (data.proposal_is_point_mass || (data.propose_probs.fp16_data().empty()
+        && data.propose_probs.bf16_data().empty() && data.propose_probs.fp32_data().empty())) {
         // propose_probs is empty but that's OK — skip
     } else {
         auto& probs_tensor = (*payload->mutable_tensors())["propose_probs"];

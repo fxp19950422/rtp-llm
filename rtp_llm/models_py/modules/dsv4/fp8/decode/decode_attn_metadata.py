@@ -151,6 +151,10 @@ class DSv4DecodeAttnMetadataFP8:
     # model actually uses are present.
     pool_block_tables: Dict[str, torch.Tensor] = field(default_factory=dict)
 
+    # Optional [B*Q] device bool in request-major order. A backend may use
+    # this to suppress routed MoE work for graph padding / fake requests.
+    active_token_mask: Optional[torch.Tensor] = None
+
     # Per-tag raw-token coverage for one block_table row. For the
     # seq=16384/kernel=128 layout, FULL paged pools carry 128 here while
     # SWA_KV carries 16384. Compressed writers convert this to their
