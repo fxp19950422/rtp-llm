@@ -399,6 +399,8 @@ message GenerateRequestPB {
     repeated int32 position_ids = 9;
     TensorPB propose_probs = 10;
     TensorPB propose_hidden = 11;
+    // Explicit distribution contract; empty probabilities never imply a point mass.
+    bool proposal_is_point_mass = 12;
 }
 
 // In the TP case, the decode master broadcasts to decode workers.
@@ -748,6 +750,7 @@ message SideChannelPayloadPB {
     int32  local_reuse_len         = 4;
     int32  remote_reuse_len        = 5;
     int32  memory_reuse_len        = 6;
+    bool   proposal_is_point_mass = 7;
 }
 
 message P2PConnectorStartLoadResponsePB {

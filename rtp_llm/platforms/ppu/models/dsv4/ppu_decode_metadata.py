@@ -1,4 +1,4 @@
-"""Instance-owned Graph for single-token PPU Decode metadata preparation."""
+"""Instance-owned Graph for PPU Decode and fixed-width MTP metadata."""
 
 import torch
 
@@ -31,6 +31,12 @@ class PpuDecodeMetadataGraph(DSv4DecodeFmhaImplFP8):
     by the base class and shared with the model's captured attention kernels.
     """
 
+    def supports_device_only_replay_prepare(self):
+        # C++ may omit CPU mirrors only for this explicit contract. Captured
+        # inputs always carry device length buffers; direct Python callers may
+        # still supply host-only inputs through the reference-compatible path.
+        return True
+
     def __init__(
         self,
         config,
@@ -38,23 +44,35 @@ class PpuDecodeMetadataGraph(DSv4DecodeFmhaImplFP8):
         attn_inputs,
         *,
         fused_state_slots=False,
-        shared_rope_tables=()
+        shared_rope_tables=(),
+        mask_inactive=False,
     ):
         device = torch.device(device)
         if (
             device.type != "cuda"
             or torch.cuda.get_device_name(device) != "ZW-M890P"
-            or config.q_len != 1
+            or config.q_len not in (1, 2, 3, 4)
             or not 0 < config.max_batch_size <= 128
             or not config.paged_pool_specs
         ):
-            raise ValueError("PPU metadata Graph requires paged M890P Decode q_len=1")
+            raise ValueError("PPU metadata Graph requires paged M890P Decode q_len=1/2/3/4")
         super().__init__(config, device, attn_inputs)
         self._metadata_graph = None
         self._source_tables = None
         self._source_identity = None
         self._capture_stream = None
         self._positions = torch.empty_like(self.metadata.start_pos)
+        if mask_inactive:
+            from rtp_llm.models_py.modules.dsv4.kv_cache_utils import SWA_KV
+
+            if SWA_KV not in config.paged_pool_specs:
+                raise ValueError("Inactive MoE masking requires a paged SWA pool")
+            # Keep capture warmup's original full route workload. Replay
+            # updates this owned allocation after the framework copies tables.
+            self.metadata.active_token_mask = torch.ones(
+                config.max_batch_size * config.q_len,
+                dtype=torch.bool, device=device,
+            )
         self._state_slot_updater = None
         if fused_state_slots:
             from rtp_llm.platforms.ppu.kernels.ppu_decode_state_slots import (
@@ -76,7 +94,7 @@ class PpuDecodeMetadataGraph(DSv4DecodeFmhaImplFP8):
             self._rope_sources[id(table)] = table
         self.metadata.rope_freqs_by_source = {
             key: torch.empty(
-                (config.max_batch_size, table.shape[1]),
+                (config.max_batch_size * config.q_len, table.shape[1]),
                 dtype=table.dtype,
                 device=table.device,
             )
@@ -112,13 +130,31 @@ class PpuDecodeMetadataGraph(DSv4DecodeFmhaImplFP8):
         ):
             raise ValueError("Shared RoPE table or output storage changed")
         primary = primary_attention_inputs(attn_inputs)
-        if (
-            primary is None
-            or getattr(primary, "is_target_verify", False)
-            or getattr(primary, "is_prefill", False)
-        ):
-            raise ValueError("PPU metadata Graph accepts single-token Decode only")
-        positions = primary.sequence_lengths
+        if primary is None:
+            raise ValueError("PPU metadata Graph requires attention inputs")
+        verify = getattr(primary, "is_target_verify", False)
+        prefill = getattr(primary, "is_prefill", False)
+        if self.config.q_len == 1 and (verify or prefill):
+            raise ValueError("Single-token metadata Graph requires Decode inputs")
+        # Match the reference updater: C++ refreshes prefix_lengths for
+        # verify/draft catch-up, while sequence_lengths may be a stale sentinel.
+        positions = (
+            primary.prefix_lengths
+            if verify or (prefill and self.config.q_len > 1)
+            else primary.sequence_lengths
+        )
+        if verify or (prefill and self.config.q_len > 1):
+            device_positions = getattr(primary, "prefix_lengths_device", None)
+            if device_positions is not None and device_positions.numel():
+                if not device_positions.is_cuda:
+                    raise ValueError("prefix_lengths_device must be on device")
+                positions = device_positions
+        else:
+            plus_one = getattr(primary, "sequence_lengths_plus_1_device", None)
+            if plus_one is not None and plus_one.numel():
+                if not plus_one.is_cuda:
+                    raise ValueError("sequence_lengths_plus_1_device must be on device")
+                positions = plus_one - 1
         batch = self.config.max_batch_size
         if (
             positions.shape != (batch,)
@@ -159,6 +195,16 @@ class PpuDecodeMetadataGraph(DSv4DecodeFmhaImplFP8):
             compressor_state_slot_updater=self._state_slot_updater,
         )
         self._update_rope()
+        if self.metadata.active_token_mask is not None:
+            from rtp_llm.models_py.modules.dsv4.kv_cache_utils import SWA_KV
+
+            batch, width = self.config.max_batch_size, self.config.q_len
+            # Zero is reserved for graph padding and engine fake streams.
+            # Scan the entire row: a real SWA block need not be in column 0.
+            active = (self._source_tables[SWA_KV][:batch] > 0).any(dim=1)
+            self.metadata.active_token_mask.view(batch, width).copy_(
+                active[:, None].expand(batch, width)
+            )
 
     def prepare_cuda_graph(self, attn_inputs):
         if torch.cuda.is_current_stream_capturing():

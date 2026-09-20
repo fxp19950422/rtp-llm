@@ -32,6 +32,7 @@ struct P2PSideChannelPayload {
     TensorPB             propose_hidden;
     std::vector<int32_t> position_ids;
     bool                 has_data = false;
+    bool                 proposal_is_point_mass = false;
 };
 
 class PrefillLoadCaller {

@@ -90,6 +90,11 @@ class DecodeQKVGpuTest(unittest.TestCase):
 
     @torch.inference_mode()
     def test_dynamic_normalization_graph_and_empty_batch(self):
+        for width in (1, 2, 3, 4):
+            with self.subTest(query_len=width):
+                self._check_dynamic_normalization(width)
+
+    def _check_dynamic_normalization(self, width):
         from rtp_llm.models_py.modules.dsv4._fused_rmsnorm_rope_triton import (
             fused_rmsnorm_rope,
         )
@@ -99,16 +104,16 @@ class DecodeQKVGpuTest(unittest.TestCase):
         wq = torch.linspace(0.5, 1.5, 1024, device="cuda", dtype=torch.bfloat16)
         wk = torch.linspace(0.75, 1.25, 512, device="cuda", dtype=torch.bfloat16)
         for batch in (0, 1, 3, 8, 32, 128):
-            raw = torch.empty(batch, 1, 1536, device="cuda", dtype=torch.bfloat16)
+            raw = torch.empty(batch, width, 1536, device="cuda", dtype=torch.bfloat16)
             freqs = torch.polar(
-                torch.ones(batch, 32, device="cuda"),
-                torch.randn(batch, 32, device="cuda"),
+                torch.ones(batch * width, 32, device="cuda"),
+                torch.randn(batch * width, 32, device="cuda"),
             )
             raw.normal_()
             if batch == 0:
                 qr, kv = normalize_decode_qkv(raw, wq, wk, freqs, 1e-6)
-                self.assertEqual(qr.shape, (0, 1, 1024))
-                self.assertEqual(kv.shape, (0, 1, 512))
+                self.assertEqual(qr.shape, (0, width, 1024))
+                self.assertEqual(kv.shape, (0, width, 512))
                 continue
             for _ in range(3):
                 normalize_decode_qkv(raw, wq, wk, freqs, 1e-6)

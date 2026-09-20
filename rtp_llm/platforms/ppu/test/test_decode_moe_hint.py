@@ -86,6 +86,38 @@ class DecodeMoeHintTest(unittest.TestCase):
             self.assertEqual(launch.call_args.kwargs["expected_m"], 24)
             self.assertEqual(launch.call_args.kwargs["output_dtype"], torch.bfloat16)
             self.assertEqual(capacity.expected_rows(batch), 24)
+        batch_provider = PpuDecodeProvider(
+            {**DECODE_EXECUTION_OPTIONS, "DSV4_PPU_MTP_MOE_HINT": "batch"}
+        )
+        context.selection.model_metadata["execution_options"] = batch_provider.execution_options
+        with patch(
+            "rtp_llm.platforms.ppu.models.dsv4.ppu_ep_moe.PpuEPMoE",
+            side_effect=factory,
+        ):
+            batch_strategy = pluggable_builders.build_decode_moe(
+                build_ctx=context, request=request, platform_provider=batch_provider,
+                layer_id=cfg.layer_id, dim=cfg.dim, tp_size=1, ep_size=8,
+                is_decode_role=True,
+            )
+        batch_strategy._wrapper = strategy._wrapper
+        batch_strategy._w13 = batch_strategy._s13 = object()
+        batch_strategy._w2 = batch_strategy._s2 = object()
+        for local_rows, expected_hint in ((0, 1), (1, 1), (8, 2), (32, 6), (128, 24)):
+            x = torch.empty((local_rows, cfg.dim), dtype=torch.bfloat16)
+            weights = torch.empty((local_rows, 6))
+            indices = torch.empty((local_rows, 6), dtype=torch.int64)
+            with patch(target) as launch:
+                batch_strategy(x, weights, indices)
+            self.assertEqual(launch.call_args.kwargs["expected_m"], expected_hint)
+            self.assertEqual(launch.call_args.kwargs["max_dispatch_tokens"], 256)
+            self.assertIs(launch.call_args.args[0], buffer)
+            self.assertIs(launch.call_args.args[2], weights)
+            self.assertIs(launch.call_args.args[3], indices)
+            self.assertEqual(capacity.expected_rows(local_rows), 24)
+        with self.assertRaisesRegex(ValueError, "DSV4_PPU_MTP_MOE_HINT"):
+            PpuDecodeProvider(
+                {**DECODE_EXECUTION_OPTIONS, "DSV4_PPU_MTP_MOE_HINT": "unknown"}
+            )
         with self.assertRaisesRegex(ValueError, "DSV4_PPU_DECODE_MOE_HINT"):
             PpuDecodeProvider(
                 {**DECODE_EXECUTION_OPTIONS, "DSV4_PPU_DECODE_MOE_HINT": "unknown"}

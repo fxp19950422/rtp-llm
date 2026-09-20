@@ -38,6 +38,7 @@ FIFOSchedulerBase::FIFOSchedulerBase(const RuntimeConfig&                   runt
     max_inited_kv_cache_streams_(
         std::max<int64_t>(runtime_config.fifo_scheduler_config.max_inited_kv_cache_streams, 0)),
     prefill_chunk_size_(runtime_config.fifo_scheduler_config.prefill_chunk_size),
+    prefill_chunk_batch_tokens_(runtime_config.fifo_scheduler_config.prefill_chunk_batch_tokens),
     need_fill_fake_stream_(parallelism_config.dp_size > 1 && parallelism_config.tp_rank == 0),
     metrics_reporter_(metrics_reporter) {}
 
@@ -193,7 +194,7 @@ std::list<GenerateStreamPtr> FIFOSchedulerBase::selectPrefillPrefix(std::list<Ge
         return active_streams;
     }
 
-    int64_t                      budget_left = prefill_chunk_size_;
+    int64_t budget_left = prefill_chunk_batch_tokens_ > 0 ? prefill_chunk_batch_tokens_ : prefill_chunk_size_;
     std::list<GenerateStreamPtr> selected;
 
     const auto finish_invalid_stream = [&active_streams](auto it, ErrorCode error_code, const std::string& reason) {
@@ -228,7 +229,9 @@ std::list<GenerateStreamPtr> FIFOSchedulerBase::selectPrefillPrefix(std::list<Ge
             continue;
         }
 
-        const int64_t grant = computeChunkGrant(budget_left, rows, remaining, block_size);
+        // Keep each stream's chunk bound even when an explicitly larger batch
+        // budget permits more independent short streams in this forward.
+        const int64_t grant = computeChunkGrant(std::min(budget_left, prefill_chunk_size_), rows, remaining, block_size);
 
         if (grant <= 0) {
             if (!selected.empty()) {

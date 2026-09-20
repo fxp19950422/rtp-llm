@@ -22,9 +22,18 @@ class Metadata:
 
 class QuerySliceTest(unittest.TestCase):
     def test_request_order_and_padding_survive_each_query_slice(self):
-        positions = torch.tensor([[254, 255, 256, 257], [510, 511, 512, 513], [-1] * 4])
-        requests = torch.arange(3).repeat_interleave(4)
-        slots = torch.arange(12).reshape(3, 4) + 100
+        for width in (2, 3, 4):
+            for start in (127, 255, 511):
+                with self.subTest(width=width, start=start):
+                    self._check_query_slices(width, start)
+
+    def _check_query_slices(self, width, start):
+        positions = torch.tensor(
+            [list(range(start, start + width)),
+             list(range(start + 256, start + 256 + width)), [-1] * width]
+        )
+        requests = torch.arange(3).repeat_interleave(width)
+        slots = torch.arange(3 * width).reshape(3, width) + 100
         slots[2].fill_(-1)
         meta = Metadata(
             positions.flatten(),
@@ -35,16 +44,16 @@ class QuerySliceTest(unittest.TestCase):
             compressed_lens_per_token=(positions + 1) // 4,
         )
         columns = []
-        for q in range(4):
-            step = slice_compressor_query(meta, 3, 4, q)
+        for q in range(width):
+            step = slice_compressor_query(meta, 3, width, q)
             columns.append(step.positions)
             self.assertEqual(step.b_idx.tolist(), [0, 1, 2])
-            self.assertEqual(step.state_slots.tolist(), [100 + q, 104 + q, -1])
+            self.assertEqual(step.state_slots.tolist(), [100 + q, 100 + width + q, -1])
             self.assertEqual(
                 step.compressed_lens_per_token.tolist(),
                 [
-                    (254 + q + 1) // 4,
-                    (510 + q + 1) // 4,
+                    (start + q + 1) // 4,
+                    (start + 256 + q + 1) // 4,
                     0,
                 ],
             )
@@ -53,7 +62,7 @@ class QuerySliceTest(unittest.TestCase):
         self.assertTrue(torch.equal(torch.stack(columns, dim=1), positions))
         self.assertTrue(meta.is_batched)
         with self.assertRaisesRegex(ValueError, "row counts differ"):
-            slice_compressor_query(meta, 2, 4, 0)
+            slice_compressor_query(meta, 2, width, 0)
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires a PPU test allocation")
@@ -67,7 +76,7 @@ class C4SpeculativeRingTest(unittest.TestCase):
         )
 
         torch.manual_seed(701)
-        raw = torch.randn(2, 516, 512, device="cuda") * 0.2
+        raw = torch.randn(2, 524, 512, device="cuda") * 0.2
         ape = torch.randn(8, 128, device="cuda") * 0.1
         table = torch.tensor([[5, 2], [3, 4]], device="cuda", dtype=torch.int32)
         starts = [254, 510]
@@ -80,6 +89,8 @@ class C4SpeculativeRingTest(unittest.TestCase):
                         [5, 2][(pos // 256) % 2] if b == 0 else [3, 4][(pos // 256) % 2]
                     )
                     state[physical, pos % entries].copy_(raw[b, pos])
+            prefix_state = state.clone()
+            original_raw = raw.clone()
 
             def step(offset):
                 pos = torch.tensor([s + offset for s in starts], device="cuda")
@@ -117,11 +128,22 @@ class C4SpeculativeRingTest(unittest.TestCase):
             for offset in range(4):
                 step(offset)
             if entries == 12:
-                # Reject the last three proposals; overwrite the next token
-                # and recompute its C4 boundary from the retained prefix.
-                for b, start in enumerate(starts):
-                    raw[b, start + 1].add_(0.15)
-                step(1)
+                # Each accepted length changes the position at which a
+                # correction/bonus is replayed. Check MTP1/MTP2/MTP3 across
+                # every rejection position and the all-accepted boundary.
+                for width in (2, 3, 4):
+                    for accepted in range(1, width + 1):
+                        with self.subTest(width=width, accepted=accepted):
+                            state.copy_(prefix_state)
+                            raw.copy_(original_raw)
+                            for offset in range(width):
+                                step(offset)
+                            for b, start in enumerate(starts):
+                                raw[b, start + accepted].add_(0.15)
+                            # Advance through the next compression boundary;
+                            # stale speculative state must not enter its sum.
+                            for offset in range(accepted, accepted + 4):
+                                step(offset)
 
 
 if __name__ == "__main__":

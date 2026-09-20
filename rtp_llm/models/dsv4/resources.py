@@ -59,7 +59,10 @@ def opaque_cache_layouts(metadata):
                 entries = (1 + desc["state_ring_overlap"]) * ratio
                 if desc["state_ring_include_gen_num_per_cycle"]:
                     entries += generation
-                entries = (entries + 1) & ~1
+                alignment = desc.get("state_ring_entry_alignment", 2)
+                if alignment <= 0:
+                    raise ValueError(f"Invalid state ring alignment for {tag}")
+                entries = (entries + alignment - 1) // alignment * alignment
             elif mode == "EXPLICIT":
                 entries = desc["explicit_entry_count"]
             else:

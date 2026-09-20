@@ -10,6 +10,7 @@ import inspect
 import json
 import os
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -39,17 +40,17 @@ from rtp_llm.utils.model_weight import W
 class TensorCache:
     """CP1, MTP-off native-compatible views with a reserved null block."""
 
-    def __init__(self, layer, ratio, batch, max_seq_len=16384):
+    def __init__(self, layer, ratio, batch, max_seq_len=16384, gamma=0):
         self.layer = layer
         # One kernel block covers 256 raw tokens, including 64 FP4 entries.
-        self.specs = {SWA_KV: (128, 16384, 1)}
+        self.specs = {SWA_KV: ((128 + gamma + 1) & ~1, 16384, 1)}
         if ratio:
             kv, state = (CSA_KV, CSA_STATE) if ratio == 4 else (HCA_KV, HCA_STATE)
             self.specs[kv] = (256 // ratio, 256, max_seq_len // 256)
-            self.specs[state] = (8 if ratio == 4 else 128, 16384, 1)
+            self.specs[state] = (((8 if ratio == 4 else 128) + gamma + 1) & ~1, 16384, 1)
         if ratio == 4:
             self.specs[INDEXER_KV] = (64, 256, max_seq_len // 256)
-            self.specs[INDEXER_STATE] = (8, 16384, 1)
+            self.specs[INDEXER_STATE] = ((8 + gamma + 3) // 4 * 4, 16384, 1)
         self.group_tags = list(self.specs)
         self.tables, self.pools = {}, {}
         state_dims = {CSA_STATE: 2048, HCA_STATE: 1024, INDEXER_STATE: 512}
@@ -211,7 +212,7 @@ def load_attention(checkpoint, layer, max_batch):
         norm_eps=config["rms_norm_eps"],
         layer_weights=weights,
     )
-    attn.reset_rope_cache(torch.device("cuda"))
+    attn.init_rope_cache(torch.device("cuda"))
     return attn, hashes
 
 
@@ -304,6 +305,152 @@ def bf16_ulp_distance(a, b):
     "requires a read-only Flash checkpoint and a PPU M890P",
 )
 class DecodeAttentionTest(unittest.TestCase):
+    @torch.inference_mode()
+    def test_mtp_overlap_graph_matches_reference_through_rejection(self):
+        self._check_mtp_overlap_graph(use_metadata_graph=False)
+
+    @torch.inference_mode()
+    def test_mtp_metadata_graph_and_merged_attention_through_rejection(self):
+        self._check_mtp_overlap_graph(use_metadata_graph=True)
+
+    @torch.inference_mode()
+    def test_batched_mtp_indexer_preserves_state_and_causal_topk(self):
+        self._check_mtp_overlap_graph(use_metadata_graph=True, batch_indexer=True)
+        self._check_mtp_overlap_graph(
+            use_metadata_graph=True, batch_indexer=True, batch=80, layers=(2,),
+            short_positions=(126, 127, 128, 254, 255, 256),
+        )
+
+    def _check_mtp_overlap_graph(
+        self, *, use_metadata_graph, batch_indexer=False, batch=3,
+        layers=(0, 2, 3), short_positions=None,
+    ):
+        torch.manual_seed(890416)
+        for layer in layers:
+            attn, _ = load_attention(Path(os.environ["RTP_PPU_DSV4_CHECKPOINT"]), layer, batch * 4)
+            attn._decode_mtp_overlap = True
+            if attn.indexer is not None:
+                attn.indexer._batch_mtp_queries = batch_indexer
+            trace = AttentionTrace(attn)
+            for width in (2, 3, 4):
+                with self.subTest(layer=layer, width=width):
+                    print(f"MTP_ATTENTION_START layer={layer} width={width}", flush=True)
+                    cache = TensorCache(layer, attn.compress_ratio, batch, gamma=width - 1)
+                    reference = TensorCache(layer, attn.compress_ratio, batch, gamma=width - 1)
+                    initial = cache.clone_contents()
+                    positions = torch.full((batch,), 127, dtype=torch.int32, device="cuda")
+                    inputs = torch.randn(batch, width, 4096, dtype=torch.bfloat16, device="cuda")
+                    config = DSv4DecodeFmhaImplConfigFP8(
+                        max_batch_size=batch, q_len=width, window_size=128,
+                        head_dim=512, max_seq_len=16384, compress_ratios=[attn.compress_ratio],
+                        index_topk=512, paged_pool_specs=cache.specs, group_tags=cache.group_tags,
+                    )
+                    tagged = cache.inputs(positions, batch, stable=use_metadata_graph)
+                    if use_metadata_graph:
+                        from rtp_llm.platforms.ppu.models.dsv4.ppu_decode_metadata import PpuDecodeMetadataGraph
+
+                        impl = PpuDecodeMetadataGraph(
+                            config, torch.device("cuda"), tagged,
+                            fused_state_slots=True, shared_rope_tables=(attn.freqs_cis,),
+                        )
+                    else:
+                        impl = DSv4DecodeFmhaImplFP8(config, torch.device("cuda"), tagged)
+                    stream = torch.cuda.Stream()
+                    stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(stream):
+                        for _ in range(3):
+                            attn.forward_decode(inputs, impl.metadata, cache)
+                    torch.cuda.current_stream().wait_stream(stream)
+                    graph = torch.cuda.CUDAGraph()
+                    graph_trace = trace.begin()
+                    with torch.cuda.graph(graph, stream=stream):
+                        actual = attn.forward_decode(inputs, impl.metadata, cache)
+                    graph_arguments = trace.arguments
+                    torch.cuda.current_stream().wait_stream(stream)
+                    cache.restore(initial)
+                    position, iteration = 0, 0
+                    cases = []
+                    while position < 260:
+                        cases.append(position)
+                        position += 1 + iteration % width
+                        iteration += 1
+                    if short_positions is not None:
+                        cases = list(short_positions)
+                    short_steps = len(cases)
+                    # Address-only probes with valid nonzero packed history
+                    # also exercise real TopK selection beyond 512 C4 entries.
+                    cases.extend((2046, 2047, 2048, 4094, 4095, 4096, 5502, 5503, 5504))
+                    max_mla_ulp, max_output_abs, repeat_checks = 0, 0.0, 0
+                    for iteration, position in enumerate(cases):
+                        if iteration == short_steps:
+                            inject_long_history(cache, reference)
+                        positions.fill_(position)
+                        inputs.normal_()
+                        tagged = cache.inputs(positions, batch, stable=use_metadata_graph)
+                        impl.prepare_cuda_graph(tagged)
+                        eager = DSv4DecodeFmhaImplFP8(config, torch.device("cuda"), tagged)
+                        eager.prepare_cuda_graph(tagged)
+                        eager_trace = trace.begin()
+                        reference_indexer = (
+                            patch.object(attn.indexer, "_batch_mtp_queries", False)
+                            if attn.indexer is not None else nullcontext()
+                        )
+                        with patch.object(attn, "_decode_streams", None), reference_indexer:
+                            expected = attn.forward_decode(inputs, eager.metadata, reference)
+                        graph.replay()
+                        self.assertEqual(graph_trace.keys(), eager_trace.keys())
+                        for name in graph_trace.keys() - {"output"}:
+                            observed, wanted = graph_trace[name], eager_trace[name]
+                            if name.endswith("topk_idxs"):
+                                observed = observed.sort(dim=-1).values
+                                wanted = wanted.sort(dim=-1).values
+                            torch.testing.assert_close(
+                                observed, wanted, rtol=0, atol=0,
+                                msg=f"MTP MLA {name} layer={layer} width={width} position={position}",
+                            )
+                        for tag in cache.pools:
+                            torch.testing.assert_close(
+                                cache.pools[tag].kv_cache_base,
+                                reference.pools[tag].kv_cache_base,
+                                rtol=0, atol=0,
+                                msg=f"MTP cache {tag} layer={layer} width={width} position={position}",
+                            )
+                        for value in (actual, expected, graph_trace["output"], eager_trace["output"]):
+                            self.assertTrue(bool(torch.isfinite(value).all()))
+                        ulp = int(bf16_ulp_distance(graph_trace["output"], eager_trace["output"]).max())
+                        max_mla_ulp = max(max_mla_ulp, ulp)
+                        max_output_abs = max(max_output_abs, float((actual.float() - expected.float()).abs().max()))
+                        # As in the single-query test below, qualify replay
+                        # against the same native MLA kernel's repeat envelope.
+                        # Output projection can amplify one BF16 MLA ULP; an
+                        # arbitrary final-output tolerance obscures that cause.
+                        if ulp > 1:
+                            repeat_checks += 1
+                            low = high = trace.original(**graph_arguments).clone()
+                            for _ in range(15):
+                                repeated = trace.original(**graph_arguments)
+                                self.assertTrue(bool(torch.isfinite(repeated).all()))
+                                low = torch.minimum(low, repeated)
+                                high = torch.maximum(high, repeated)
+                            nearest = torch.maximum(low, torch.minimum(high, graph_trace["output"]))
+                            self.assertLessEqual(
+                                int(bf16_ulp_distance(graph_trace["output"], nearest).max()),
+                                1, (layer, width, position),
+                            )
+                        freqs = attn.freqs_cis.index_select(0, impl.metadata.position_ids[:batch * width].long())
+                        projected = decode_output_proj(attn, graph_trace["output"].clone(), freqs, batch, width)
+                        torch.testing.assert_close(projected, actual, rtol=0, atol=0)
+                    print("MTP_ATTENTION_RESULT " + json.dumps({
+                        "layer": layer, "width": width, "steps": len(cases),
+                        "metadata_graph": use_metadata_graph,
+                        "batched_indexer": batch_indexer, "batch": batch,
+                        "max_mla_bf16_ulp": max_mla_ulp,
+                        "max_output_abs": max_output_abs,
+                        "same_kernel_repeat_checks": repeat_checks,
+                        "cache_exact": True,
+                        "mla_inputs_equal_up_to_topk_order": True,
+                    }), flush=True)
+
     @torch.inference_mode()
     def test_checkpoint_attention_graph_and_state(self):
         self._check_checkpoint_attention(shared_rope=False)

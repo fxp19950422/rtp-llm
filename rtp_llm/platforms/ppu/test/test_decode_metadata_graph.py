@@ -22,9 +22,10 @@ class MetadataFactoryTest(unittest.TestCase):
 
         options = dict(DECODE_EXECUTION_OPTIONS)
         provider = PpuDecodeProvider(options)
+        config = SimpleNamespace(q_len=1)
         options["DSV4_PPU_DECODE_ROPE"] = "layer"
         with self.assertRaisesRegex(ValueError, "constructed"):
-            provider.build_decode_metadata(DSv4DecodeFmhaImplFP8)
+            provider.build_decode_metadata(DSv4DecodeFmhaImplFP8, config)
 
         class Attention:
             def __init__(self, **kwargs):
@@ -38,13 +39,13 @@ class MetadataFactoryTest(unittest.TestCase):
         with patch(
             "rtp_llm.platforms.ppu.models.dsv4.ppu_decode_metadata.PpuDecodeMetadataGraph"
         ) as factory:
-            provider.build_decode_metadata(DSv4DecodeFmhaImplFP8)
+            provider.build_decode_metadata(DSv4DecodeFmhaImplFP8, config)
             tables = factory.call_args.kwargs["shared_rope_tables"]
             self.assertEqual(len(tables), 1)
             self.assertIs(tables[0], table)
         del first, second
         with self.assertRaisesRegex(RuntimeError, "released"):
-            provider.build_decode_metadata(DSv4DecodeFmhaImplFP8)
+            provider.build_decode_metadata(DSv4DecodeFmhaImplFP8, config)
 
     def test_shared_rope_rejects_a_replaced_attention_source(self):
         from rtp_llm.platforms.ppu.models.dsv4.ppu_decode_attention import (
@@ -62,6 +63,28 @@ class MetadataFactoryTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "RoPE source changed"):
             decode_attention_overlap(attention, torch.zeros((1, 1, 4)), metadata, {})
+
+    def test_masking_requires_metadata_graph_and_boolean_option(self):
+        for options in (
+            {"DSV4_PPU_MTP_MASK_INACTIVE": "yes"},
+            {"DSV4_PPU_MTP_MASK_INACTIVE": "1"},
+        ):
+            with self.assertRaises(ValueError):
+                PpuDecodeProvider({**DECODE_EXECUTION_OPTIONS, **options})
+
+    def test_batched_indexer_option_is_instance_owned(self):
+        options = {**DECODE_EXECUTION_OPTIONS, "DSV4_PPU_MTP_BATCH_INDEXER": "1"}
+        candidate = PpuDecodeProvider(options)
+        options["DSV4_PPU_MTP_BATCH_INDEXER"] = "0"
+        plain = PpuDecodeProvider(DECODE_EXECUTION_OPTIONS)
+        with self.assertRaisesRegex(ValueError, "BATCH_INDEXER"):
+            PpuDecodeProvider({**DECODE_EXECUTION_OPTIONS, "DSV4_PPU_MTP_BATCH_INDEXER": "yes"})
+        class Attention:
+            def __init__(self, **kwargs):
+                self.batch_queries = kwargs["decode_mtp_batch_indexer"]
+                self.freqs_cis = torch.zeros((8, 2), dtype=torch.complex64)
+        self.assertTrue(candidate.build_attention(Attention).batch_queries)
+        self.assertFalse(plain.build_attention(Attention).batch_queries)
 
     def test_default_and_explicit_factory_contract(self):
         value = object()
@@ -103,7 +126,35 @@ class MetadataGraphTest(unittest.TestCase):
     def test_shared_rope_dynamic_positions_and_batch_ownership(self):
         self._check_model_metadata("graph_fused", shared_rope=True)
 
-    def _check_model_metadata(self, mode, shared_rope=False):
+    @torch.inference_mode()
+    def test_mtp_verify_and_draft_metadata_match_reference(self):
+        for width in (2, 3, 4):
+            for role in ("verify", "draft"):
+                with self.subTest(width=width, role=role):
+                    self._check_model_metadata(
+                        "graph_fused", shared_rope=True, q_len=width, mtp_role=role
+                    )
+
+    @torch.inference_mode()
+    def test_device_lengths_override_stale_host_mirrors(self):
+        for width, role in ((1, None), (2, "verify"), (2, "draft"), (3, "verify"), (3, "draft"), (4, "verify"), (4, "draft")):
+            with self.subTest(width=width, role=role):
+                self._check_model_metadata(
+                    "graph_fused", shared_rope=True, q_len=width,
+                    mtp_role=role, device_inputs=True,
+                )
+
+    @torch.inference_mode()
+    def test_inactive_token_mask_tracks_device_tables(self):
+        for width in (1, 2, 3, 4):
+            with self.subTest(width=width):
+                self._check_model_metadata(
+                    "graph_fused", shared_rope=True, q_len=width,
+                    mtp_role="verify" if width > 1 else None,
+                    device_inputs=True, mask_inactive=True,
+                )
+
+    def _check_model_metadata(self, mode, shared_rope=False, q_len=1, mtp_role=None, device_inputs=False, mask_inactive=False):
         from rtp_llm.models_py.model_desc.deepseek_v4_model import DeepSeekV4Model
         from rtp_llm.models_py.modules.dsv4.fp8.decode.decode_fmha_impl import (
             DSv4DecodeFmhaImplFP8,
@@ -122,13 +173,13 @@ class MetadataGraphTest(unittest.TestCase):
         )
 
         specs = {
-            SWA_KV: (128, 16384, 1),
+            SWA_KV: ((128 + q_len) & ~1, 16384, 2 if mask_inactive else 1),
             CSA_KV: (64, 256, 64),
             HCA_KV: (2, 256, 64),
             INDEXER_KV: (64, 256, 64),
-            CSA_STATE: (8, 16384, 1),
-            HCA_STATE: (128, 16384, 1),
-            INDEXER_STATE: (8, 16384, 1),
+            CSA_STATE: ((8 + q_len) & ~1, 16384, 1),
+            HCA_STATE: ((128 + q_len) & ~1, 16384, 1),
+            INDEXER_STATE: ((8 + q_len + 2) // 4 * 4, 16384, 1),
         }
         constants = {
             "/req_id_per_token",
@@ -151,10 +202,13 @@ class MetadataGraphTest(unittest.TestCase):
             positions = torch.zeros(batch, dtype=torch.int32, pin_memory=True)
             inputs = {
                 tag: SimpleNamespace(
-                    sequence_lengths=positions,
-                    input_lengths=torch.ones(batch, dtype=torch.int32),
-                    is_prefill=False,
-                    is_target_verify=False,
+                    sequence_lengths=(
+                        torch.full_like(positions, 16384) if mtp_role else positions
+                    ),
+                    prefix_lengths=positions if mtp_role else None,
+                    input_lengths=torch.full((batch,), q_len, dtype=torch.int32),
+                    is_prefill=mtp_role == "draft",
+                    is_target_verify=mtp_role == "verify",
                     # Strided sources test that identity includes layout.
                     kv_cache_kernel_block_id_device=torch.ones(
                         (batch, count * 2), device="cuda", dtype=torch.int32
@@ -163,7 +217,10 @@ class MetadataGraphTest(unittest.TestCase):
                 for tag, (_, _, count) in specs.items()
             }
             if shared_rope:
-                provider = PpuDecodeProvider(DECODE_EXECUTION_OPTIONS)
+                provider = PpuDecodeProvider({
+                    **DECODE_EXECUTION_OPTIONS, "DSV4_PPU_MTP_METADATA_GRAPH": "1",
+                    "DSV4_PPU_MTP_MASK_INACTIVE": "1" if mask_inactive else "0",
+                })
             else:
                 # Keep unfused state-slot and per-layer RoPE numerical references
                 # without exposing additional production provider modes.
@@ -263,11 +320,31 @@ class MetadataGraphTest(unittest.TestCase):
                         table[::2].zero_()
                     elif step % 3 == 1:
                         table[:, -1].fill_(-1)
+                if mask_inactive and step % 4 == 2:
+                    # A real block can occupy a later column with column 0 empty.
+                    inputs[SWA_KV].kv_cache_kernel_block_id_device[:, 0].zero_()
+                    inputs[SWA_KV].kv_cache_kernel_block_id_device[:, -1].fill_(1)
                 reference.prepare_cuda_graph(inputs)
                 for name, tensor in actual.items():
                     if name not in constants:
                         tensor.fill_(-99)
-                candidate.prepare_cuda_graph(inputs)
+                candidate_inputs = inputs
+                if device_inputs:
+                    candidate_inputs = {tag: SimpleNamespace(**vars(value)) for tag, value in inputs.items()}
+                    device_positions = positions.cuda()
+                    for value in candidate_inputs.values():
+                        value.sequence_lengths = torch.full_like(positions, -777)
+                        value.prefix_lengths = torch.full_like(positions, -888)
+                        value.prefix_lengths_device = device_positions
+                        value.sequence_lengths_plus_1_device = device_positions + 1
+                candidate.prepare_cuda_graph(candidate_inputs)
+                if mask_inactive:
+                    mask = candidate.metadata.active_token_mask
+                    self.assertEqual(mask.data_ptr(), pointers["/active_token_mask"])
+                    expected_mask = (
+                        inputs[SWA_KV].kv_cache_kernel_block_id_device > 0
+                    ).any(dim=1).repeat_interleave(q_len)
+                    self.assertTrue(torch.equal(mask, expected_mask))
                 if graph is None:
                     graph = candidate._metadata_graph
                 self.assertIs(candidate._metadata_graph, graph)
@@ -323,11 +400,11 @@ class MetadataGraphTest(unittest.TestCase):
                 candidate.prepare_cuda_graph(inputs)
             inputs[SWA_KV].kv_cache_kernel_block_id_device = original
             for value in inputs.values():
-                value.sequence_lengths = positions.to(torch.int64)
+                setattr(value, "prefix_lengths" if mtp_role else "sequence_lengths", positions.to(torch.int64))
             with self.assertRaisesRegex(ValueError, "int32 batch"):
                 candidate.prepare_cuda_graph(inputs)
             for value in inputs.values():
-                value.sequence_lengths = positions
+                setattr(value, "prefix_lengths" if mtp_role else "sequence_lengths", positions)
             with self.assertRaisesRegex(ValueError, "every configured cache tag"):
                 candidate.prepare_cuda_graph({SWA_KV: inputs[SWA_KV]})
 

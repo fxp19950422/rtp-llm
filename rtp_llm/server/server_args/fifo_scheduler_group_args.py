@@ -77,7 +77,18 @@ def init_fifo_scheduler_group_args(parser, fifo_scheduler_config):
         type=int,
         default=0,
         help="chunked prefill 单次 PREFILL forward 的总 token 预算，由所有真实 context row 共享。"
+            "设置 prefill_chunk_batch_tokens 后，本参数限制单个 stream 的真实 context rows 总预算。"
             ">0 时启用，并自动按 KV cache block 大小对齐。"
             "仅支持 PREFILL / PDFUSION 角色，且不支持 MLA 或线性注意力模型。"
             "使用 force_batch、beam、logits、loss、hidden_states、all_probs 或多模态输入的请求将被拒绝。",
+    )
+    fifo_scheduler_group.add_argument(
+        "--prefill_chunk_batch_tokens",
+        env_name="PREFILL_CHUNK_BATCH_TOKENS",
+        bind_to=[(fifo_scheduler_config, "prefill_chunk_batch_tokens")],
+        type=int,
+        default=0,
+        help="chunked prefill 全 batch 的独立计算 token 预算；0 沿用 prefill_chunk_size。"
+            "正数要求启用 chunk，且介于 prefill_chunk_size 与 max_batch_tokens_size 之间，"
+            "按 KV block 向下对齐；每个 stream 仍受 prefill_chunk_size 限制。",
     )

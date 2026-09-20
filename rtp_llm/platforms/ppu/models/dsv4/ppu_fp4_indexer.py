@@ -110,6 +110,7 @@ class PpuFP4Compressor(CompressorFP8):
 
 class PpuFP4Indexer(IndexerFP8):
     CACHE_ENTRY_BYTES = 68
+    _batch_mtp_queries = False
 
     def __init__(self, *args, layer_weights, **kwargs):
         super().__init__(
@@ -251,8 +252,8 @@ class PpuFP4Indexer(IndexerFP8):
         q_producer_stream=None,
         decode_streams=None,
     ):
-        if x.ndim != 3 or x.shape[1] not in (1, 4):
-            raise ValueError("FP4 Indexer requires Decode or MTP3 verify queries")
+        if x.ndim != 3 or x.shape[1] not in (1, 2, 3, 4):
+            raise ValueError("FP4 Indexer requires Decode or MTP1/MTP2/MTP3 verify queries")
         if x.shape[1] == 1:
             return self._forward_decode_step(
                 x,
@@ -273,18 +274,25 @@ class PpuFP4Indexer(IndexerFP8):
         batch, query_length = x.shape[:2]
         if not batch:
             return out_topk_buffer
+        if self._batch_mtp_queries:
+            return self._forward_decode_queries_batched(
+                x, qr, start_pos, out_topk_buffer, compressor_meta
+            )
         queries = qr.reshape(batch, query_length, -1)
         output = out_topk_buffer.reshape(batch, query_length, self.index_topk)
+        # Reuse contiguous scratch across query positions. Output slices have
+        # a request stride of query_length * index_topk and cannot be passed
+        # directly to kernels that require contiguous per-request rows.
+        step_output = torch.empty(
+            (batch, 1, self.index_topk),
+            device=x.device,
+            dtype=out_topk_buffer.dtype,
+        )
         # Tokens from one request mutate the same state ring. Process query
         # positions in order, batching independent requests at each position.
         # This also preserves the pre-rollback state in the speculative ring.
         for index in range(query_length):
             meta = slice_compressor_query(compressor_meta, batch, query_length, index)
-            step_output = torch.empty(
-                (batch, 1, self.index_topk),
-                device=x.device,
-                dtype=out_topk_buffer.dtype,
-            )
             self._forward_decode_step(
                 x[:, index : index + 1].contiguous(),
                 queries[:, index : index + 1].contiguous(),
@@ -295,6 +303,57 @@ class PpuFP4Indexer(IndexerFP8):
             )
             output[:, index : index + 1].copy_(step_output)
         return out_topk_buffer
+
+    def _forward_decode_queries_batched(self, x, qr, start_pos, out_topk_buffer, meta):
+        """Batch stateless work; retain chronological C4 state transitions."""
+        batch, width = x.shape[:2]
+        tokens = batch * width
+        x, qr = x.contiguous(), qr.contiguous()
+        if self._cp_ctx is not None and self._cp_ctx.cp_size > 1:
+            raise ValueError("FP4 Indexer CP is not qualified")
+        if self._kv_pool_view is None or self._kv_block_table is None:
+            raise RuntimeError("FP4 Indexer Decode pools were not bound")
+        if meta.positions.numel() != tokens or not out_topk_buffer.is_contiguous():
+            raise ValueError("Batched Indexer requires request-major metadata and contiguous output")
+        self.compressor.freqs_cis = self.freqs_cis
+        self._propagate_pool_to_nested()
+        try:
+            q = self._compute_indexer_q(qr, None, apply_rope=False)
+            q = q.reshape(tokens, self.n_heads, 128).contiguous()
+            weights = F.linear(x.reshape(tokens, -1), self.weights_proj)
+            q, qs, weights = quantize_q(
+                q, weights, self.weight_scale,
+                torch.view_as_real(self.freqs_cis).flatten(-2), meta.positions,
+            )
+            for index in range(width):
+                step = slice_compressor_query(meta, batch, width, index)
+                self.compressor.forward_decode_vectorized(
+                    x[:, index : index + 1].contiguous(), start_pos + index,
+                    meta=step, position_ids=step.positions.reshape(batch, 1),
+                )
+            # C4 writes only newly completed compressed entries. Each query's
+            # own length excludes later appended entries; state writes above
+            # must remain ordered even though score/TopK can now be batched.
+            lengths = meta.compressed_lens_per_token
+            if lengths is None:
+                lengths = (meta.positions + 1) // self.compress_ratio
+            lengths = lengths.reshape(tokens, 1).to(torch.int32).contiguous()
+            table = self._kv_block_table[:batch].to(torch.int32)
+            table = table.repeat_interleave(width, dim=0).contiguous()
+            capacity = table.shape[1] * self._kv_eb
+            score_width = max(32, min(capacity, self._kv_cache_t or capacity))
+            logits = paged_score(
+                q.reshape(tokens, 1, self.n_heads, 64),
+                qs.reshape(tokens, 1, self.n_heads), weights,
+                self._kv_pool_view, table, lengths, score_width,
+            )
+            topk_decode(
+                logits.reshape(tokens, score_width), lengths.reshape(tokens),
+                out_topk_buffer.reshape(tokens, self.index_topk),
+            )
+            return out_topk_buffer
+        finally:
+            self._clear_nested_pool()
 
     def _forward_decode_step(
         self,
@@ -391,10 +450,13 @@ class PpuFP4Attention(PpuRopeAttention):
         decode_stream_pool=None,
         decode_qkv_mode="separate",
         decode_indexer_mode="sequential",
+        decode_mtp_overlap=False,
+        decode_mtp_batch_indexer=False,
         **kwargs,
     ):
         if decode_qkv_mode not in ("separate", "merged"):
             raise ValueError("PPU Decode QKV must be separate or merged")
+        self._decode_mtp_overlap = decode_mtp_overlap
         if decode_qkv_mode == "merged" and decode_stream_pool is None:
             raise ValueError("Merged PPU Decode QKV requires model-owned streams")
         if decode_indexer_mode not in ("sequential", "overlap"):
@@ -402,6 +464,8 @@ class PpuFP4Attention(PpuRopeAttention):
         if decode_indexer_mode == "overlap" and decode_stream_pool is None:
             raise ValueError("PPU Indexer overlap requires model-owned streams")
         super().__init__(*args, indexer_factory=PpuFP4Indexer, **kwargs)
+        if self.indexer is not None:
+            self.indexer._batch_mtp_queries = bool(decode_mtp_batch_indexer)
         self._decode_streams = None
         self._decode_indexer_streams = None
         self._decode_qkv_projection = None
@@ -474,7 +538,7 @@ class PpuFP4Attention(PpuRopeAttention):
         )
 
     def _forward_decode_body(self, x, attn_metadata):
-        if self._decode_streams is None or x.shape[1] != 1:
+        if self._decode_streams is None or (x.shape[1] != 1 and not self._decode_mtp_overlap):
             return super()._forward_decode_body(x, attn_metadata)
         from .ppu_decode_attention import decode_attention_overlap
 

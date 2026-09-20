@@ -128,14 +128,19 @@ class PpuEPMoE(nn.Module):
             self._shared_executor.start(self.shared_experts, x)
         return routing
 
-    def _run_chunk(self, x, input_ids, out, *, observer=None):
+    def _run_chunk(self, x, input_ids, out, *, observer=None, active_token_mask=None):
         weights, indices = self._route_and_start_shared(x, input_ids)
         try:
             if observer is not None:
                 observer("input", x)
                 observer("topk_weights", weights)
                 observer("topk_indices", indices)
-            routed = self._strategy(x, weights, indices)
+            if active_token_mask is None:
+                routed = self._strategy(x, weights, indices)
+            else:
+                routed = self._strategy(
+                    x, weights, indices, active_token_mask=active_token_mask
+                )
         except Exception:
             self._shared_executor.finish()
             raise
@@ -147,12 +152,22 @@ class PpuEPMoE(nn.Module):
         if observer is not None:
             observer("final_y", out)
 
-    def forward(self, x, input_ids, *, is_decode_forward=False, positions=None):
+    def forward(
+        self, x, input_ids, *, is_decode_forward=False, positions=None,
+        active_token_mask=None,
+    ):
         shape = x.shape
         flat = x.reshape(-1, self.dim)
         ids = input_ids.reshape(-1)
         if ids.numel() != flat.size(0):
             raise ValueError("MoE input_ids/token mismatch")
+        if active_token_mask is not None and (
+            active_token_mask.shape != (flat.size(0),)
+            or active_token_mask.dtype != torch.bool
+            or active_token_mask.device != flat.device
+            or not active_token_mask.is_contiguous()
+        ):
+            raise ValueError("MoE active_token_mask must be one device bool per token")
         capacity = self.max_tokens_per_rank
         capturing = (
             torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
@@ -177,6 +192,10 @@ class PpuEPMoE(nn.Module):
             )
             with self._record_function_scope():
                 self._run_chunk(
-                    flat[start:end], ids[start:end], out[start:end], observer=observer
+                    flat[start:end], ids[start:end], out[start:end], observer=observer,
+                    active_token_mask=(
+                        active_token_mask[start:end]
+                        if active_token_mask is not None else None
+                    ),
                 )
         return out.view(shape)

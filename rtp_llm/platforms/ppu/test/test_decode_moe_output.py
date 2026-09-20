@@ -1,6 +1,8 @@
 """Native BF16 combine storage must preserve the FP32 shared-add boundary."""
 
 import unittest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -11,6 +13,35 @@ from rtp_llm.platforms.ppu.modules.fused_moe.mxfp4_low_latency import (
 
 
 class MoeOutputContractTest(unittest.TestCase):
+    def test_decode_block_forwards_optional_mask_only_when_present(self):
+        from rtp_llm.models_py.modules.dsv4.block import Block
+
+        x = torch.ones(2, 3, 4, 8)
+        ids = torch.zeros(2, 3, dtype=torch.int64)
+        mask = torch.tensor([True, True, True, False, False, False])
+        hc = SimpleNamespace(
+            pre_norm=lambda value, *args, **kwargs: (value, None, None),
+            post=lambda value, *args: value,
+        )
+        ffn = Mock(return_value=x)
+        block = SimpleNamespace(
+            layer_id=0, tp_size=1, tp_rank=0, attn_hc=hc, ffn_hc=hc,
+            attn_norm=None, ffn_norm=None, ffn=ffn,
+        )
+        with patch(
+            "rtp_llm.models_py.modules.dsv4._record_tensor.should_record_layer",
+            return_value=False,
+        ):
+            for value in (None, mask):
+                metadata = SimpleNamespace(active_token_mask=value)
+                Block.forward_decode(block, x, metadata, ids, attn_fn=lambda x: x)
+                expected = {"is_decode_forward": True}
+                if value is not None:
+                    expected["active_token_mask"] = mask
+                self.assertEqual(ffn.call_args.kwargs.keys(), expected.keys())
+                if value is not None:
+                    self.assertIs(ffn.call_args.kwargs["active_token_mask"], mask)
+
     def test_invalid_output_dtype_fails_before_dispatch(self):
         with self.assertRaisesRegex(ValueError, "routed output"):
             low_latency_mxfp4_moe(

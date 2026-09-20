@@ -61,9 +61,10 @@ def normalize_decode_qkv(raw, q_weight, kv_weight, freqs, eps):
     The row layout is Flash Q-A 1024 followed by KV 512. The kernel retains
     FP32 RMSNorm/RoPE arithmetic and the original BF16 consumer boundary.
     """
-    if raw.ndim != 3 or tuple(raw.shape[1:]) != (1, 1536):
-        raise ValueError("Merged Decode QKV must have shape [B,1,1536]")
-    batch = raw.shape[0]
+    if raw.ndim != 3 or raw.shape[1] not in (1, 2, 3, 4) or raw.shape[2] != 1536:
+        raise ValueError("Merged Decode QKV must have shape [B,Q,1536], Q=1/2/3/4")
+    batch, queries = raw.shape[:2]
+    rows = batch * queries
     tensors = (raw, q_weight, kv_weight, freqs)
     if any(
         not t.is_cuda or t.device != raw.device or not t.is_contiguous()
@@ -80,14 +81,14 @@ def normalize_decode_qkv(raw, q_weight, kv_weight, freqs, eps):
         raise TypeError("Merged QKV projection and norm weights must be BF16")
     if q_weight.shape != (1024,) or kv_weight.shape != (512,):
         raise ValueError("Merged QKV requires norm weights [1024] and [512]")
-    if freqs.shape != (batch, 32) or freqs.dtype != torch.complex64:
-        raise ValueError("Merged QKV frequencies must be complex64 [B,32]")
+    if freqs.shape != (rows, 32) or freqs.dtype != torch.complex64:
+        raise ValueError("Merged QKV frequencies must be complex64 [B*Q,32]")
     if not math.isfinite(eps) or eps <= 0:
         raise ValueError("Merged QKV norm epsilon must be finite and positive")
-    q = torch.empty((batch, 1, 1024), dtype=raw.dtype, device=raw.device)
-    kv = torch.empty((batch, 1, 512), dtype=raw.dtype, device=raw.device)
-    if batch:
-        _qkv_norm[(batch, 2)](
+    q = torch.empty((batch, queries, 1024), dtype=raw.dtype, device=raw.device)
+    kv = torch.empty((batch, queries, 512), dtype=raw.dtype, device=raw.device)
+    if rows:
+        _qkv_norm[(rows, 2)](
             raw,
             q_weight,
             kv_weight,

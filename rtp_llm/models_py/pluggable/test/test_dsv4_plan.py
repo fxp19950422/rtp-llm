@@ -214,6 +214,15 @@ class Dsv4PlanTest(unittest.TestCase):
                     ctx.prepare([request_for("model", ctx.selection)])
 
     def test_mtp3_target_and_draft_use_separate_complete_plans(self):
+        self._check_mtp_target_and_draft_plans(3)
+
+    def test_mtp2_target_and_draft_use_separate_complete_plans(self):
+        self._check_mtp_target_and_draft_plans(2)
+
+    def test_mtp1_target_and_draft_use_separate_complete_plans(self):
+        self._check_mtp_target_and_draft_plans(1)
+
+    def _check_mtp_target_and_draft_plans(self, gamma):
         from rtp_llm.models.dsv4.specs import validate_runtime_role
 
         for decode in (False, True):
@@ -228,7 +237,7 @@ class Dsv4PlanTest(unittest.TestCase):
                         layer_compress_ratios=[0] if layers == 1 else [4] * 43,
                         speculative=True,
                         speculative_type="MTP",
-                        gen_num_per_cycle=3,
+                        gen_num_per_cycle=gamma,
                     )
                     ctx = (
                         self.decode_context(rank, **changed)
@@ -268,7 +277,7 @@ class Dsv4PlanTest(unittest.TestCase):
             gen_num_per_cycle=3,
         )
         for changed in (
-            {"gen_num_per_cycle": 1},
+            {"gen_num_per_cycle": 0},
             {"gen_num_per_cycle": 4},
             {"speculative_type": "EAGLE3"},
             {"speculative": False},
