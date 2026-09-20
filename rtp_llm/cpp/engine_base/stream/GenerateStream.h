@@ -72,6 +72,7 @@ struct StreamSpecUpdateInfo {
     // updates leave speculative_propose_step at zero and are not counted.
     int speculative_propose_step = 0;
     int accepted_draft_tokens    = 0;
+    bool draft_token_ids_are_point_mass = false;
 };
 
 struct SpeculativeExecutorStreamOutput {
@@ -110,6 +111,7 @@ public:
 
     // hold tensors from grpc
     std::vector<torch::Tensor> tensors_holder;
+    bool token_ids_are_point_mass = false;
 };
 using SpeculativeExecutorStreamOutputPtr = std::shared_ptr<SpeculativeExecutorStreamOutput>;
 
@@ -640,6 +642,7 @@ public:
         // once bookkeeping catches up.
         // -1 = unset (first iter / cleared).
         int next_seq_len_upper_bound = -1;
+        bool draft_token_ids_are_point_mass = false;
     };
 
     uint64_t setMtpAsyncDeviceState(MtpAsyncDeviceState state) {
@@ -727,6 +730,13 @@ public:
     torch::Tensor getDraftAllProbsGpu() const {
         std::lock_guard<std::mutex> lock(*mtp_async_state_mutex_);
         return mtp_async_state_.draft_all_probs_gpu;
+    }
+    bool draftTokenIdsArePointMass(bool use_device_state) const {
+        std::lock_guard<std::mutex> lock(*mtp_async_state_mutex_);
+        if (use_device_state && mtp_async_state_.propose_tokens_gpu.defined()) {
+            return mtp_async_state_.draft_token_ids_are_point_mass;
+        }
+        return sp_output_buffer_ && sp_output_buffer_->token_ids_are_point_mass;
     }
     void clearSpecDecodeDeviceState() {
         // Unconditional legacy/testing escape hatch. Active MTP decode paths

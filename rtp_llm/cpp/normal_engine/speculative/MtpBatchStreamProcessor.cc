@@ -64,7 +64,12 @@ torch::Tensor MtpBatchStreamProcessor::advanceLinearCacheBlockTable(const torch:
                             batch_size,
                             previous_seq_lengths.numel(),
                             accept_lengths.numel());
-    if (batch_size == 0 || block_count == 0) {
+    // FULL/SWA groups (including DSv4 OpaqueKV specs) do not participate in host LINEAR swaps.
+    // DSv4's SWA/state groups can have only a few slots even at long absolute
+    // positions; computing LINEAR swap indices for those tables is invalid.
+    // Own the storage so the next gather cannot overwrite an in-flight view.
+    if (batch_size == 0 || block_count == 0
+        || std::find(group_types.begin(), group_types.end(), CacheGroupType::LINEAR) == group_types.end()) {
         return current_table.clone();
     }
 
@@ -1382,6 +1387,8 @@ void MtpBatchStreamProcessor::updateOneStepDraftSamplerOutput(const StreamGroups
     std::vector<torch::Tensor> draft_token_probs_list;
     std::vector<torch::Tensor> draft_token_id_slices;
     draft_token_id_slices.reserve(batch_size);
+    const bool point_mass = !stream_groups.allStreams().empty()
+        && stream_groups.allStreams().front()->draftTokenIdsArePointMass(useMtpDeviceState());
 
     for (const auto& stream : stream_groups.allStreams()) {
         auto sp_output_buffer = stream->getSPOutputBuffer();
@@ -1389,6 +1396,11 @@ void MtpBatchStreamProcessor::updateOneStepDraftSamplerOutput(const StreamGroups
         RTP_LLM_CHECK_WITH_INFO(
             draft_token.defined(), "one-step MTP draft sampler token missing for stream %ld", stream->streamId());
         draft_token_id_slices.push_back(draft_token);
+        RTP_LLM_CHECK_WITH_INFO(stream->draftTokenIdsArePointMass(useMtpDeviceState()) == point_mass,
+                                "MTP batch mixes proposal distribution contracts");
+        if (point_mass) {
+            continue;
+        }
 
         // Prefer main-thread device-state all_probs; fallback is safe after
         // worker clear because clear runs after specUpdate writes all_probs.
@@ -1410,9 +1422,10 @@ void MtpBatchStreamProcessor::updateOneStepDraftSamplerOutput(const StreamGroups
         }
     }
 
-    draft_token_probs_d_t          = torch::stack(draft_token_probs_list, 0).contiguous();
+    draft_token_probs_d_t = point_mass ? torch::Tensor() : torch::stack(draft_token_probs_list, 0).contiguous();
     draft_sampler_output.all_probs = draft_token_probs_d_t;
     draft_sampler_output.token_ids = std::move(draft_token_ids);
+    draft_sampler_output.token_ids_are_point_mass = point_mass;
 }
 
 void MtpBatchStreamProcessor::updateMultiStepDraftSamplerOutput(const StreamGroups&         stream_groups,
@@ -1422,6 +1435,21 @@ void MtpBatchStreamProcessor::updateMultiStepDraftSamplerOutput(const StreamGrou
                                                                 torch::Tensor&              draft_token_probs_d_t,
                                                                 std::vector<torch::Tensor>& draft_token_probs_list) {
     std::vector<torch::Tensor> prev_draft_token_probs_list;
+    const bool point_mass = !stream_groups.allStreams().empty()
+        && stream_groups.allStreams().front()->draftTokenIdsArePointMass(useMtpDeviceState());
+    if (point_mass) {
+        RTP_LLM_CHECK_WITH_INFO(draft_token_probs_list.empty(), "point-mass draft unexpectedly produced dense q");
+        for (const auto& stream : stream_groups.allStreams()) {
+            RTP_LLM_CHECK_WITH_INFO(stream->draftTokenIdsArePointMass(useMtpDeviceState()),
+                                    "MTP batch mixes proposal distribution contracts");
+        }
+        draft_token_probs_d_t = torch::Tensor();
+        draft_sampler_output.all_probs = torch::Tensor();
+        draft_sampler_output.token_ids_are_point_mass = true;
+        spec_token_ids_d_t = draft_token_ids_d_t.slice(1, 1).contiguous();
+        draft_sampler_output.token_ids = spec_token_ids_d_t;
+        return;
+    }
     for (const auto& stream : stream_groups.allStreams()) {
         auto sp_output_buffer = stream->getSPOutputBuffer();
         // Prefer device-state draft_all_probs (see comment in
@@ -1436,6 +1464,7 @@ void MtpBatchStreamProcessor::updateMultiStepDraftSamplerOutput(const StreamGrou
 
     draft_token_probs_d_t          = torch::cat(draft_token_probs_list, 1).contiguous();
     draft_sampler_output.all_probs = draft_token_probs_d_t;
+    draft_sampler_output.token_ids_are_point_mass = false;
 
     // draft_token_ids_d_t = draft_token_ids_d_t[:, 1:]
     spec_token_ids_d_t             = draft_token_ids_d_t.slice(1, 1).contiguous();
@@ -1512,6 +1541,7 @@ void MtpBatchStreamProcessor::preparePrefillSpecUpdateInfo(const StreamGroups&  
         }
 
         spec_update_infos.push_back({new_tokens, 1, -1, std::move(last_hidden_states), std::move(propose_all_probs)});
+        spec_update_infos.back().draft_token_ids_are_point_mass = draft_sampler_output.token_ids_are_point_mass;
 
         batch_idx_in += cur_batch_size;
         batch_idx_out += next_batch_size;
@@ -1563,6 +1593,7 @@ void MtpBatchStreamProcessor::prepareDecodeSpecUpdateInfo(
         StreamSpecUpdateInfo spec_update_info{
             accept_tokens_tensor, cur_accept_len, -1, std::move(last_hidden_states), std::move(propose_all_probs)};
         spec_update_info.speculative_propose_step = propose_step_;
+        spec_update_info.draft_token_ids_are_point_mass = draft_sampler_output.token_ids_are_point_mass;
         spec_update_info.accepted_draft_tokens    = std::max(0, cur_accept_len - 1);
         // Per-stream verify errors from SpecLogitsVerifyRunner ride the update
         // path so grammar/think mask failures reach the stream (main #1006).

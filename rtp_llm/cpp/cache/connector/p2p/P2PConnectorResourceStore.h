@@ -38,6 +38,7 @@ struct P2PConnectorResourceEntry {
         TensorPB             propose_probs;
         TensorPB             propose_hidden;
         std::vector<int32_t> position_ids;
+        bool proposal_is_point_mass = false;
     };
     SideChannelData             side_channel_data;
     bool                        side_channel_ready = false;

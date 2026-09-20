@@ -9,16 +9,18 @@ from rtp_llm.platforms.ppu.kernels.ppu_mxfp4_masked import (
 from rtp_llm.platforms.ppu.kernels.ppu_topk_padding import pad_inactive_routes
 
 
-def pad_topk(indices, weights):
+def pad_topk(indices, weights, active_token_mask=None):
     """Pad unsupported widths (including V4's six) with inactive routes."""
     width = indices.shape[1]
     supported = (2, 4, 8, 16)
     if width in supported:
-        return indices, weights
+        if active_token_mask is None:
+            return indices, weights
+        return pad_inactive_routes(indices, weights, width, active_token_mask)
     target = next((n for n in supported if n > width), None)
     if target is None or width <= 0:
         raise ValueError("DeepEP topk must be in [1,16]")
-    return pad_inactive_routes(indices, weights, target)
+    return pad_inactive_routes(indices, weights, target, active_token_mask)
 
 
 def low_latency_mxfp4_moe(
@@ -34,6 +36,7 @@ def low_latency_mxfp4_moe(
     expected_m,
     swiglu_limit=None,
     output_dtype=torch.float32,
+    active_token_mask=None,
 ):
     """Dispatch and combine every valid row, with no compact-prefix capacity.
 
@@ -58,7 +61,7 @@ def low_latency_mxfp4_moe(
         or x.shape[0] > max_dispatch_tokens
     ):
         raise ValueError("Invalid DeepEP LL BF16 tokens / FP32 weights / int64 routes")
-    indices, weights = pad_topk(indices, weights)
+    indices, weights = pad_topk(indices, weights, active_token_mask)
     indices, weights = indices.contiguous(), weights.contiguous()
     expert_x, counts, handle, _, _ = buffer.low_latency_dispatch(
         x=x.contiguous(),

@@ -48,6 +48,40 @@ class TopkPaddingTest(unittest.TestCase):
                         else:
                             self.assert_routes(indices, weights, output)
 
+    def test_mask_changes_in_graph_preserve_active_route_bits(self):
+        for width in (1, 2, 4, 6, 8, 16):
+            rows = 17
+            indices = torch.randint(-1, 256, (rows, width), device="cuda")
+            weights = torch.randn((rows, width), device="cuda")
+            weights[:, 0] = -0.0
+            if width > 1:
+                weights[:, 1] = 2**-140
+            mask = torch.ones(rows, dtype=torch.bool, device="cuda")
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    pad_topk(indices, weights, mask)
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                output = pad_topk(indices, weights, mask)
+            torch.cuda.current_stream().wait_stream(stream)
+            for active in (17, 3, 0, 9, 17):
+                mask.copy_(torch.arange(rows, device="cuda") < active)
+                output[0].fill_(999)
+                output[1].fill_(123)
+                graph.replay()
+                expected_indices = indices.clone()
+                expected_weights = weights.clone()
+                expected_indices[active:] = -1
+                expected_weights[active:] = 0
+                self.assert_routes(expected_indices, expected_weights, output)
+            with self.assertRaisesRegex(ValueError, "device bool"):
+                pad_topk(indices, weights, mask.to(torch.int32))
+            with self.assertRaisesRegex(ValueError, "device bool"):
+                pad_topk(indices, weights, mask[:-1])
+
     def test_changing_graph_inputs_overwrite_every_output(self):
         for rows in (1, 3, 8, 32, 128):
             with self.subTest(rows=rows):

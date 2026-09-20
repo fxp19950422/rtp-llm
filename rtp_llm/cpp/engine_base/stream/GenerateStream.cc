@@ -1228,6 +1228,7 @@ void GenerateStream::specUpdate(const StreamSpecUpdateInfo& update_info) {
 
     sp_output_buffer_->hidden_states = update_info.draft_hidden_states;
     sp_output_buffer_->all_probs     = update_info.draft_token_probs;
+    sp_output_buffer_->token_ids_are_point_mass = update_info.draft_token_ids_are_point_mass;
     // Apply the explicit tri-state proposal update. PD partial updates use
     // nullopt to preserve the handoff proposal; GPU/CPU proposal producers use
     // a defined/undefined Tensor respectively to replace or clear the mirror.

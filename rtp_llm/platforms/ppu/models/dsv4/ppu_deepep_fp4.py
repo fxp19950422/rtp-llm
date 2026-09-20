@@ -77,8 +77,9 @@ class PpuDeepEPFP4Strategy(torch.nn.Module):
         if output_dtype not in (torch.float32, torch.bfloat16):
             raise ValueError("PPU routed output must be FP32 or BF16")
         self.output_dtype = output_dtype
-        if expected_m_policy != "capacity":
-            raise ValueError("PPU MoE expected rows policy must be capacity")
+        if expected_m_policy not in ("capacity", "batch"):
+            raise ValueError("PPU MoE expected rows policy must be capacity or batch")
+        self._expected_m_policy = expected_m_policy
         if not self.can_handle(cfg):
             raise ValueError(
                 "PPU DeepEP MXFP4 requires TP1 with compatible EP-local experts"
@@ -96,6 +97,16 @@ class PpuDeepEPFP4Strategy(torch.nn.Module):
 
     def expected_rows(self, num_tokens):
         """Host launch hint only; never truncate the buffer or device counts."""
+        if self._expected_m_policy == "batch":
+            # Remote ranks may send far more rows than the local estimate.
+            # The masked kernels still traverse their full device counts;
+            # this value changes launch geometry, never receive capacity.
+            cfg = self.cfg
+            return max(
+                1,
+                (num_tokens * cfg.ep_size * cfg.n_activated_experts
+                 + cfg.n_routed_experts - 1) // cfg.n_routed_experts,
+            )
         return self._expected_m
 
     def setup_weights(self, layer_weights):
@@ -133,7 +144,7 @@ class PpuDeepEPFP4Strategy(torch.nn.Module):
         self._wrapper = wrapper
         return wrapper
 
-    def forward(self, x, weights, indices):
+    def forward(self, x, weights, indices, *, active_token_mask=None):
         from rtp_llm.platforms.ppu.modules.fused_moe.mxfp4_low_latency import (
             low_latency_mxfp4_moe,
         )
@@ -151,4 +162,5 @@ class PpuDeepEPFP4Strategy(torch.nn.Module):
             expected_m=self.expected_rows(x.shape[0]),
             swiglu_limit=self.cfg.swiglu_limit if self.cfg.swiglu_limit > 0 else None,
             output_dtype=self.output_dtype,
+            active_token_mask=active_token_mask,
         )

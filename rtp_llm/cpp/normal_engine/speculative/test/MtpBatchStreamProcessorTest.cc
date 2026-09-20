@@ -1413,6 +1413,17 @@ TEST_F(MtpBatchStreamProcessorTest, testUpdateOneStepDraftSamplerOutput) {
 
     vector<float> expect_all_probs = {0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8};
     EXPECT_EQ(expect_all_probs, toVec<float>(sampler_output.all_probs));
+    EXPECT_FALSE(sampler_output.token_ids_are_point_mass);
+
+    for (auto stream : {stream1, stream2}) {
+        stream->getSPOutputBuffer()->all_probs = torch::Tensor();
+        stream->getSPOutputBuffer()->token_ids_are_point_mass = true;
+    }
+    processor.updateOneStepDraftSamplerOutput(stream_groups, sampler_output, draft_token_probs_d_t, holder);
+    EXPECT_EQ(expect_token_ids, toVec<int>(sampler_output.token_ids));
+    EXPECT_TRUE(sampler_output.token_ids_are_point_mass);
+    EXPECT_FALSE(sampler_output.all_probs.defined());
+    EXPECT_FALSE(draft_token_probs_d_t.defined());
 }
 
 TEST_F(MtpBatchStreamProcessorTest, testUpdateOneStepDraftSamplerOutputFromDeviceState) {
@@ -1482,6 +1493,19 @@ TEST_F(MtpBatchStreamProcessorTest, testUpdateOneStepDraftSamplerOutputFromDevic
     vector<float> expect_all_probs = {0.9, 0.8, 0.7, 0.6, 0.4, 0.3, 0.2, 0.1};
     EXPECT_TRUE(sampler_output.all_probs.is_cuda());
     EXPECT_EQ(expect_all_probs, toVec<float>(sampler_output.all_probs));
+
+    // Device state is authoritative even while the worker-owned stream still
+    // holds the previous dense distribution and different proposal tokens.
+    for (auto stream : {stream1, stream2}) {
+        auto state = stream->getMtpAsyncDeviceState();
+        state.draft_all_probs_gpu = torch::Tensor();
+        state.draft_token_ids_are_point_mass = true;
+        stream->setMtpAsyncDeviceState(std::move(state));
+    }
+    processor.updateOneStepDraftSamplerOutput(stream_groups, sampler_output, draft_token_probs_d_t, holder);
+    EXPECT_EQ(expect_token_ids, toVec<int>(sampler_output.token_ids));
+    EXPECT_TRUE(sampler_output.token_ids_are_point_mass);
+    EXPECT_FALSE(sampler_output.all_probs.defined());
 
     unsetenv("RTP_LLM_MTP_ASYNC_DEVICE_STATE");
 }
@@ -1557,6 +1581,19 @@ TEST_F(MtpBatchStreamProcessorTest, updateMultiStepDraftSamplerOutput) {
     vector<float> expect_all_probs = {0.1, 0.2, 0.3, 0.4, 1.1, 1.2, 1.3, 1.4, 2.1, 2.2, 2.3, 2.4,
                                       0.5, 0.6, 0.7, 0.8, 1.5, 1.6, 1.7, 1.8, 2.5, 2.6, 2.7, 2.8};
     EXPECT_EQ(expect_all_probs, toVec<float>(sampler_output.all_probs));
+
+    for (auto stream : {stream1, stream2}) {
+        stream->getSPOutputBuffer()->token_ids_are_point_mass = true;
+        stream->getSPOutputBuffer()->all_probs = torch::Tensor();
+    }
+    draft_token_probs_list.clear();
+    processor.updateMultiStepDraftSamplerOutput(stream_groups, sampler_output,
+                                                draft_token_ids_d_t, spec_token_ids_d_t,
+                                                draft_token_probs_d_t, draft_token_probs_list);
+    EXPECT_EQ(expect_token_ids, toVec<int>(sampler_output.token_ids));
+    EXPECT_TRUE(sampler_output.token_ids_are_point_mass);
+    EXPECT_FALSE(sampler_output.all_probs.defined());
+    EXPECT_FALSE(draft_token_probs_d_t.defined());
 }
 
 TEST_F(MtpBatchStreamProcessorTest, testPrefillDispatchUsesDraftLastHiddenOverride) {
@@ -1721,6 +1758,23 @@ TEST_F(MtpBatchStreamProcessorTest, testAdvanceLinearCacheBlockTableMatchesEvery
     }
 
     EXPECT_TRUE(torch::equal(actual, expected));
+}
+
+TEST_F(MtpBatchStreamProcessorTest, testOpaqueCacheSnapshotKeepsShortRingAtLongPositionsAndOwnsStorage) {
+    const auto cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+    // OPAQUE state/SWA tables are short rings, not absolute-position LINEAR
+    // tables.  Crossing position 8192 must not index slot 32 in a two-slot ring.
+    auto original = torch::arange(12, torch::kInt32).reshape({3, 2, 2});
+    auto source = original.to(cuda_i32);
+    auto snapshot = MtpBatchStreamProcessor::advanceLinearCacheBlockTable(
+        source,
+        torch::tensor({8192, 8193}, torch::kInt32).to(cuda_i32),
+        torch::tensor({1, 2}, torch::kInt32).to(cuda_i32),
+        {CacheGroupType::SWA, CacheGroupType::FULL, CacheGroupType::FULL},
+        256);
+    EXPECT_NE(snapshot.data_ptr(), source.data_ptr());
+    source.zero_();
+    EXPECT_TRUE(torch::equal(snapshot.cpu(), original));
 }
 
 TEST_F(MtpBatchStreamProcessorTest, testCacheSnapshotOverlayKeepsPhysicalKernelPairAndFreshRows) {

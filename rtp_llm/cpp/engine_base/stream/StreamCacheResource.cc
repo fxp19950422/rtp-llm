@@ -220,6 +220,9 @@ static bool applyP2PSideChannelToStream(const std::shared_ptr<FusedAsyncReadCont
                payload->propose_tokens.size() * sizeof(int));
 
         const auto cuda_i32 = torch::TensorOptions().dtype(torch::kInt32).device(torch::kCUDA);
+        sp_output_buffer->token_ids_are_point_mass = payload->proposal_is_point_mass;
+        RTP_LLM_CHECK_WITH_INFO(!payload->proposal_is_point_mass || !tensorPbHasPayload(payload->propose_probs),
+                                "point-mass P2P handoff must not carry dense probabilities");
         if (tensorPbHasPayload(payload->propose_probs)) {
             sp_output_buffer->all_probs = TensorPbConvert::pbToTorch(payload->propose_probs).to(torch::kCUDA);
         }
@@ -249,6 +252,7 @@ static bool applyP2PSideChannelToStream(const std::shared_ptr<FusedAsyncReadCont
                 .draft_all_probs_gpu    = sp_output_buffer->all_probs,
                 .previous_seq_len_upper_bound = stream->seqLength(),
                 .next_seq_len_upper_bound     = stream->seqLength(),
+                .draft_token_ids_are_point_mass = sp_output_buffer->token_ids_are_point_mass,
             });
         }
         RTP_LLM_LOG_DEBUG("applyP2PSideChannel: propose_tokens count=%zu", payload->propose_tokens.size());

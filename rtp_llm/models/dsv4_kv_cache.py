@@ -291,6 +291,10 @@ def build_dsv4_kv_cache_spec_descs(
         4 * indexer_head_dim,
         DataType.TYPE_FP32,
     )
+    if indexer_cache_mode is Dsv4IndexerCacheMode.FP4:
+        # The native C4 kernel addresses groups of four state rows. MTP1's
+        # 8+1 ring must round to 12, rather than the generic two-row multiple.
+        indexer_state.state_ring_entry_alignment = CSA_LAYER_COMPRESS_RATIO
     csa_state = _make_dsv4_desc(
         CSA_STATE_TAG,
         _FIXED_STATE_KIND,

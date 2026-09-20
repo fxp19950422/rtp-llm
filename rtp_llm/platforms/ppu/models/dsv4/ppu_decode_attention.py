@@ -19,15 +19,15 @@ def decode_attention_overlap(attn, x, metadata, streams):
     Streams are prepared at construction and shared across this model's layers.
     """
     bsz, q_len, _ = x.shape
-    if q_len != 1:
-        raise ValueError("PPU Decode overlap requires one token per request")
+    if q_len not in (1, 2, 3, 4):
+        raise ValueError("PPU Decode overlap requires 1/2/3/4 tokens per request")
     start_pos = metadata.start_pos[:bsz]
-    position_ids = metadata.position_ids[:bsz]
+    position_ids = metadata.position_ids[: bsz * q_len]
     attn._ensure_freqs_cis_bound()
     shared_freqs = getattr(metadata, "rope_freqs_by_source", {})
     if shared_freqs:
         try:
-            freqs = shared_freqs[id(attn.freqs_cis)][:bsz]
+            freqs = shared_freqs[id(attn.freqs_cis)][: bsz * q_len]
         except KeyError as error:
             raise RuntimeError(
                 "Decode RoPE source changed; rebuild the metadata Graph"
@@ -48,6 +48,7 @@ def decode_attention_overlap(attn, x, metadata, streams):
                 tensor.record_stream(stream)
     try:
         qr, kv = None, None
+        # The fused norm indexes every B*Q row and uses its own rotary phase.
         if attn._decode_qkv_projection is not None:
             from rtp_llm.platforms.ppu.kernels.ppu_qkv_norm import normalize_decode_qkv
 
@@ -71,7 +72,9 @@ def decode_attention_overlap(attn, x, metadata, streams):
             qr = decode_compute_q_a(attn, x)
         if attn.indexer is not None:
             indexer_options = {}
-            if attn._decode_indexer_streams is None:
+            # Multi-query indexer owns chronological ring updates on its
+            # outer stream; only single-query decode uses its inner fork.
+            if attn._decode_indexer_streams is None or q_len > 1:
                 streams["indexer"].wait_stream(current)
             else:
                 indexer_options["q_producer_stream"] = current
