@@ -941,6 +941,7 @@ MtpExecutor::MtpExecutor(const EngineInitParams&                        params,
     const bool skip_greedy_rng = !is_dspark_
         && readEnvFlagOnce("RTP_LLM_MTP_SKIP_GREEDY_RNG", "mtp-sampler", "skip_greedy_rng");
     speculative_sampler_.reset(new speculative::SpeculativeSampler(d2t_map_, propose_step_, skip_greedy_rng));
+    batch_stream_processor_->setDraftToTargetMap(d2t_map_);
     if (!is_dspark_) {
         fast_topk_sampler_.reset(new speculative::FastTopKSampler(d2t_map_));
     }

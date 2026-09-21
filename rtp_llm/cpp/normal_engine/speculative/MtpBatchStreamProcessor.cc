@@ -1377,6 +1377,21 @@ void MtpBatchStreamProcessor::updateDecodePostDraftModelInput(
     hidden_states_d_t              = model_input.last_hidden_states;
 }
 
+torch::Tensor MtpBatchStreamProcessor::targetDraftProbs(const torch::Tensor& probs) const {
+    RTP_LLM_CHECK_WITH_INFO(probs.defined() && probs.dim() >= 2, "dense MTP proposal is missing");
+    if (probs.size(-1) == static_cast<int64_t>(vocab_size_)) {
+        return probs;
+    }
+    RTP_LLM_CHECK_WITH_INFO(draft_to_target_map_.defined()
+                                && draft_to_target_map_.numel() == probs.size(-1),
+                            "dense MTP proposal vocabulary requires a matching d2t map");
+    auto shape = probs.sizes().vec();
+    shape.back() = vocab_size_;
+    auto mapped = torch::zeros(shape, probs.options());
+    mapped.index_copy_(-1, draft_to_target_map_.to(probs.device(), torch::kInt64), probs);
+    return mapped;
+}
+
 void MtpBatchStreamProcessor::updateOneStepDraftSamplerOutput(const StreamGroups& stream_groups,
                                                               SamplerOutput&      draft_sampler_output,
                                                               torch::Tensor&      draft_token_probs_d_t,
@@ -1416,7 +1431,7 @@ void MtpBatchStreamProcessor::updateOneStepDraftSamplerOutput(const StreamGroups
         RTP_LLM_CHECK_WITH_INFO(use_dev_probs || (sp_output_buffer && sp_output_buffer->all_probs.defined()),
                                 "one-step MTP draft all_probs missing for stream %ld",
                                 stream->streamId());
-        draft_token_probs_list.push_back(use_dev_probs ? dev_probs : sp_output_buffer->all_probs);
+        draft_token_probs_list.push_back(targetDraftProbs(use_dev_probs ? dev_probs : sp_output_buffer->all_probs));
         dense_reference = draft_token_probs_list.back();
     }
 
@@ -1472,8 +1487,8 @@ void MtpBatchStreamProcessor::updateMultiStepDraftSamplerOutput(const StreamGrou
         // Prefer device-state draft_all_probs (see comment in
         // updateOneStepDraftSamplerOutput for the same fallback contract).
         const auto& dev_probs = stream->getDraftAllProbsGpu();
-        prev_draft_token_probs_list.push_back(useMtpDeviceState() && dev_probs.defined() ? dev_probs :
-                                                                                           sp_output_buffer->all_probs);
+        prev_draft_token_probs_list.push_back(targetDraftProbs(
+            useMtpDeviceState() && dev_probs.defined() ? dev_probs : sp_output_buffer->all_probs));
         dense_reference = prev_draft_token_probs_list.back();
         ++batch_idx;
     }
@@ -1488,7 +1503,7 @@ void MtpBatchStreamProcessor::updateMultiStepDraftSamplerOutput(const StreamGrou
         probs = probs.to(dense_reference.options());
     }
     for (auto& probs : draft_token_probs_list) {
-        probs = probs.to(dense_reference.options());
+        probs = targetDraftProbs(probs).to(dense_reference.options());
     }
     auto pre_draft_token_probs = torch::stack(prev_draft_token_probs_list, 0).contiguous();
     draft_token_probs_list.insert(draft_token_probs_list.begin(), pre_draft_token_probs);
@@ -1573,6 +1588,7 @@ void MtpBatchStreamProcessor::preparePrefillSpecUpdateInfo(const StreamGroups&  
 
         spec_update_infos.push_back({new_tokens, 1, -1, std::move(last_hidden_states), std::move(propose_all_probs)});
         spec_update_infos.back().draft_token_ids_are_point_mass = draft_sampler_output.token_ids_are_point_mass;
+        spec_update_infos.back().draft_to_target_map = draft_to_target_map_;
 
         batch_idx_in += cur_batch_size;
         batch_idx_out += next_batch_size;

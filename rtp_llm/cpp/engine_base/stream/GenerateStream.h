@@ -73,6 +73,7 @@ struct StreamSpecUpdateInfo {
     int speculative_propose_step = 0;
     int accepted_draft_tokens    = 0;
     bool draft_token_ids_are_point_mass = false;
+    torch::Tensor draft_to_target_map;
 };
 
 struct SpeculativeExecutorStreamOutput {
@@ -116,6 +117,8 @@ public:
     torch::Tensor propose_tokens_gpu;
     torch::Tensor hidden_states;
     torch::Tensor all_probs;
+    // Shared immutable vocabulary metadata for legacy dense P/D handoff.
+    torch::Tensor draft_to_target_map;
 
     // hold tensors from grpc
     std::vector<torch::Tensor> tensors_holder;

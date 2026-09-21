@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -592,17 +593,10 @@ void PrefillRpcServer::remoteGenerate(PrefillGenerateContext& prefill_context) {
     auto sp_output_buffer = stream->getSPOutputBuffer();
 
     if (sp_output_buffer && !engine_->isDSpark()) {
-        generate_request.set_proposal_is_point_mass(sp_output_buffer->token_ids_are_point_mass);
-        if (sp_output_buffer->token_ids_are_point_mass) {
-            // Older decode peers ignore the marker and still require dense q.
-            auto all_probs_cpu = SpeculativeExecutorStreamOutput::pointMassProbs(
-                sp_output_buffer->draftTokens().cpu().reshape({-1}), maga_init_params_.model_config_.vocab_size);
-            QueryConverter::transTensorPB(generate_request.mutable_propose_probs(), all_probs_cpu);
-        } else {
-            RTP_LLM_CHECK_WITH_INFO(sp_output_buffer->all_probs.defined(), "dense MTP handoff requires probabilities");
-            auto all_probs_cpu = sp_output_buffer->all_probs.cpu();
-            QueryConverter::transTensorPB(generate_request.mutable_propose_probs(), all_probs_cpu);
-        }
+        const auto* legacy_env = std::getenv("RTP_LLM_MTP_LEGACY_DENSE_HANDOFF");
+        const bool legacy_dense = legacy_env && std::string(legacy_env) == "1";
+        QueryConverter::transMtpProposal(
+            &generate_request, *sp_output_buffer, maga_init_params_.model_config_.vocab_size, legacy_dense);
         torch::Tensor hidden_states_cpu;
         if (!sp_output_buffer->hidden_states.defined()) {
             // dummy hidden states, so datatype is not important
