@@ -69,6 +69,7 @@ def run_rank(rank, world, rendezvous):
             tp_size=1,
         ),
         expected_m_policy=os.environ.get("RTP_PPU_MOE_TEST_HINT", "capacity"),
+        gemm_tile=os.environ.get("RTP_PPU_MOE_TEST_TILE", "auto"),
     )
     # Each nibble denotes exactly 1. W1/W3 use 2**-8; W2 uses an
     # expert-specific power of two, making route/EP-shard mistakes observable.
