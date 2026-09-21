@@ -773,6 +773,58 @@ class DeepseekV4DetectorTest(TestCase):
 
 
 class DeepseekV4ReasoningToolPipelineTest(IsolatedAsyncioTestCase):
+    async def test_official_full_parser_parallel_limit(self):
+        for parallel in (False, True, None):
+            with self.subTest(parallel=parallel):
+                encoding = Mock()
+                encoding.parse_message_from_completion_text.return_value = {
+                    "role": "assistant",
+                    "content": "Weather results.",
+                    "reasoning_content": "Compare the two cities.",
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": "get_weather",
+                                "arguments": json.dumps({"city": city}),
+                            },
+                        }
+                        for city in ("Hangzhou", "Shanghai")
+                    ],
+                }
+                renderer = _make_renderer(encoding)
+                renderer._generate_log_probs = AsyncMock(return_value=None)
+                request = ChatCompletionRequest(
+                    messages=[{"role": "user", "content": "Weather?"}],
+                    tools=_rtp_tools(),
+                    parallel_tool_calls=parallel,
+                    chat_template_kwargs={"enable_thinking": True},
+                )
+                status = ReasoningToolStreamStatus(
+                    request,
+                    DeepSeekV4Detector(),
+                    ReasoningParser(model_type="deepseek-v3", force_reasoning=True),
+                )
+                # No DSML here: a parser fallback cannot satisfy these assertions.
+                status.delta_output_string = "official completion"
+                delta = await renderer._process_reasoning_and_tool_calls(
+                    status, self._output(), is_streaming=False
+                )
+                encoding.parse_message_from_completion_text.assert_called_once()
+                self.assertEqual(delta.output_str.content, "Weather results.")
+                self.assertEqual(
+                    delta.output_str.reasoning_content, "Compare the two cities."
+                )
+                calls = delta.output_str.tool_calls
+                self.assertEqual(len(calls), 1 if parallel is False else 2)
+                self.assertEqual(
+                    json.loads(calls[0].function.arguments), {"city": "Hangzhou"}
+                )
+                if parallel is not False:
+                    self.assertEqual(
+                        json.loads(calls[1].function.arguments), {"city": "Shanghai"}
+                    )
+
     async def test_auto_tool_parallel_limit_full_and_streaming(self):
         text = (
             "<｜DSML｜tool_calls>\n"

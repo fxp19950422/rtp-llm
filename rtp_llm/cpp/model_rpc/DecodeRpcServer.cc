@@ -684,10 +684,9 @@ void DecodeRpcServer::localGenerate(DecodeGenerateContext& decode_context) {
 
             sp_output_buffer->token_ids_are_point_mass = generate_request.proposal_is_point_mass();
             // Dense q may accompany the marker for older peers; new peers use the marker.
-            torch::Tensor propose_probs_t;
-            if (!sp_output_buffer->token_ids_are_point_mass) {
-                RTP_LLM_CHECK_WITH_INFO(generate_request.has_propose_probs(), "dense MTP handoff lacks probabilities");
-                propose_probs_t = pinGrpcTensor(QueryConverter::transTensor(generate_request.propose_probs()));
+            auto propose_probs_t = QueryConverter::transMtpProposalProbs(generate_request);
+            if (propose_probs_t.defined()) {
+                propose_probs_t = pinGrpcTensor(propose_probs_t);
             }
             auto propose_hidden_t = pinGrpcTensor(QueryConverter::transTensor(generate_request.propose_hidden()));
 
