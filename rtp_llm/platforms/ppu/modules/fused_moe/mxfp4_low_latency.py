@@ -37,6 +37,7 @@ def low_latency_mxfp4_moe(
     swiglu_limit=None,
     output_dtype=torch.float32,
     active_token_mask=None,
+    gemm_tile="auto",
 ):
     """Dispatch and combine every valid row, with no compact-prefix capacity.
 
@@ -90,6 +91,7 @@ def low_latency_mxfp4_moe(
         expected_m=expected_m,
         swiglu_limit=swiglu_limit,
         out=combine_slot if direct else None,
+        gemm_tile=gemm_tile,
     )
     if not direct:
         if result.shape != combine_slot.shape:

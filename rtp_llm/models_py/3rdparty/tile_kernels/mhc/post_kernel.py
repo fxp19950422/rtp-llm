@@ -169,7 +169,10 @@ def mhc_post_fwd(
     out: torch.Tensor | None = None,
     *,
     enable_pdl: bool | None = None,
+    n_thr: int = 128,
 ) -> torch.Tensor:
+    if n_thr not in (128, 256):
+        raise ValueError("HC post threads must be 128 or 256")
     num_seqs, num_tokens, mhc, hidden = residual.shape
 
     assert x.dtype == torch.bfloat16, f"{x.dtype=}"
@@ -199,7 +202,7 @@ def mhc_post_fwd(
         out = torch.empty_like(residual)
     if enable_pdl is None:
         enable_pdl = os.environ.get("DSV4_MHC_POST_PDL", "1") != "0"
-    kernel = _mhc_post_fwd(mhc, hidden, enable_pdl=enable_pdl)
+    kernel = _mhc_post_fwd(mhc, hidden, n_thr=n_thr, enable_pdl=enable_pdl)
     kernel(
         comb_res_mix.flatten(0, 1),
         residual.flatten(0, 1),

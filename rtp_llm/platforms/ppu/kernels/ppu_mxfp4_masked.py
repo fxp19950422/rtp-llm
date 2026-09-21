@@ -45,8 +45,22 @@ def tensor_spans_overlap(a, b):
     return a0 < b1 and b0 < a1
 
 
+def _decode_tile_configs(gemm_tile, experts, hidden, inter, expected_m):
+    if gemm_tile not in ("auto", "n128"):
+        raise ValueError("PPU MoE GEMM tile must be auto or n128")
+    if gemm_tile == "auto" or (experts, hidden, inter) != (32, 4096, 2048) or expected_m > 16:
+        return None
+    from deep_gemm.jit_kernels.gemm_fp4 import get_smem_config_fp4
+    from deep_gemm.jit_kernels.utils import get_num_sms
+
+    # A launch hint only: masked GEMMs still traverse every device-side count.
+    return (get_num_sms(), 32, 128, 128, 32, 64, 2,
+            get_smem_config_fp4(2, 32, 128, 32, 64, 128))
+
+
 def mxfp4_experts_masked(
-    expert_x, weight13, weight2, counts, *, expected_m, swiglu_limit=None, out=None
+    expert_x, weight13, weight2, counts, *, expected_m, swiglu_limit=None, out=None,
+    gemm_tile="auto",
 ):
     """Two masked GEMMs and fused SwiGLU; all valid rows retain full capacity.
 
@@ -95,12 +109,14 @@ def mxfp4_experts_masked(
     ):
         raise ValueError("Expert output must be a disjoint contiguous BF16 full slot")
 
+    configs = _decode_tile_configs(gemm_tile, e, d, inter, expected_m)
+    launch_kwargs = {"configs": configs} if configs is not None else {}
     gate_up = torch.empty((e, m, 2 * inter), dtype=torch.bfloat16, device=x.device)
     deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(
-        (x, scale), (w13, s13), None, gate_up, counts, expected_m
+        (x, scale), (w13, s13), None, gate_up, counts, expected_m, **launch_kwargs
     )
     hidden = silu_mul_masked_mxfp4(gate_up, counts, swiglu_limit, expected_m)
     deep_gemm.m_grouped_gemm_fp4_fp4_bf16_nt_masked(
-        hidden, (w2, s2), None, out, counts, expected_m
+        hidden, (w2, s2), None, out, counts, expected_m, **launch_kwargs
     )
     return out

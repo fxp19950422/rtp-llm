@@ -70,7 +70,8 @@ class PpuDeepEPFP4Strategy(torch.nn.Module):
         )
 
     def __init__(
-        self, cfg, *, expected_m_policy="capacity", output_dtype=torch.float32
+        self, cfg, *, expected_m_policy="capacity", output_dtype=torch.float32,
+        gemm_tile="auto",
     ):
         super().__init__()
         self.cfg = cfg
@@ -80,6 +81,9 @@ class PpuDeepEPFP4Strategy(torch.nn.Module):
         if expected_m_policy not in ("capacity", "batch"):
             raise ValueError("PPU MoE expected rows policy must be capacity or batch")
         self._expected_m_policy = expected_m_policy
+        if gemm_tile not in ("auto", "n128"):
+            raise ValueError("PPU MoE GEMM tile must be auto or n128")
+        self._gemm_tile = gemm_tile
         if not self.can_handle(cfg):
             raise ValueError(
                 "PPU DeepEP MXFP4 requires TP1 with compatible EP-local experts"
@@ -163,4 +167,5 @@ class PpuDeepEPFP4Strategy(torch.nn.Module):
             swiglu_limit=self.cfg.swiglu_limit if self.cfg.swiglu_limit > 0 else None,
             output_dtype=self.output_dtype,
             active_token_mask=active_token_mask,
+            gemm_tile=self._gemm_tile,
         )
