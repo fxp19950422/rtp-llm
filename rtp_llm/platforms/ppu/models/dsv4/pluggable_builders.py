@@ -49,6 +49,7 @@ def build_decode_moe(*, build_ctx, request, platform_provider, **kwargs):
         strategy_kwargs={
             "expected_m_policy": platform_provider._moe_hint,
             "output_dtype": platform_provider._moe_output_dtype,
+            "gemm_tile": platform_provider._moe_tile,
         },
         **kwargs,
     )

@@ -10,9 +10,26 @@ from rtp_llm.platforms.ppu.models.dsv4 import pluggable_builders
 from rtp_llm.platforms.ppu.models.dsv4.ppu_decode_provider import PpuDecodeProvider
 from rtp_llm.platforms.ppu.models.dsv4.manifest import DECODE_EXECUTION_OPTIONS
 from rtp_llm.platforms.ppu.models.dsv4.ppu_deepep_fp4 import PpuDeepEPFP4Strategy
+from rtp_llm.platforms.ppu.kernels.ppu_mxfp4_masked import _decode_tile_configs
 
 
 class DecodeMoeHintTest(unittest.TestCase):
+    def test_tile_is_opt_in_and_model_shape_bounded(self):
+        self.assertIsNone(_decode_tile_configs("auto", 32, 4096, 2048, 8))
+        self.assertIsNone(_decode_tile_configs("n128", 32, 4096, 2048, 17))
+        self.assertIsNone(_decode_tile_configs("n128", 64, 4096, 2048, 8))
+        self.assertIsNone(_decode_tile_configs("n128", 32, 8192, 2048, 8))
+        self.assertIsNone(_decode_tile_configs("n128", 32, 4096, 4096, 8))
+        with self.assertRaisesRegex(ValueError, "GEMM tile"):
+            _decode_tile_configs("unknown", 32, 4096, 2048, 8)
+        with patch("deep_gemm.jit_kernels.utils.get_num_sms", return_value=64), patch(
+            "deep_gemm.jit_kernels.gemm_fp4.get_smem_config_fp4", return_value=(1, 2, 3)
+        ) as smem:
+            for hint in (1, 8, 16):
+                self.assertEqual(_decode_tile_configs("n128", 32, 4096, 2048, hint),
+                                 (64, 32, 128, 128, 32, 64, 2, (1, 2, 3)))
+            smem.assert_called_with(2, 32, 128, 32, 64, 128)
+
     def test_instance_policy_preserves_dispatch_contract(self):
         cfg = MoeCfg(
             layer_id=0,
@@ -85,9 +102,11 @@ class DecodeMoeHintTest(unittest.TestCase):
             self.assertEqual(launch.call_args.kwargs["max_dispatch_tokens"], 256)
             self.assertEqual(launch.call_args.kwargs["expected_m"], 24)
             self.assertEqual(launch.call_args.kwargs["output_dtype"], torch.bfloat16)
+            self.assertEqual(launch.call_args.kwargs["gemm_tile"], "auto")
             self.assertEqual(capacity.expected_rows(batch), 24)
         batch_provider = PpuDecodeProvider(
-            {**DECODE_EXECUTION_OPTIONS, "DSV4_PPU_MTP_MOE_HINT": "batch"}
+            {**DECODE_EXECUTION_OPTIONS, "DSV4_PPU_MTP_MOE_HINT": "batch",
+             "DSV4_PPU_MTP_MOE_TILE": "n128"}
         )
         context.selection.model_metadata["execution_options"] = batch_provider.execution_options
         with patch(
@@ -109,6 +128,7 @@ class DecodeMoeHintTest(unittest.TestCase):
             with patch(target) as launch:
                 batch_strategy(x, weights, indices)
             self.assertEqual(launch.call_args.kwargs["expected_m"], expected_hint)
+            self.assertEqual(launch.call_args.kwargs["gemm_tile"], "n128")
             self.assertEqual(launch.call_args.kwargs["max_dispatch_tokens"], 256)
             self.assertIs(launch.call_args.args[0], buffer)
             self.assertIs(launch.call_args.args[2], weights)
@@ -124,6 +144,10 @@ class DecodeMoeHintTest(unittest.TestCase):
             )
         with self.assertRaisesRegex(ValueError, "rows policy"):
             PpuDeepEPFP4Strategy(cfg, expected_m_policy="unknown")
+        with self.assertRaisesRegex(ValueError, "GEMM tile"):
+            PpuDeepEPFP4Strategy(cfg, gemm_tile="unknown")
+        with self.assertRaisesRegex(ValueError, "DSV4_PPU_MTP_MOE_TILE"):
+            PpuDecodeProvider({**DECODE_EXECUTION_OPTIONS, "DSV4_PPU_MTP_MOE_TILE": "unknown"})
         with self.assertRaisesRegex(ValueError, "DSV4_PPU_DECODE_MOE_OUTPUT"):
             PpuDecodeProvider(
                 {**DECODE_EXECUTION_OPTIONS, "DSV4_PPU_DECODE_MOE_OUTPUT": "fp16"}
