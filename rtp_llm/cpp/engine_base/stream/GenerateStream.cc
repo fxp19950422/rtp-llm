@@ -238,6 +238,14 @@ absl::Status GenerateStream::incrKVBlock() {
     return stream_cache_resource_->incrKVBlock();
 }
 
+absl::Status GenerateStream::preparePrefillChunk() {
+    std::lock_guard<std::mutex> lock(*mutex_);
+    if (!useChunkWindow() || isFakeStream()) {
+        return absl::OkStatus();
+    }
+    return stream_cache_resource_->incrKVBlock(reuse_length_ + currentChunkLen(), reuse_length_);
+}
+
 void GenerateStream::releaseResource() {
     RTP_LLM_PROFILE_FUNCTION();
     // Return KV blocks only after all workers that captured this stream finish.
@@ -947,15 +955,6 @@ StreamState GenerateStream::moveToNext() {
             state = old_status;
         } else {
             state = generate_status_->moveToNext();
-        }
-        if (state == StreamState::RUNNING && useChunkWindow() && !isFakeStream()) {
-            const auto prepared = stream_cache_resource_->incrKVBlock(
-                reuse_length_ + currentChunkLen(), reuse_length_);
-            if (!prepared.ok()) {
-                reportEventWithoutLock(StreamEvents::Error, ErrorCode::EXECUTION_EXCEPTION,
-                                       "chunk prefill state allocation failed: " + prepared.ToString());
-                state = getStatus();
-            }
         }
         const auto new_status = getStatus();
 

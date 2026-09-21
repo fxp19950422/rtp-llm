@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_pipeline.h>
+#include "topk_exact.cuh"
 
 #ifndef SGL_TOPK
 #define SGL_TOPK 512
@@ -143,7 +144,7 @@ template <uint32_t kBits>
 SGL_DEVICE uint32_t extract_coarse_bin_pf(float x) {
   // Order-preserving fp32->fp16->uint16 mapping, then top-kBits as bin idx.
   __half h = __float2half_rn(x);
-  uint16_t bits = __half_as_ushort(h);
+  uint16_t bits = x == 0.0f ? 0u : __half_as_ushort(h);
   uint16_t key = (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
   return key >> (16 - kBits);
 }
@@ -784,6 +785,11 @@ SGL_DEVICE void register_topk_bf16_pf(
   }
 
   const auto [thr_bin, num_above, num_equal] = smem->match;
+
+  if (num_equal > prefill_bf16::kMaxTies) {
+    rtp_topk::exact_topk<prefill_bf16::kTopK>(scores, indices, length, _smem);
+    return;
+  }
 
   // Phase 3: Scatter
   constexpr uint32_t kMaxTolerance = 0;

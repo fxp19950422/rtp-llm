@@ -105,6 +105,39 @@ py_test(
 )
 
 py_test(
+    name = "test_ppu_moe_gather_shared_source",
+    srcs = ["ppu/models/dsv4/test/test_ppu_moe_gather_shared_source.py"],
+    main = "ppu/models/dsv4/test/test_ppu_moe_gather_shared_source.py",
+    data = [":platform_sources", ":ppu_sources"],
+    tags = ["source-only"],
+)
+
+py_test(
+    name = "test_ppu_moe_route_compactor_source",
+    srcs = ["ppu/models/dsv4/test/test_ppu_moe_route_compactor_source.py"],
+    main = "ppu/models/dsv4/test/test_ppu_moe_route_compactor_source.py",
+    data = [":platform_sources", ":ppu_sources"],
+    tags = ["source-only"],
+)
+
+py_test(
+    name = "fp4_indexer_request_slices_test",
+    srcs = ["ppu/test/test_fp4_indexer_request_slices.py"],
+    main = "ppu/test/test_fp4_indexer_request_slices.py",
+    data = [":platform_sources", ":ppu_sources"],
+    deps = ["//rtp_llm/models_py:models", "//rtp_llm:testlib"],
+)
+
+test_suite(
+    name = "ppu_source_regression_tests",
+    tests = [
+        ":test_ppu_moe_gather_shared_source",
+        ":test_ppu_moe_route_compactor_source",
+        ":fp4_indexer_request_slices_test",
+    ],
+)
+
+py_test(
     name = "fp4_indexer_chunk_state_test",
     srcs = ["ppu/test/test_fp4_indexer_chunk_state.py"],
     main = "ppu/test/test_fp4_indexer_chunk_state.py",

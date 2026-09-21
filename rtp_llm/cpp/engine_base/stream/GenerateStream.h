@@ -195,6 +195,7 @@ public:
     void                 fakeInitKVBlock(size_t reserved_blocks = 0);
     virtual absl::Status initKVBlock();
     virtual absl::Status incrKVBlock();
+    absl::Status preparePrefillChunk();
     virtual void         releaseResource();
     int                  nextNeedBlockNums(int reserve_step) const;
     int                  estimateInitialNeedBlocks() const;
