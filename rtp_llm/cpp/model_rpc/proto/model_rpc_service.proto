@@ -400,6 +400,7 @@ message GenerateRequestPB {
     TensorPB propose_probs = 10;
     TensorPB propose_hidden = 11;
     // Explicit distribution contract; empty probabilities never imply a point mass.
+    // Senders also attach dense one-hot q for older peers; marked receivers may ignore it.
     bool proposal_is_point_mass = 12;
 }
 

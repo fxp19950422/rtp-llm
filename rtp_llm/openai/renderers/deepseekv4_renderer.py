@@ -679,14 +679,24 @@ class DeepseekV4Renderer(ReasoningToolBaseRenderer):
         output: GenerateOutput,
         is_streaming: bool,
     ) -> Optional[OutputDelta]:
+        parsed_delta = None
         if not is_streaming:
             parsed_delta = await self._parse_full_dsv4_completion(status, output)
-            if parsed_delta is not None:
-                return parsed_delta
-
-        return await super()._process_reasoning_and_tool_calls(
-            status, output, is_streaming
-        )
+        if parsed_delta is None:
+            parsed_delta = await super()._process_reasoning_and_tool_calls(
+                status, output, is_streaming
+            )
+        if (
+            parsed_delta is not None
+            and status.request.parallel_tool_calls is False
+            and parsed_delta.output_str.tool_calls
+        ):
+            # Auto mode must still permit plain text. Apply the same limit to
+            # full responses and every streaming fragment, including arguments.
+            parsed_delta.output_str.tool_calls = [
+                call for call in parsed_delta.output_str.tool_calls if call.index == 0
+            ] or None
+        return parsed_delta
 
     def _extract_streaming_reasoning_content(
         self,

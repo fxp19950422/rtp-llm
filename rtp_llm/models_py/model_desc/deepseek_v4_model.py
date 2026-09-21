@@ -413,6 +413,7 @@ class DeepSeekV4Model(GptModelBase):
             f"got {self._max_generate_batch_size}"
         )
         self._gen_num_per_cycle = int(model_config.gen_num_per_cycle)
+        self._prefill_scheduler_chunked = model_config.prefill_chunk_size > 0
         self._prefill_scheduler_token_capacity = int(
             model_config.moe_prefill_max_tokens_per_rank
             if model_config.moe_prefill_max_tokens_per_rank is not None
@@ -596,30 +597,29 @@ class DeepSeekV4Model(GptModelBase):
         return self._v4_args.max_seq_len * self._max_context_batch_size
 
     def _resolve_mtp_hidden_token_capacity(self) -> int:
-        # Keep the cross-forward MTP hidden buffer aligned with the scheduler
-        # token budget too.  In chunk prefill, sizing this by
-        # ``max_context_batch_size * max_seq_len`` has the same failure mode as
-        # ``PrefillWorkspace``: it reserves space for theoretical rows that the
-        # scheduler will never admit when ``max_batch_tokens_size`` is lower.
-        return min(
-            int(self._resolve_shared_token_capacity()),
-            int(self._prefill_scheduler_token_capacity),
+        decode_capacity = self._max_generate_batch_size * (
+            max(self._gen_num_per_cycle + 1, 1) if self._is_speculative else 1
         )
+        return max(self._resolve_prefill_q_token_capacity(), decode_capacity)
 
     def _resolve_prefill_q_token_capacity(self) -> int:
-        # ``PrefillWorkspace`` only needs to cover the largest scheduler-admitted
-        # prefill batch, not the theoretical ``max_context_batch_size *
-        # max_seq_len`` product when ``max_batch_tokens_size`` is lower.  The
-        # factory finalizes ``V4Args.max_tokens_per_rank`` from the scheduler as:
-        #
-        #   min(max_context_batch_size * max_seq_len, max_batch_tokens_size)
-        #
-        # Reusing that finalized cap keeps the prefill-Q scratch from reserving
-        # hundreds of thousands of rows when chunk/batch-token limits admit far
-        # fewer tokens.
+        if self._is_decode_role:
+            return self._resolve_shared_token_capacity()
+        budget = self._prefill_scheduler_token_capacity
+        if not self._prefill_scheduler_chunked:
+            # FIFO admits a singleton longer than the batch token budget.
+            budget = max(budget, int(self._v4_args.max_seq_len))
+        padded_capacity = resolve_moe_max_tokens_per_rank(
+            max_seq_len=int(self._v4_args.max_seq_len),
+            current_max_tokens_per_rank=budget,
+            cp_size=self._prefill_cp_size,
+            max_generate_batch_size=self._max_generate_batch_size,
+            max_context_batch_size=self._max_context_batch_size,
+            chunking_enabled=False,
+        )
         return min(
             int(self._resolve_shared_token_capacity()),
-            int(self._prefill_scheduler_token_capacity),
+            padded_capacity,
         )
 
     def _resolve_prefill_q_dim(self) -> int:

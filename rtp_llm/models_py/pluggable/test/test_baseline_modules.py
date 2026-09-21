@@ -42,11 +42,36 @@ class BaselineModuleConstructionTest(unittest.TestCase):
         model._max_generate_batch_size = 3
         model._is_speculative = False
         model._gen_num_per_cycle = 4
+        model._prefill_scheduler_token_capacity = 8
+        model._prefill_scheduler_chunked = False
         self.assertEqual(model._resolve_prefill_q_token_capacity(), 3)
         self.assertEqual(model._resolve_mtp_hidden_token_capacity(), 3)
         model._is_speculative = True
         self.assertEqual(model._resolve_prefill_q_token_capacity(), 15)
         self.assertEqual(model._resolve_mtp_hidden_token_capacity(), 15)
+
+    def test_prefill_capacity_respects_singleton_and_cp_padding(self):
+        from rtp_llm.models_py.model_desc.deepseek_v4_model import DeepSeekV4Model
+
+        model = DeepSeekV4Model.__new__(DeepSeekV4Model)
+        torch.nn.Module.__init__(model)
+        model._is_decode_role = False
+        model._v4_args = SimpleNamespace(max_seq_len=8192, max_tokens_per_rank=128)
+        model._max_context_batch_size = 128
+        model._max_generate_batch_size = 128
+        model._is_speculative = True
+        model._gen_num_per_cycle = 3
+        model._prefill_cp_size = 1
+        model._prefill_scheduler_token_capacity = 1024
+        model._prefill_scheduler_chunked = False
+        self.assertEqual(model._resolve_prefill_q_token_capacity(), 8192)
+        self.assertEqual(model._resolve_mtp_hidden_token_capacity(), 8192)
+        model._prefill_scheduler_chunked = True
+        self.assertEqual(model._resolve_prefill_q_token_capacity(), 1024)
+        model._prefill_scheduler_token_capacity = 128
+        model._prefill_cp_size = 4
+        self.assertEqual(model._resolve_prefill_q_token_capacity(), 256)
+        self.assertEqual(model._resolve_mtp_hidden_token_capacity(), 512)
 
     def test_attention_constructor_does_not_require_provider_builder(self):
         from rtp_llm.models.dsv4.builders import build_attention

@@ -773,6 +773,53 @@ class DeepseekV4DetectorTest(TestCase):
 
 
 class DeepseekV4ReasoningToolPipelineTest(IsolatedAsyncioTestCase):
+    async def test_auto_tool_parallel_limit_full_and_streaming(self):
+        text = (
+            "<｜DSML｜tool_calls>\n"
+            '<｜DSML｜invoke name="get_weather">\n'
+            '<｜DSML｜parameter name="city" string="true">Hangzhou</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>\n"
+            '<｜DSML｜invoke name="get_weather">\n'
+            '<｜DSML｜parameter name="city" string="true">Shanghai</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+        )
+        for streaming in (False, True):
+            for parallel in (False, True, None):
+                with self.subTest(streaming=streaming, parallel=parallel):
+                    renderer = _make_renderer(None)
+                    renderer._generate_log_probs = AsyncMock(return_value=None)
+                    request = ChatCompletionRequest(
+                        messages=[{"role": "user", "content": "Weather?"}],
+                        tools=_rtp_tools(),
+                        parallel_tool_calls=parallel,
+                        chat_template_kwargs={"enable_thinking": False},
+                    )
+                    status = ReasoningToolStreamStatus(
+                        request,
+                        DeepSeekV4Detector(),
+                        ReasoningParser(
+                            model_type="deepseek-v3", force_reasoning=False
+                        ),
+                    )
+                    calls = {}
+                    chunks = (
+                        [text[i : i + 7] for i in range(0, len(text), 7)]
+                        if streaming
+                        else [text]
+                    )
+                    for chunk in chunks:
+                        status.delta_output_string += chunk
+                        delta = await renderer._process_reasoning_and_tool_calls(
+                            status, self._output(), is_streaming=streaming
+                        )
+                        if delta is not None:
+                            for call in delta.output_str.tool_calls or []:
+                                calls[call.index] = calls.get(call.index, "") + (
+                                    call.function.arguments or ""
+                                )
+                    self.assertEqual(len(calls), 1 if parallel is False else 2)
+                    self.assertEqual(json.loads(calls[0]), {"city": "Hangzhou"})
+
     def _output(self):
         aux_info = AuxInfo()
         aux_info.input_len = 10
