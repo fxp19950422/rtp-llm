@@ -42,10 +42,6 @@ class PpuDecodeProvider(PpuModuleProvider):
         self._moe_tile = self.execution_options.get("DSV4_PPU_MTP_MOE_TILE", "auto")
         if self._moe_tile not in ("auto", "n128"):
             raise ValueError("DSV4_PPU_MTP_MOE_TILE must be auto or n128")
-        post_threads = self.execution_options.get("DSV4_PPU_MTP_HC_POST_THREADS", "128")
-        if post_threads not in ("128", "256"):
-            raise ValueError("DSV4_PPU_MTP_HC_POST_THREADS must be 128 or 256")
-        self._hc_post_threads = int(post_threads)
         mask_inactive = self.execution_options.get("DSV4_PPU_MTP_MASK_INACTIVE", "0")
         if mask_inactive not in ("0", "1"):
             raise ValueError("DSV4_PPU_MTP_MASK_INACTIVE must be 0 or 1")
@@ -134,6 +130,5 @@ class PpuDecodeProvider(PpuModuleProvider):
             allow_graph=True,
             fuse_prenorm=True,
             fuse_norm=True,
-            post_threads=self._hc_post_threads,
             **kwargs,
         )
