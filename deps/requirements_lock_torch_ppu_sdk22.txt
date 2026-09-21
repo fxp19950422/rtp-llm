@@ -754,7 +754,8 @@ grpcio==1.62.0 \
     --hash=sha256:fbe0c20ce9a1cff75cfb828b21f08d0a1ca527b67f2443174af6626798a754a4 \
     --hash=sha256:fc2836cb829895ee190813446dce63df67e6ed7b9bf76060262c55fcd097d270 \
     --hash=sha256:fcc98cff4084467839d0a20d16abc2a76005f3d1b38062464d088c07f500d170
-grpcio-tools @ file:///opt/ppu-sdk22-wheelhouse/grpcio_tools-1.62.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl#sha256=b65288ebe12e38dd3650fea65d82fcce0d35df1ae4a770b525c10119ee71962f
+grpcio-tools @ file:///opt/ppu-sdk22-wheelhouse/grpcio_tools-1.62.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl \
+    --hash=sha256:b65288ebe12e38dd3650fea65d82fcce0d35df1ae4a770b525c10119ee71962f
 h11==0.14.0 \
     --hash=sha256:8f19fbbe99e72420ff35c00b27a34cb9937e902a8b810e2c88300c6f0a3b699d \
     --hash=sha256:e3fe4ac4b851c468cc8363d500db52c2ead036020723024a109d37346efaa761

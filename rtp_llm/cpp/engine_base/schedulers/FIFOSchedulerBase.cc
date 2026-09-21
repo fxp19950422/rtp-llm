@@ -244,6 +244,14 @@ std::list<GenerateStreamPtr> FIFOSchedulerBase::selectPrefillPrefix(std::list<Ge
         }
 
         stream->setChunkSize(static_cast<int>(grant));
+        // Admission and continuation can change the window. Prepare only the
+        // final grant, including PDFusion streams already in RUNNING state.
+        const auto prepared = stream->preparePrefillChunk();
+        if (!prepared.ok()) {
+            it = finish_invalid_stream(it, ErrorCode::EXECUTION_EXCEPTION,
+                                       "chunk prefill state allocation failed: " + prepared.ToString());
+            continue;
+        }
         selected.push_back(stream);
         budget_left -= grant * rows;
         ++it;

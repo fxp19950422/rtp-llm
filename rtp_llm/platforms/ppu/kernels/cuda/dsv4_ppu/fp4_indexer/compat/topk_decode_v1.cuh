@@ -11,6 +11,7 @@
 #include <bit>
 #include <cfloat>
 #include <cstdint>
+#include "topk_exact.cuh"
 
 namespace {
 
@@ -81,7 +82,7 @@ struct alignas(8) TieV3 {
 template <uint32_t kBits>
 SGL_DEVICE uint32_t extract_coarse_bin_v3(float x) {
   __half h = __float2half_rn(x);
-  uint16_t bits = __half_as_ushort(h);
+  uint16_t bits = x == 0.0f ? 0u : __half_as_ushort(h);
   uint16_t key = (bits & 0x8000) ? static_cast<uint16_t>(~bits) : static_cast<uint16_t>(bits | 0x8000);
   return key >> (16 - kBits);
 }
@@ -241,6 +242,11 @@ register_topk(const float* __restrict__ scores, int32_t* __restrict__ indices, c
   }
 
   const auto [thr_bin, num_above, num_equal] = smem->match;
+
+  if (num_equal > v3::kMaxTies) {
+    rtp_topk::exact_topk<kTopK>(scores, indices, length, _smem);
+    return;
+  }
 
   // Phase 3: Scatter
   constexpr uint32_t kMaxTolerance = 0;
@@ -545,6 +551,10 @@ SGL_DEVICE void radix_topk(const float* __restrict__ input, int32_t* __restrict_
   }
 
   // stage 2: refine with 8bit radix passes
+  if (s_num_input[0] > SMEM_INPUT_SIZE) {
+    rtp_topk::exact_topk<kTopK>(input, output, length, s_input_idx);
+    return;
+  }
 #pragma unroll 4
   for (int round = 0; round < 4; ++round) {
     const auto r_idx = round % 2;

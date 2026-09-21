@@ -151,14 +151,24 @@ struct ChunkSchedulerTestConfig {
     int         prefill_chunk_size    = 16;
     int         prefill_chunk_batch_tokens = 0;
     std::string decode_prefill_ratio;
+    bool        sparse_state = false;
 };
+
+static CacheConfig makeChunkSchedulerCacheConfig(const ChunkSchedulerTestConfig& config) {
+    if (config.sparse_state) {
+        auto spec = rtp_llm::test::makeResolvedOpaqueSpec(
+            true, "swa_kv", DataType::TYPE_UINT8, 32, config.seq_size_per_block);
+        return rtp_llm::test::makeSingleGroupCacheConfig(spec, CacheGroupType::SWA, 1, config.block_num);
+    }
+    return rtp_llm::test::makeSimpleMhaCacheConfig(
+        1, config.block_num, config.seq_size_per_block, DataType::TYPE_FP16, 1, 4);
+}
 
 template<typename SchedulerType>
 class ChunkSchedulerTestEnv {
 public:
     explicit ChunkSchedulerTestEnv(const ChunkSchedulerTestConfig& config):
-        cache_manager(std::make_shared<KVCacheManager>(rtp_llm::test::makeSimpleMhaCacheConfig(
-            1, config.block_num, config.seq_size_per_block, rtp_llm::DataType::TYPE_FP16, 1, 4))) {
+        cache_manager(std::make_shared<KVCacheManager>(makeChunkSchedulerCacheConfig(config))) {
         resource_context.cache_manager = cache_manager;
         resource_context.role_type     = config.role_type;
 
@@ -210,6 +220,64 @@ private:
     ModelSpecificConfig           model_specific_config;
     std::unique_ptr<SchedulerType> scheduler_;
 };
+
+TEST_F(FIFOSchedulerTest, ChunkGrantPreparesActualSparseTail) {
+    ChunkSchedulerTestConfig config;
+    config.sparse_state = true;
+    ChunkSchedulerTestEnv<FIFOScheduler> env(config);
+    env.resource_context.reuse_cache = false;
+    ASSERT_TRUE(env.init());
+    auto short_stream = env.makeStream(std::vector<int>(4, 1));
+    auto long_stream = env.makeStream(std::vector<int>(64, 2));
+    ASSERT_TRUE(env.scheduler().enqueue(short_stream).ok());
+    ASSERT_TRUE(env.scheduler().enqueue(long_stream).ok());
+    ASSERT_TRUE(expectPrefillBatch(env.scheduler().schedule(), {short_stream, long_stream}, {4, 12}));
+    const auto& blocks = long_stream->kvCache().blocks(0, 0);
+    ASSERT_EQ(blocks.size(), 16);
+    EXPECT_FALSE(isNullBlockIdx(blocks[1]));
+    EXPECT_FALSE(isNullBlockIdx(blocks[2]));
+    EXPECT_TRUE(isNullBlockIdx(blocks[3]));
+    env.scheduler().stop();
+}
+
+TEST_F(FIFOSchedulerTest, PDFusionPreparesEverySparseChunkAndRetainsPreviousTail) {
+    ChunkSchedulerTestConfig config;
+    config.role_type = RoleType::PDFUSION;
+    config.sparse_state = true;
+    ChunkSchedulerTestEnv<PDFusionRatioScheduler> env(config);
+    env.resource_context.reuse_cache = false;
+    ASSERT_TRUE(env.init());
+    auto stream = env.makeStream(std::vector<int>(64, 1));
+    ASSERT_TRUE(env.scheduler().enqueue(stream).ok());
+    for (int round = 0; round < 3; ++round) {
+        ASSERT_TRUE(expectPrefillBatch(env.scheduler().schedule(), {stream}, {16}));
+        const auto& blocks = stream->kvCache().blocks(0, 0);
+        EXPECT_FALSE(isNullBlockIdx(blocks[round * 4 + 2]));
+        EXPECT_FALSE(isNullBlockIdx(blocks[round * 4 + 3]));
+        if (round > 0) EXPECT_FALSE(isNullBlockIdx(blocks[round * 4 - 1]));
+        stream->update(makeSingleTokenUpdate(100));
+    }
+    env.scheduler().stop();
+}
+
+TEST_F(FIFOSchedulerTest, SparseChunkAllocationFailureFinishesAndReleasesStream) {
+    ChunkSchedulerTestConfig config;
+    config.sparse_state = true;
+    config.block_num = 3;
+    ChunkSchedulerTestEnv<FIFOScheduler> env(config);
+    env.resource_context.reuse_cache = false;
+    ASSERT_TRUE(env.init());
+    const auto free_before = env.cache_manager->freeBlocksNum();
+    auto stream = env.makeStream(std::vector<int>(64, 1));
+    stream->reportEvent(StreamEvents::CanRun);
+    ASSERT_EQ(stream->moveToNext(), StreamState::RUNNING);
+    std::list<GenerateStreamPtr> active{stream};
+    EXPECT_TRUE(env.scheduler().selectPrefillPrefix(active).empty());
+    EXPECT_TRUE(active.empty());
+    EXPECT_TRUE(stream->hasError());
+    EXPECT_EQ(stream->getStatus(), StreamState::FINISHED);
+    EXPECT_EQ(env.cache_manager->freeBlocksNum(), free_before);
+}
 
 TEST_F(FIFOSchedulerTest, pdPrefillAdmissionInterleavesDecodeEndpoints) {
     ScopedEnvVar balance_env("RTP_PD_PREFILL_BALANCE_DECODE_RANK", "1");

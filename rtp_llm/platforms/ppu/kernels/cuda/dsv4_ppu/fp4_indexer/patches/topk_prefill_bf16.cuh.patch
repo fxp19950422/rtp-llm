@@ -1,9 +1,11 @@
---- a/csrc/deepseek_v4/topk_prefill_bf16.cuh
-+++ b/compat/topk_prefill_bf16.cuh
-@@ -579,7 +579,23 @@
-     hist_vec.fill(0);
-     smem->histogram_vec[tx] = hist_vec;
-     if (tx == 0) {
+--- csrc/deepseek_v4/topk_prefill_bf16.cuh
++++ compat/topk_prefill_bf16.cuh
+@@ -17,0 +18 @@
++#include "topk_exact.cuh"
+@@ -146 +147 @@
+-  uint16_t bits = __half_as_ushort(h);
++  uint16_t bits = x == 0.0f ? 0u : __half_as_ushort(h);
+@@ -582 +583,17 @@
 -      smem->counter_gt = smem->counter_eq = 0;
 +      smem->counter_gt = 0;
 +      // Model rows are either entirely finite or entirely NaN. Use the first
@@ -22,13 +24,7 @@
 +          }
 +        }
 +      }
-     }
-     __syncthreads();
-   }
-@@ -594,6 +610,77 @@
-     for (uint32_t e = 0; e < 4; ++e) {
-       const uint32_t idx = base + e;
-       local[v][e] = (idx < length) ? static_cast<float>(scores[idx]) : 0.0f;
+@@ -596,0 +614,71 @@
 +    }
 +  }
 +
@@ -100,22 +96,16 @@
 +        if (tx == 0) smem->counter_eq = 0u;
 +        __syncthreads();
 +      }
-     }
-   }
-
-@@ -621,7 +708,7 @@
-     __pipeline_commit();
-   }
-
+@@ -624 +712 @@
 -  // Accumulate histogram via shared-memory atomics
 +  // Accumulate histogram via shared-memory atomics.
- #pragma unroll
-   for (uint32_t v = 0; v < prefill_bf16::kVecsPerThread; ++v) {
- #pragma unroll
-@@ -774,6 +861,40 @@
-   const uint32_t num_ties = min(num_equal, prefill_bf16::kMaxTies);
-   const uint32_t topk_remain = prefill_bf16::kTopK - num_above;
-
+@@ -699,0 +788,5 @@
++
++  if (num_equal > prefill_bf16::kMaxTies) {
++    rtp_topk::exact_topk<prefill_bf16::kTopK>(scores, indices, length, _smem);
++    return;
++  }
+@@ -776,0 +870,34 @@
 +  // The FP4 indexer pads each short row with one repeated BF16 sentinel.
 +  // At 4K context / TP4 this commonly leaves 500+ identical values in the
 +  // threshold bin. Ranking every member against every other member below is
@@ -150,24 +140,9 @@
 +    }
 +  }
 +
-   const auto is_greater = [](const TieV3& a, const TieV3& b) {
-     return (a.score > b.score) || (a.score == b.score && a.idx < b.idx);
-   };
-@@ -920,7 +1041,7 @@
- // and 2-pass register (<=32K) paths. Only allocates
- // RegisterTopKSmemPF + s_topk_indices smem.
- // ============================================================
+@@ -923 +1050 @@
 -__global__ __launch_bounds__(prefill_bf16::kBlockSize, 1) void topk_prefill_bf16_register_kernel(
 +__global__ __launch_bounds__(prefill_bf16::kBlockSize, 2) void topk_prefill_bf16_register_kernel(
-     const TopKPrefillBF16Params params) {
-   using namespace prefill_bf16;
-
-@@ -1042,7 +1163,7 @@
- void setup_kernel_smem_once_pf(host::DebugInfo where = {}) {
-   [[maybe_unused]]
-   static const auto result = [] {
+@@ -1045 +1172 @@
 -    const auto fptr = std::bit_cast<const void*>(f);
 +    const auto fptr = reinterpret_cast<const void*>(f);
-     return ::cudaFuncSetAttribute(fptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
-   }();
-   host::RuntimeDeviceCheck(result, where);
