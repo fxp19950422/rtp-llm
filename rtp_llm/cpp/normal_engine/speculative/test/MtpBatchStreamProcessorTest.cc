@@ -1415,6 +1415,12 @@ TEST_F(MtpBatchStreamProcessorTest, testUpdateOneStepDraftSamplerOutput) {
     EXPECT_EQ(expect_all_probs, toVec<float>(sampler_output.all_probs));
     EXPECT_FALSE(sampler_output.token_ids_are_point_mass);
 
+    stream1->getSPOutputBuffer()->all_probs = torch::Tensor();
+    stream1->getSPOutputBuffer()->token_ids_are_point_mass = true;
+    processor.updateOneStepDraftSamplerOutput(stream_groups, sampler_output, draft_token_probs_d_t, holder);
+    EXPECT_FALSE(sampler_output.token_ids_are_point_mass);
+    EXPECT_EQ((vector<float>{0, 0, 1, 0, 0.5, 0.6, 0.7, 0.8}), toVec<float>(sampler_output.all_probs));
+
     for (auto stream : {stream1, stream2}) {
         stream->getSPOutputBuffer()->all_probs = torch::Tensor();
         stream->getSPOutputBuffer()->token_ids_are_point_mass = true;
@@ -1581,6 +1587,26 @@ TEST_F(MtpBatchStreamProcessorTest, updateMultiStepDraftSamplerOutput) {
     vector<float> expect_all_probs = {0.1, 0.2, 0.3, 0.4, 1.1, 1.2, 1.3, 1.4, 2.1, 2.2, 2.3, 2.4,
                                       0.5, 0.6, 0.7, 0.8, 1.5, 1.6, 1.7, 1.8, 2.5, 2.6, 2.7, 2.8};
     EXPECT_EQ(expect_all_probs, toVec<float>(sampler_output.all_probs));
+
+    // A dense first proposal from an older prefill peer followed by top-1
+    // steps must still supply one distribution for every draft token.
+    draft_token_probs_list.clear();
+    processor.updateMultiStepDraftSamplerOutput(stream_groups, sampler_output,
+                                                draft_token_ids_d_t, spec_token_ids_d_t,
+                                                draft_token_probs_d_t, draft_token_probs_list);
+    EXPECT_EQ(sampler_output.all_probs.sizes(), torch::IntArrayRef({2, 3, 4}));
+    EXPECT_EQ((vector<float>{0.1, 0.2, 0.3, 0.4, 0, 1, 0, 0, 0, 0, 1, 0,
+                            0.5, 0.6, 0.7, 0.8, 0, 0, 1, 0, 0, 0, 0, 1}),
+              toVec<float>(sampler_output.all_probs));
+    stream1->getSPOutputBuffer()->token_ids_are_point_mass = true;
+    stream1->getSPOutputBuffer()->all_probs = torch::Tensor();
+    draft_token_probs_list.clear();
+    processor.updateMultiStepDraftSamplerOutput(stream_groups, sampler_output,
+                                                draft_token_ids_d_t, spec_token_ids_d_t,
+                                                draft_token_probs_d_t, draft_token_probs_list);
+    EXPECT_FALSE(sampler_output.token_ids_are_point_mass);
+    EXPECT_EQ((vector<float>{1, 0, 0, 0}), toVec<float>(sampler_output.all_probs[0][0]));
+    EXPECT_EQ(sampler_output.all_probs.sizes(), torch::IntArrayRef({2, 3, 4}));
 
     for (auto stream : {stream1, stream2}) {
         stream->getSPOutputBuffer()->token_ids_are_point_mass = true;

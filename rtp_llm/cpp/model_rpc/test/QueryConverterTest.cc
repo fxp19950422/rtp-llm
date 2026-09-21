@@ -19,6 +19,23 @@ namespace rtp_llm {
 
 class QueryConverterTest: public DeviceTestBase {};
 
+TEST_F(QueryConverterTest, testPointMassHandoffRetainsLegacyDenseProbabilities) {
+    SpeculativeExecutorStreamOutput output;
+    output.tokens = torch::tensor({{3, 1}}, torch::kInt32);
+    GenerateRequestPB request;
+    request.set_proposal_is_point_mass(true);
+    auto probs = SpeculativeExecutorStreamOutput::pointMassProbs(output.draftTokens().reshape({-1}), 4);
+    QueryConverter::transTensorPB(request.mutable_propose_probs(), probs);
+
+    GenerateRequestPB received;
+    ASSERT_TRUE(received.ParseFromString(request.SerializeAsString()));
+    EXPECT_TRUE(received.proposal_is_point_mass());
+    ASSERT_TRUE(received.has_propose_probs());
+    // Legacy readers do not know the marker and consume only the dense tensor.
+    auto legacy_probs = QueryConverter::transTensor(received.propose_probs());
+    EXPECT_TRUE(torch::equal(legacy_probs, torch::tensor({{0.0f, 1.0f, 0.0f, 0.0f}})));
+}
+
 TEST_F(QueryConverterTest, testTransInput) {
     GenerateInputPB input;
     input.mutable_request_info()->set_frontend_ip("10.0.0.1");

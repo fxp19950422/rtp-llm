@@ -455,14 +455,22 @@ class ModelFactory:
             seq_size_per_block=model_config.attn_config.tokens_per_block,
         )
         scheduler_config = engine_config.runtime_config.fifo_scheduler_config
+        model_config.prefill_chunk_size = int(scheduler_config.prefill_chunk_size)
         # Generic MoE executors allocate their fixed-capacity communication
         # buffers while the Python model is constructed. Preserve the finalized
         # scheduler prefill bound on the model config so those buffers cover a
         # full admitted context batch, not just one maximum-length request.
+        # FIFO also admits a singleton above the batch budget, capped by its
+        # chunk size when chunking is enabled and by max_seq_len otherwise.
         model_config.moe_prefill_max_tokens_per_rank = min(
             int(scheduler_config.max_context_batch_size)
             * int(model_config.max_seq_len),
-            int(scheduler_config.max_batch_tokens_size),
+            max(
+                int(scheduler_config.max_batch_tokens_size),
+                model_config.prefill_chunk_size
+                if model_config.prefill_chunk_size > 0
+                else int(model_config.max_seq_len),
+            ),
         )
 
         # Set model_name to engine_config.runtime_config.model_name (for backward compatibility)
@@ -561,6 +569,7 @@ class ModelFactory:
         propose_model_config.moe_prefill_max_tokens_per_rank = (
             model_config.moe_prefill_max_tokens_per_rank
         )
+        propose_model_config.prefill_chunk_size = model_config.prefill_chunk_size
 
         if sp_config.type == SpeculativeType.DSPARK:
             ModelFactory._setup_dspark_configs(
