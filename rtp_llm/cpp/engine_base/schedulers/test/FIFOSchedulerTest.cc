@@ -157,7 +157,9 @@ static CacheConfig makeChunkSchedulerCacheConfig(const ChunkSchedulerTestConfig&
     if (config.sparse_state) {
         auto spec = rtp_llm::test::makeResolvedOpaqueSpec(
             true, "swa_kv", DataType::TYPE_UINT8, 32, config.seq_size_per_block);
-        return rtp_llm::test::makeSingleGroupCacheConfig(spec, CacheGroupType::SWA, 1, config.block_num);
+        auto cache_config = rtp_llm::test::makeSingleGroupCacheConfig(spec, CacheGroupType::SWA, 1, config.block_num);
+        cache_config.use_independent_block_pools = true;
+        return cache_config;
     }
     return rtp_llm::test::makeSimpleMhaCacheConfig(
         1, config.block_num, config.seq_size_per_block, DataType::TYPE_FP16, 1, 4);
