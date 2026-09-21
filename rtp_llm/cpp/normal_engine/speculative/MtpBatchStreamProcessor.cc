@@ -1387,10 +1387,14 @@ void MtpBatchStreamProcessor::updateOneStepDraftSamplerOutput(const StreamGroups
     auto         draft_token_ids = emptyInt32OnPreferredDevice({(int64_t)batch_size, (int64_t)propose_step_});
 
     std::vector<torch::Tensor> draft_token_probs_list;
+    torch::Tensor dense_reference;
     std::vector<torch::Tensor> draft_token_id_slices;
     draft_token_id_slices.reserve(batch_size);
-    const bool point_mass = !stream_groups.allStreams().empty()
-        && stream_groups.allStreams().front()->draftTokenIdsArePointMass(useMtpDeviceState());
+    const auto streams = stream_groups.allStreams();
+    const bool point_mass = !streams.empty()
+        && std::all_of(streams.begin(), streams.end(), [this](const auto& stream) {
+               return stream->draftTokenIdsArePointMass(useMtpDeviceState());
+           });
 
     for (const auto& stream : stream_groups.allStreams()) {
         auto sp_output_buffer = stream->getSPOutputBuffer();
@@ -1398,9 +1402,12 @@ void MtpBatchStreamProcessor::updateOneStepDraftSamplerOutput(const StreamGroups
         RTP_LLM_CHECK_WITH_INFO(
             draft_token.defined(), "one-step MTP draft sampler token missing for stream %ld", stream->streamId());
         draft_token_id_slices.push_back(draft_token);
-        RTP_LLM_CHECK_WITH_INFO(stream->draftTokenIdsArePointMass(useMtpDeviceState()) == point_mass,
-                                "MTP batch mixes proposal distribution contracts");
         if (point_mass) {
+            continue;
+        }
+        if (stream->draftTokenIdsArePointMass(useMtpDeviceState())) {
+            draft_token_probs_list.push_back(
+                SpeculativeExecutorStreamOutput::pointMassProbs(draft_token.reshape({-1}), vocab_size_));
             continue;
         }
 
@@ -1412,6 +1419,7 @@ void MtpBatchStreamProcessor::updateOneStepDraftSamplerOutput(const StreamGroups
                                 "one-step MTP draft all_probs missing for stream %ld",
                                 stream->streamId());
         draft_token_probs_list.push_back(use_dev_probs ? dev_probs : sp_output_buffer->all_probs);
+        dense_reference = draft_token_probs_list.back();
     }
 
     if (!draft_token_id_slices.empty()) {
@@ -1424,6 +1432,9 @@ void MtpBatchStreamProcessor::updateOneStepDraftSamplerOutput(const StreamGroups
         }
     }
 
+    for (auto& probs : draft_token_probs_list) {
+        probs = probs.to(dense_reference.options());
+    }
     draft_token_probs_d_t = point_mass ? torch::Tensor() : torch::stack(draft_token_probs_list, 0).contiguous();
     draft_sampler_output.all_probs = draft_token_probs_d_t;
     draft_sampler_output.token_ids = std::move(draft_token_ids);
@@ -1437,14 +1448,12 @@ void MtpBatchStreamProcessor::updateMultiStepDraftSamplerOutput(const StreamGrou
                                                                 torch::Tensor&              draft_token_probs_d_t,
                                                                 std::vector<torch::Tensor>& draft_token_probs_list) {
     std::vector<torch::Tensor> prev_draft_token_probs_list;
-    const bool point_mass = !stream_groups.allStreams().empty()
-        && stream_groups.allStreams().front()->draftTokenIdsArePointMass(useMtpDeviceState());
-    if (point_mass) {
-        RTP_LLM_CHECK_WITH_INFO(draft_token_probs_list.empty(), "point-mass draft unexpectedly produced dense q");
-        for (const auto& stream : stream_groups.allStreams()) {
-            RTP_LLM_CHECK_WITH_INFO(stream->draftTokenIdsArePointMass(useMtpDeviceState()),
-                                    "MTP batch mixes proposal distribution contracts");
-        }
+    const auto streams = stream_groups.allStreams();
+    const bool point_mass = !streams.empty()
+        && std::all_of(streams.begin(), streams.end(), [this](const auto& stream) {
+               return stream->draftTokenIdsArePointMass(useMtpDeviceState());
+           });
+    if (point_mass && draft_token_probs_list.empty()) {
         draft_token_probs_d_t = torch::Tensor();
         draft_sampler_output.all_probs = torch::Tensor();
         draft_sampler_output.token_ids_are_point_mass = true;
@@ -1452,15 +1461,37 @@ void MtpBatchStreamProcessor::updateMultiStepDraftSamplerOutput(const StreamGrou
         draft_sampler_output.token_ids = spec_token_ids_d_t;
         return;
     }
+    int64_t batch_idx = 0;
+    torch::Tensor dense_reference = draft_token_probs_list.empty() ? torch::Tensor() : draft_token_probs_list.front();
     for (const auto& stream : stream_groups.allStreams()) {
         auto sp_output_buffer = stream->getSPOutputBuffer();
+        if (stream->draftTokenIdsArePointMass(useMtpDeviceState())) {
+            prev_draft_token_probs_list.push_back(SpeculativeExecutorStreamOutput::pointMassProbs(
+                draft_token_ids_d_t[batch_idx].slice(0, 1, 2), vocab_size_));
+            ++batch_idx;
+            continue;
+        }
         // Prefer device-state draft_all_probs (see comment in
         // updateOneStepDraftSamplerOutput for the same fallback contract).
         const auto& dev_probs = stream->getDraftAllProbsGpu();
         prev_draft_token_probs_list.push_back(useMtpDeviceState() && dev_probs.defined() ? dev_probs :
                                                                                            sp_output_buffer->all_probs);
+        dense_reference = prev_draft_token_probs_list.back();
+        ++batch_idx;
     }
 
+    // Top-1 decode steps omit q. Materialize them only when the inherited
+    // first proposal requires the dense contract for the whole batch.
+    if (draft_token_probs_list.empty() && draft_token_ids_d_t.size(1) > 2) {
+        draft_token_probs_list.push_back(SpeculativeExecutorStreamOutput::pointMassProbs(
+            draft_token_ids_d_t.slice(1, 2), vocab_size_));
+    }
+    for (auto& probs : prev_draft_token_probs_list) {
+        probs = probs.to(dense_reference.options());
+    }
+    for (auto& probs : draft_token_probs_list) {
+        probs = probs.to(dense_reference.options());
+    }
     auto pre_draft_token_probs = torch::stack(prev_draft_token_probs_list, 0).contiguous();
     draft_token_probs_list.insert(draft_token_probs_list.begin(), pre_draft_token_probs);
 

@@ -94,6 +94,14 @@ public:
     }
 
 public:
+    static torch::Tensor pointMassProbs(const torch::Tensor& token_ids, int64_t vocab_size) {
+        auto shape = token_ids.sizes().vec();
+        shape.push_back(vocab_size);
+        return torch::zeros({token_ids.numel(), vocab_size}, token_ids.options().dtype(torch::kFloat32))
+            .scatter_(1, token_ids.reshape({-1, 1}).to(torch::kInt64), 1.0)
+            .reshape(shape);
+    }
+
     torch::Tensor draftTokens() const {
         if (!tokens.defined() || tokens.dim() != 2 || tokens.size(1) < 2) {
             return torch::Tensor();
