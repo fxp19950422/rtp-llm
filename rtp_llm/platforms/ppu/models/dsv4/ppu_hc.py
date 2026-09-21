@@ -17,18 +17,12 @@ class PpuHCUnit(TileLangHCUnit):
         allow_graph=False,
         fuse_prenorm=False,
         fuse_norm=False,
-        post_threads=128,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.tp_size, self.tp_rank = tp_size, tp_rank
         self._allow_graph = allow_graph
         self._fuse_norm = fuse_norm
-        if post_threads not in (128, 256):
-            raise ValueError("PPU HC post threads must be 128 or 256")
-        if post_threads != 128 and (not allow_graph or tp_size != 1):
-            raise ValueError("PPU HC post256 requires TP1 Decode Graph support")
-        self._post_threads = post_threads
         self._prenorm_partials = None
         self._backend = options.get(
             "DSV4_MHC_PRE_GEMM_BACKEND", "deepgemm_deterministic"
@@ -193,6 +187,4 @@ class PpuHCUnit(TileLangHCUnit):
     def _post_operator(self, x, residual, post, comb, *, hc_mult, out=None):
         if residual.numel() == 0:
             return residual if out is None else out
-        rows = residual.numel() // (hc_mult * self.dim)
-        n_thr = self._post_threads if hc_mult == 4 and self.dim == 4096 and rows <= 320 else 128
-        return self._post_kernel(x, residual, post, comb, out=out, enable_pdl=False, n_thr=n_thr)
+        return self._post_kernel(x, residual, post, comb, out=out, enable_pdl=False)
