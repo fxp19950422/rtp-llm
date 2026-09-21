@@ -5,6 +5,48 @@ from rtp_llm.platforms.ppu.kernels.ppu_bf16_radix_topk import bf16_radix_topk
 
 @unittest.skipUnless(torch.cuda.is_available(), 'requires PPU/CUDA')
 class RadixTopKTest(unittest.TestCase):
+    def test_native_candidate_overflow_and_graph_replay(self):
+        from rtp_llm.platforms.ppu.kernels.cuda.ppu_fp4_indexer import topk_bf16, topk_decode
+
+        for dtype, widths in ((torch.bfloat16, (2048, 16384)),
+                              (torch.float32, (2048, 16384, 32768, 65537))):
+            for width in widths:
+                for k in (512, 1024):
+                    with self.subTest(dtype=dtype, width=width, k=k):
+                        x = torch.ones(4, width + 128, device='cuda', dtype=dtype)[:, :width]
+                        x[:, width // 2:] = 1.0078125
+                        x[1].fill_(100000)
+                        x[1, width // 2:] = 200000
+                        x[2].fill_(0)
+                        x[2, ::2] = -0.0
+                        lengths = torch.tensor([width, width, width, 17], device='cuda', dtype=torch.int32)
+                        starts = torch.zeros_like(lengths)
+                        out = torch.empty(4, k, device='cuda', dtype=torch.int32)
+
+                        def run():
+                            if dtype == torch.bfloat16:
+                                topk_bf16(x, starts, lengths, out)
+                            else:
+                                topk_decode(x, lengths, out)
+
+                        run()  # Compile and initialize before capture.
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph):
+                            run()
+                        for replay in range(3):
+                            if replay == 1:
+                                x[0].fill_(1)
+                                x[0, :width // 2] = 1.0078125
+                            graph.replay()
+                            for row, length in enumerate(lengths.tolist()):
+                                expected = torch.full((k,), -1, device='cuda', dtype=torch.int32)
+                                count = min(k, length)
+                                expected[:count] = torch.argsort(
+                                    x[row, :length], descending=True, stable=True
+                                )[:count].int()
+                                self.assertTrue(torch.equal(out[row].sort().values, expected.sort().values),
+                                                (row, replay, out[row, :8].tolist(), expected[:8].tolist()))
+
     def test_native_wide_selection_and_exact_retries(self):
         from rtp_llm.platforms.ppu.kernels.cuda.ppu_fp4_indexer import topk_bf16
 
