@@ -69,16 +69,6 @@ protected:
         DeviceTestBase::TearDown();
     }
 
-    void setupMockCoordinator() {
-        mock_coord_ = std::make_shared<NiceMock<MockKVCacheConnectorCoordinator>>(cache_manager_->config_,
-                                                                                  cache_manager_->kv_cache_config_,
-                                                                                  cache_manager_->runtime_config_,
-                                                                                  cache_manager_->allocator_,
-                                                                                  nullptr);
-        ON_CALL(*mock_coord_, hasActiveConnectors()).WillByDefault(Return(true));
-        cache_manager_->coordinator_ = mock_coord_;
-    }
-
     std::shared_ptr<FIFOScheduler> createScheduler(size_t max_generate_batch_size     = 100,
                                                    size_t max_inited_kv_cache_streams = 0,
                                                    int    prefill_chunk_size          = 0) {
@@ -209,7 +199,6 @@ protected:
     int64_t                                                  next_request_id_{1};
     KVCacheAllocatorPtr                                      real_allocator_;
     std::shared_ptr<testing::NiceMock<MockKVCacheAllocator>> mock_allocator_;
-    std::shared_ptr<NiceMock<MockKVCacheConnectorCoordinator>> mock_coord_;
     size_t                                                   initial_malloc_calls_{0};
     size_t                                                   free_calls_{0};
     size_t                                                   insert_calls_{0};
@@ -905,11 +894,6 @@ TEST_F(FIFOSchedulerAsyncCacheTest, testPDFusionPendingAllocatorLoadsCountToward
 }
 
 TEST_F(FIFOSchedulerAsyncCacheTest, testFIFOChunkedLoadDoneDefersWaiterAtInitedKVLimit) {
-    setupMockCoordinator();
-
-    auto mock_ctx = createDoneAsyncContext();
-    EXPECT_CALL(*mock_coord_, asyncRead(_)).WillOnce(Return(std::static_pointer_cast<AsyncContext>(mock_ctx)));
-
     constexpr int prefill_chunk_size = 4;
     auto          scheduler          = createScheduler(
         /*max_generate_batch_size=*/100, /*max_inited_kv_cache_streams=*/2, prefill_chunk_size);
@@ -934,6 +918,11 @@ TEST_F(FIFOSchedulerAsyncCacheTest, testFIFOChunkedLoadDoneDefersWaiterAtInitedK
                                       /*variable_num_beams=*/{},
                                       /*role_type=*/RoleType::PDFUSION,
                                       prefill_chunk_size);
+    auto          context            = makeControlledAllocatorContext();
+    ASSERT_TRUE(context->completeTransfers(1, true));
+    installReadinessAllocator([context, loading_stream](const MallocInfo& info) {
+        return info.request_id == loading_stream->streamId() ? context : nullptr;
+    });
 
     ASSERT_TRUE(scheduler->enqueue(loading_stream).ok());
     ASSERT_TRUE(scheduler->enqueue(direct_stream).ok());
