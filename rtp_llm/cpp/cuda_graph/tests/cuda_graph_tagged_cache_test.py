@@ -499,6 +499,8 @@ def _build_target_verify_inputs(
 
 class TestCudaGraphTaggedCache(unittest.TestCase):
     def test_device_only_metadata_replay_preserves_padding_without_host_mirrors(self):
+        if os.environ.get("TEST_USING_DEVICE") != "CUDA":
+            self.skipTest("device-only replay preparation is CUDA-only")
         DeviceOnlyPrepare.prepare_calls = 0
         with patch.dict(os.environ, {"RTP_LLM_DEVICE_INPUT": "1"}):
             runner = CudaGraphRunner()
