@@ -195,7 +195,8 @@ static bool applyP2PSideChannelToStream(const std::shared_ptr<FusedAsyncReadCont
         stream->setReuseLength(payload->total_reuse_len);
         stream->setLocalReuseLength(payload->local_reuse_len + payload->memory_reuse_len);
         stream->setMtpTokenIndex(payload->total_reuse_len);
-        stream->setMemoryReuseLength(payload->memory_reuse_len);
+        // The legacy P2P "memory" tier is the host tier in the current cache model.
+        stream->setHostReuseLength(payload->memory_reuse_len);
         stream->setRemoteReuseLength(payload->remote_reuse_len);
         RTP_LLM_LOG_DEBUG("applyP2PSideChannel: reuse total=%d, local=%d, remote=%d, memory=%d",
                           payload->total_reuse_len,
