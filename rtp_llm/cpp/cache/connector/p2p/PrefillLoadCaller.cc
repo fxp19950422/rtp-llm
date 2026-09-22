@@ -194,7 +194,6 @@ void PrefillLoadCaller::Result::updateStreamFromResponse() {
     side_channel_payload.remote_reuse_len = payload.remote_reuse_len();
     side_channel_payload.memory_reuse_len = payload.memory_reuse_len();
     side_channel_payload.has_data         = true;
-    side_channel_payload.proposal_is_point_mass = payload.proposal_is_point_mass();
 
     // Extract tensors from the payload map
     auto it_propose = payload.tensors().find("propose_tokens");

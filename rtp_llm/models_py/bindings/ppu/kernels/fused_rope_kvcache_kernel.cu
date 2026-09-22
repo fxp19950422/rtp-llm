@@ -1472,6 +1472,7 @@ __global__ void decode_add_fusedQKV_bias_transpose_with_rope_cache_kernel(T*    
                                                                           KVBlockArray kv_block_array,
                                                                           T*           QKV,
                                                                           const int*   position_ids,
+                                                                          const int*   sequence_lengths,
                                                                           const T* __restrict qkv_bias,
                                                                           const float* rope_cache,
                                                                           const int    batch_size,
@@ -1508,6 +1509,7 @@ __global__ void decode_add_fusedQKV_bias_transpose_with_rope_cache_kernel(T*    
     const int     batch_idx     = blockIdx.x;
     constexpr int seq_len       = 1;
     const int     token_idx     = batch_idx;
+    const int     sequence_length = sequence_lengths[token_idx];
     constexpr int seq_idx       = 0;
     const int     tidx          = threadIdx.x;
     const int     bidy          = blockIdx.y;
@@ -1581,7 +1583,7 @@ __global__ void decode_add_fusedQKV_bias_transpose_with_rope_cache_kernel(T*    
         }
 
         if (store_cache) {
-            const int dst_kv_seq_idx = seq_idx + position_id;
+            const int dst_kv_seq_idx = seq_idx + sequence_length;
             Tcache*   k_cache = reinterpret_cast<Tcache*>(kv_block_array.getKBlockPtr(batch_idx, dst_kv_seq_idx));
             const int inBlockIdx =
                 kv_block_array.getKVLocalIdx(dst_kv_seq_idx, head_idx, size_per_head, tidx * vec_size);
@@ -1632,7 +1634,7 @@ __global__ void decode_add_fusedQKV_bias_transpose_with_rope_cache_kernel(T*    
         }
 
         if (store_cache) {
-            const int dst_kv_seq_idx = seq_idx + position_id;
+            const int dst_kv_seq_idx = seq_idx + sequence_length;
             Tcache*   v_cache = reinterpret_cast<Tcache*>(kv_block_array.getVBlockPtr(batch_idx, dst_kv_seq_idx));
             const int inBlockIdx =
                 kv_block_array.getKVLocalIdx(dst_kv_seq_idx, head_idx, size_per_head, tidx * vec_size);
@@ -1865,6 +1867,7 @@ __global__ void decode_add_fusedQKV_bias_transpose_non_int8_with_rope_cache_kern
                                                                                    KVBlockArray kv_block_array,
                                                                                    T*           QKV,
                                                                                    const int*   position_ids,
+                                                                                   const int*   sequence_lengths,
                                                                                    const T* __restrict qkv_bias,
                                                                                    const float* rope_cache,
                                                                                    const int    batch_size,
@@ -1901,6 +1904,7 @@ __global__ void decode_add_fusedQKV_bias_transpose_non_int8_with_rope_cache_kern
     const int     batch_idx     = blockIdx.x;
     constexpr int seq_len       = 1;
     const int     token_idx     = batch_idx;
+    const int     sequence_length = sequence_lengths[token_idx];
     constexpr int seq_idx       = 0;
     const int     tidx          = threadIdx.x;
     const int     bidy          = blockIdx.y;
@@ -2009,7 +2013,7 @@ __global__ void decode_add_fusedQKV_bias_transpose_non_int8_with_rope_cache_kern
                              + head_idx * size_per_head * total_seq_len + dst_kv_seq_idx * size_per_head
                              + tidx * vec_size;
 
-        const int   dst_kv_pos_idx = seq_idx + position_id;
+        const int   dst_kv_pos_idx = seq_idx + sequence_length;
         const float scale          = 1.f;
         Tcache*     k_cache        = nullptr;
         int         inBlockIdx     = -1;
@@ -2106,7 +2110,7 @@ __global__ void decode_add_fusedQKV_bias_transpose_non_int8_with_rope_cache_kern
                              + head_idx * size_per_head * total_seq_len + dst_kv_seq_idx * size_per_head
                              + tidx * vec_size;
 
-        const int   dst_kv_pos_idx = seq_idx + position_id;
+        const int   dst_kv_pos_idx = seq_idx + sequence_length;
         const float scale          = 1.f;
         Tcache*     v_cache        = nullptr;
         int         inBlockIdx     = -1;
@@ -2542,6 +2546,7 @@ void invokeDecodeAddFusedQKVBiasTranspose(T*               q_buf,
                                                              kv_block_array,
                                                              QKV,
                                                              position_ids,
+                                                             sequence_lengths,
                                                              qkv_bias,
                                                              rope_cache,
                                                              batch_size,
@@ -2573,6 +2578,7 @@ void invokeDecodeAddFusedQKVBiasTranspose(T*               q_buf,
                                                              kv_block_array,
                                                              QKV,
                                                              position_ids,
+                                                             sequence_lengths,
                                                              qkv_bias,
                                                              rope_cache,
                                                              batch_size,

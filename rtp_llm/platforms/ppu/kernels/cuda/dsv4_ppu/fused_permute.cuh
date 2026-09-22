@@ -217,6 +217,9 @@ fused_permute_kernel(
             int d1_local = linear_vec_s / VECS_PER_D1_SFA;
             int local_vec_s = linear_vec_s - d1_local * VECS_PER_D1_SFA;
             int d1_s = d1_start + d1_local;
+            if (d1_s >= DIM1) {
+                continue;
+            }
             int byte_offset = local_vec_s * SFA_VEC;
 
             #pragma unroll
