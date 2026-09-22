@@ -108,7 +108,7 @@ TEST_F(DeviceSWAKVCacheGroupTest, DefaultPolicyDrivesBehaviorInterfaces) {
     EXPECT_NE(group.memoryPlacement(), CacheMemoryPlacement::HOST_PINNED);
 }
 
-TEST_F(SWAKVCacheGroupTest, PrefillChunkBackfillsTailAndPreservesHistory) {
+TEST_F(DeviceSWAKVCacheGroupTest, PrefillChunkBackfillsTailAndPreservesHistory) {
     auto group = makeGroup(256);
     BlockIds ids;
     ASSERT_TRUE(group.malloc(ids, 32768, false));
@@ -132,11 +132,11 @@ TEST_F(SWAKVCacheGroupTest, PrefillChunkBackfillsTailAndPreservesHistory) {
     EXPECT_FALSE(isNullBlockIdx(ids.blocks()[95]));
     EXPECT_FALSE(isNullBlockIdx(ids.blocks()[127]));
     EXPECT_EQ(validBlockCount(ids.blocks()), 6);
-    group.free(ids.blocks());
+    group.unreference(ids.blocks());
     EXPECT_EQ(block_pool_->freeBlocksNum(), total_blocks_);
 }
 
-TEST_F(SWAKVCacheGroupTest, PrefillPartialTailAndRollbackPositions) {
+TEST_F(DeviceSWAKVCacheGroupTest, PrefillPartialTailAndRollbackPositions) {
     auto group = makeGroup(256);
     BlockIds ids;
     ASSERT_TRUE(group.malloc(ids, 20000, false));
@@ -144,12 +144,12 @@ TEST_F(SWAKVCacheGroupTest, PrefillPartialTailAndRollbackPositions) {
     ASSERT_TRUE(group.preparePrefillChunk(ids, 8192, &filled));
     BlockIndicesType allocated;
     for (const auto i : filled) allocated.push_back(ids.blocks()[i]);
-    group.free(allocated);
+    group.unreference(allocated);
     ids.remove(filled);
     EXPECT_EQ(validBlockCount(ids.blocks()), 2);
     ASSERT_TRUE(group.preparePrefillChunk(ids, 20000, &filled));
     EXPECT_TRUE(filled.empty());
-    group.free(ids.blocks());
+    group.unreference(ids.blocks());
     EXPECT_EQ(block_pool_->freeBlocksNum(), total_blocks_);
 }
 
@@ -604,7 +604,7 @@ TEST_F(DeviceSWAKVCacheGroupTest, RemoveSkippedBlocks_WithReserveStep) {
     EXPECT_EQ(block_pool->freeBlocksNum(), free_before + 3);
 }
 
-TEST_F(SWAKVCacheGroupTest, RemoveSkippedBlocks_ReserveTokensUsePhysicalBlockUnits) {
+TEST_F(DeviceSWAKVCacheGroupTest, RemoveSkippedBlocks_ReserveTokensUsePhysicalBlockUnits) {
     struct Case {
         int tokens_per_block;
         int reserve_tokens;
@@ -614,11 +614,12 @@ TEST_F(SWAKVCacheGroupTest, RemoveSkippedBlocks_ReserveTokensUsePhysicalBlockUni
              {256, 0, 1}, {256, 1, 2}, {256, 4, 2}, {256, 256, 2}, {256, 257, 3}, {4, 4, 2}, {4, 5, 3}, {1, 4, 5}}) {
         SCOPED_TRACE(::testing::Message()
                      << "block_tokens=" << c.tokens_per_block << " reserve_tokens=" << c.reserve_tokens);
-        auto            spec = makeDsv4StateSpec("hca_state", c.tokens_per_block);
-        SWAKVCacheGroup group({}, spec, block_pool_, 0, 2, nullptr, nullptr, makePolicy(true));
+        auto            spec = makeDsv4StateSpec(c.tokens_per_block);
+        SWAKVCacheGroup group({}, spec, block_pool_, 0, 2, makePolicy(true));
         const size_t    free_before = block_pool_->freeBlocksNum();
-        auto            allocated   = block_pool_->malloc(6);
+        auto            allocated   = block_pool_->malloc(6).value();
         ASSERT_EQ(allocated.size(), 6u);
+        block_pool_->incRef(allocated);
         BlockIds blocks;
         blocks.assign(allocated);
         group.removeSkippedBlocks(blocks, true, c.reserve_tokens);
@@ -626,12 +627,12 @@ TEST_F(SWAKVCacheGroupTest, RemoveSkippedBlocks_ReserveTokensUsePhysicalBlockUni
         for (int i = 0; i < 6; ++i) {
             EXPECT_EQ(isNullBlockIdx(blocks.blocks()[i]), i < 6 - c.retained_blocks);
         }
-        group.free(blocks.blocks());
+        group.unreference(blocks.blocks());
         EXPECT_EQ(block_pool_->freeBlocksNum(), free_before);
     }
 }
 
-TEST_F(SWAKVCacheGroupTest, Mtp3HcaStateSupportsEightyStreamsAcrossBlockBoundaries) {
+TEST_F(DeviceSWAKVCacheGroupTest, Mtp3HcaStateSupportsEightyStreamsAcrossBlockBoundaries) {
     // Match the service's 255 usable HCA state blocks and 80 concurrent streams.
     // Only allocator bookkeeping is exercised, so use a small backing tensor.
     auto        backing_spec = createTestKvCacheSpec(1, DataType::TYPE_FP32, 1, 256, 4, 0);
@@ -642,11 +643,14 @@ TEST_F(SWAKVCacheGroupTest, Mtp3HcaStateSupportsEightyStreamsAcrossBlockBoundari
     config.seq_size_per_block               = 256;
     config.kv_block_stride_bytes            = 4;
     config.fromGroupedSpecs({backing_spec}, {{0}}, {CacheGroupType::FULL}, {"default"});
-    auto pool = std::make_shared<BlockPool>(BlockPoolConfigHelper::createConfig(config));
+    auto device_config = std::make_shared<DeviceBlockPoolConfig>(DeviceBlockPoolConfigHelper::createConfig(config));
+    device_config->use_device_malloc_backing = true;
+    std::shared_ptr<const DeviceBlockPoolConfig> const_config = device_config;
+    auto pool = std::make_shared<DeviceBlockPool>(const_config);
     ASSERT_TRUE(pool->init());
     ASSERT_EQ(pool->freeBlocksNum(), 255u);
-    auto                  spec = makeDsv4StateSpec("hca_state", 256);
-    SWAKVCacheGroup       group({}, spec, pool, 0, 0, nullptr, nullptr, makePolicy(true));
+    auto                  spec = makeDsv4StateSpec(256);
+    SWAKVCacheGroup       group({}, spec, pool, 0, 0, makePolicy(true));
     std::vector<BlockIds> streams(80);
     for (auto& blocks : streams) {
         ASSERT_TRUE(group.malloc(blocks, 4096, false, 4));
@@ -666,7 +670,7 @@ TEST_F(SWAKVCacheGroupTest, Mtp3HcaStateSupportsEightyStreamsAcrossBlockBoundari
         EXPECT_GE(pool->freeBlocksNum(), 95u);
     }
     for (auto& blocks : streams) {
-        group.free(blocks.blocks());
+        group.unreference(blocks.blocks());
     }
     EXPECT_EQ(pool->freeBlocksNum(), 255u);
 }
