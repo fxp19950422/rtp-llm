@@ -121,6 +121,15 @@ py_test(
 )
 
 py_test(
+    name = "attention_registration_test",
+    srcs = ["ppu/test/test_attention_registration.py"],
+    main = "ppu/test/test_attention_registration.py",
+    data = [":platform_sources", ":ppu_sources"],
+    deps = ["//rtp_llm/models_py:models"],
+    tags = ["source-only"],
+)
+
+py_test(
     name = "fp4_indexer_request_slices_test",
     srcs = ["ppu/test/test_fp4_indexer_request_slices.py"],
     main = "ppu/test/test_fp4_indexer_request_slices.py",
@@ -133,6 +142,7 @@ test_suite(
     tests = [
         ":test_ppu_moe_gather_shared_source",
         ":test_ppu_moe_route_compactor_source",
+        ":attention_registration_test",
         ":fp4_indexer_request_slices_test",
     ],
 )
