@@ -21,8 +21,10 @@ def _install_single_rank_rocm_graph_capture_stub() -> None:
     no-op hooks used by the device shim for that case.
     """
 
-    models_py = types.ModuleType("rtp_llm.models_py")
-    models_py.__path__ = []
+    # Keep the real namespace package and its search path available. Replacing
+    # it with an empty stub makes later imports such as pluggable.lifecycle
+    # fail even when their Bazel runfiles are present.
+    models_py = importlib.import_module("rtp_llm.models_py")
     distributed = types.ModuleType("rtp_llm.models_py.distributed")
     distributed.__path__ = []
     rocm_rccl = types.ModuleType("rtp_llm.models_py.distributed.rocm_rccl")
