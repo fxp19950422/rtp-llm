@@ -1,6 +1,6 @@
 # Descriptors stay lightweight; concrete PPU adapters and JIT sources ship
 # only in the PPU distribution. Tests may request ppu_sources explicitly.
-_ENTRYPOINTS = ["__init__.py", "ppu/__init__.py", "ppu/models/__init__.py", "ppu/models/dsv4/__init__.py", "ppu/models/dsv4/register.py", "ppu/models/dsv4/manifest.py"]
+_ENTRYPOINTS = ["__init__.py", "ppu/__init__.py", "ppu/attention.py", "ppu/models/__init__.py", "ppu/models/dsv4/__init__.py", "ppu/models/dsv4/register.py", "ppu/models/dsv4/manifest.py"]
 
 filegroup(
     name = "ppu_sources",
