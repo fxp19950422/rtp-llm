@@ -289,10 +289,29 @@ TEST_F(NormalEngineTest, testChunkedPrefillWarmupCapsIntMaxBudgetByContextBatchS
     ASSERT_EQ(*config.forward_shapes,
               (std::vector<ForwardShape>{
                   {19, 0, 1},
+                  {19 * 8, 0, 8},
                   {8, 18, 8},
                   {19, 0, 1},
+                  {19 * 8, 0, 8},
                   {8, 18, 8},
               }));
+}
+
+TEST_F(NormalEngineTest, testChunkedPrefillWarmupUsesSeparateBatchBudget) {
+    CustomConfig config;
+    config.warm_up = true;
+    config.prefill_chunk_size = 4;
+    config.prefill_chunk_batch_tokens = 10;
+    config.max_context_batch_size     = 8;
+    config.forward_shapes             = std::make_shared<std::vector<ForwardShape>>();
+    (void)createMockEngine(config);
+    // The final 2-token request fills the remainder without increasing any
+    // stream's chunk cap. Row-heavy warmup is bounded by the 8-row limit.
+    const std::vector<ForwardShape> pass = {
+        {4, 0, 1}, {4, 4, 1}, {4, 8, 1}, {4, 12, 1}, {3, 16, 1}, {10, 14, 3}, {8, 18, 8}};
+    auto expected = pass;
+    expected.insert(expected.end(), pass.begin(), pass.end());
+    EXPECT_EQ(*config.forward_shapes, expected);
 }
 
 TEST_F(NormalEngineTest, testChunkedPrefillLossWarmupUsesWholeSegment) {

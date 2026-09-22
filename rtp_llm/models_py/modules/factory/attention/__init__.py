@@ -135,7 +135,7 @@ elif device_type == DeviceType.Cuda:
     )
 
     PREFILL_MHA_IMPS.append(CPFlashInferImpl)
-# Generic PPU MHA kernels are registered by a separate backend package.
+# Public PPU fallbacks and optional optimized kernels register through the slot.
 
 # Out-of-tree backends registered a hook before this module existed. Ordering in
 # these lists is priority (earlier wins), so a backend inserts rather than
