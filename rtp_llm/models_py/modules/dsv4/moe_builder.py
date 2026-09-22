@@ -53,6 +53,7 @@ def build_baseline_moe(*, tp_size=1, tp_rank=0, platform_provider=None, **kwargs
                 "DSV4_GATE_FUSED", options.get("MOE_GATE_FUSED", "1")
             )
             != "0",
+            stable_topk=True,
         ),
         **kwargs,
     )

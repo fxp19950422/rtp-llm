@@ -157,6 +157,10 @@ class LocalLoopExecutor(Fp8Fp4ExecutorBase):
         self._W2_s = stacked_routed["w2_s"]
         self._W3_w = stacked_routed["w3_w"]
         self._W3_s = stacked_routed["w3_s"]
+        self._router_weight_after_w2 = (
+            getattr(getattr(cfg, "model_config", None), "model_type", "")
+            == "deepseek_v4"
+        )
         inter_local = int(self._W1_w.shape[1])
         stored_k = int(self._W1_w.shape[-1])
         if stored_k == cfg.dim:
@@ -220,6 +224,7 @@ class LocalLoopExecutor(Fp8Fp4ExecutorBase):
                 swiglu_limit=cfg.swiglu_limit,
                 storage=self._routed_storage,
                 expert_weights=ew,
+                router_weight_after_w2=self._router_weight_after_w2,
             )
 
         self.experts = nn.ModuleList(
@@ -465,6 +470,8 @@ class LocalLoopExecutor(Fp8Fp4ExecutorBase):
                 clamp_limit=swiglu_limit,
             )
 
+            if not getattr(self, "_router_weight_after_w2", True):
+                sm_fp32 = sm_fp32 * router_w
             sm_bf16 = sm_fp32.to(torch.bfloat16)
 
             # Quant for w2 input
@@ -485,9 +492,11 @@ class LocalLoopExecutor(Fp8Fp4ExecutorBase):
                 recipe_a=(1, _FP8_BLOCK),
                 recipe_b=(1, _FP4_BLOCK),
             )
-            # Router weighting is an output operation.  Keeping it after W2
-            # prevents the weight from perturbing W4A4 activation quantization.
-            y.add_(delta.float() * router_w)
+            if getattr(self, "_router_weight_after_w2", True):
+                # DSV4 applies routing after W2 so W4A4 quantization sees the
+                # unweighted activation.
+                delta = delta.float() * router_w
+            y.add_(delta.float())
 
         return y
 
@@ -605,6 +614,8 @@ class LocalLoopExecutor(Fp8Fp4ExecutorBase):
                     clamp_limit=swiglu_limit,
                 )
 
+                if not getattr(self, "_router_weight_after_w2", True):
+                    sm_fp32 = sm_fp32 * router_w
                 sm_bf16 = sm_fp32.to(torch.bfloat16)
 
                 sm_fp8, sm_scale = sgl_per_token_group_quant_fp8(
@@ -623,7 +634,8 @@ class LocalLoopExecutor(Fp8Fp4ExecutorBase):
                     recipe_a=(1, _FP8_BLOCK),
                     recipe_b=(1, _FP4_BLOCK),
                 )
-                # Apply the route weight only after the W2 projection.
-                y[n : n + 1].add_(delta.float() * router_w)
+                if getattr(self, "_router_weight_after_w2", True):
+                    delta = delta.float() * router_w
+                y[n : n + 1].add_(delta.float())
 
         return y
