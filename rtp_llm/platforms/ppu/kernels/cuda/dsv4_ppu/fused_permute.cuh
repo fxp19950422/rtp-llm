@@ -169,7 +169,8 @@ fused_permute_kernel(
 
 
     // ===== SFA: direct load/store =====
-    constexpr int SFA_VEC = (DIM2_SFA_BYTES >= 16) ? 16 : DIM2_SFA_BYTES;
+    static_assert(DIM2_SFA_BYTES % 4 == 0, "FP32 scale rows must be 4-byte aligned");
+    constexpr int SFA_VEC = (DIM2_SFA_BYTES % 16 == 0) ? 16 : 4;
     constexpr int VECS_PER_D1_SFA = DIM2_SFA_BYTES / SFA_VEC;
     auto copy_sfa_row = [&](int d1_s) {
         if constexpr (DIM2_SFA_BYTES % 16 == 0) {
@@ -211,9 +212,10 @@ fused_permute_kernel(
     } else {
         constexpr int TOTAL_VECS_SFA = D1_TILE * VECS_PER_D1_SFA;
         const int d1_start = blockIdx.x * D1_TILE;
-        if (threadIdx.x < TOTAL_VECS_SFA) {
-            int d1_local = threadIdx.x / VECS_PER_D1_SFA;
-            int local_vec_s = threadIdx.x - d1_local * VECS_PER_D1_SFA;
+        for (int linear_vec_s = threadIdx.x; linear_vec_s < TOTAL_VECS_SFA;
+             linear_vec_s += blockDim.x) {
+            int d1_local = linear_vec_s / VECS_PER_D1_SFA;
+            int local_vec_s = linear_vec_s - d1_local * VECS_PER_D1_SFA;
             int d1_s = d1_start + d1_local;
             int byte_offset = local_vec_s * SFA_VEC;
 

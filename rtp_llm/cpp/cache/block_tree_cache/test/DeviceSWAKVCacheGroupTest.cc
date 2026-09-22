@@ -650,7 +650,7 @@ TEST_F(DeviceSWAKVCacheGroupTest, Mtp3HcaStateSupportsEightyStreamsAcrossBlockBo
     ASSERT_TRUE(pool->init());
     ASSERT_EQ(pool->freeBlocksNum(), 255u);
     auto                  spec = makeDsv4StateSpec(256);
-    SWAKVCacheGroup       group({}, spec, pool, 0, 0, makePolicy(true));
+    SWAKVCacheGroup       group({}, spec, pool, 0, 0, makePolicy(false));
     std::vector<BlockIds> streams(80);
     for (auto& blocks : streams) {
         ASSERT_TRUE(group.malloc(blocks, 4096, false, 4));
