@@ -110,6 +110,7 @@ class PpuFP4Compressor(CompressorFP8):
 
 class PpuFP4Indexer(IndexerFP8):
     CACHE_ENTRY_BYTES = 68
+    _request_local_scoring = True
     _batch_mtp_queries = False
 
     def __init__(self, *args, layer_weights, **kwargs):

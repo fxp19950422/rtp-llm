@@ -8,8 +8,12 @@ state and collective contracts; registration does not qualify new chips/models.
 
 
 def register_backend_hooks():
+    from rtp_llm.utils.backend_registry import register_backend_hook
+
+    from .attention import register_attention
     from .models.dsv4.register import install
 
+    register_backend_hook("attention", register_attention)
     install()
 
 

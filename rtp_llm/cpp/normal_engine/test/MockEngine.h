@@ -58,6 +58,7 @@ struct CustomConfig {
     bool                                       warm_up             = false;
     bool                                       warm_up_with_loss   = false;
     int                                        prefill_chunk_size  = 0;
+    int                                        prefill_chunk_batch_tokens = 0;
     int64_t                                    max_context_batch_size = 128;
     DataType                                   kv_cache_data_type  = DataType::TYPE_FP16;
     std::map<std::string, std::vector<int>>    multi_task_prompt_tokens;
@@ -93,6 +94,7 @@ rtp_llm::EngineInitParams createEngineInitParams(const CustomConfig&     config,
     runtime_config.fifo_scheduler_config.max_context_batch_size = config.max_context_batch_size;
     runtime_config.fifo_scheduler_config.max_batch_tokens_size  = 4096;
     runtime_config.fifo_scheduler_config.prefill_chunk_size     = config.prefill_chunk_size;
+    runtime_config.fifo_scheduler_config.prefill_chunk_batch_tokens = config.prefill_chunk_batch_tokens;
     runtime_config.warm_up                                      = config.warm_up;
     runtime_config.warm_up_with_loss                            = config.warm_up_with_loss;
     model_config.attn_config.kv_cache_dtype =

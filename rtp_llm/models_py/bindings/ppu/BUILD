@@ -32,6 +32,29 @@ cc_library(
 
 
 cc_library(
+    name = "ppu_rope_kvcache_op",
+    srcs = ["FusedRopeKVCacheOp.cc"],
+    hdrs = ["FusedRopeKVCacheOp.h"],
+    copts = cuda_copts(),
+    deps = torch_deps() + [
+        "//rtp_llm/models_py/bindings/ppu/kernels:ppu_rope_kvcache",
+        "//rtp_llm/models_py/bindings/cuda/ops:cuda_impl",
+        "//rtp_llm/models_py/bindings/core:types_hdr",
+        "//rtp_llm/models_py/bindings/common/kernels:kernels_kv_cache",
+        "//rtp_llm/models_py/bindings:op_defs",
+        "//rtp_llm/models_py/bindings/common:common",
+        "//rtp_llm/cpp/config:model_config",
+        "//rtp_llm/models_py/bindings/cuda/kernels:user_buffers",
+    ],
+    target_compatible_with = select({
+        "@//:using_ppu": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    visibility = ["//visibility:public"],
+    alwayslink = 1,
+)
+
+cc_library(
     name = "ppu_bindings_register",
     srcs = [
         "RegisterPpuOps.cc",
@@ -48,6 +71,7 @@ cc_library(
         "//rtp_llm/cpp/distribute:cpu_tp_broadcaster",
         ":no_block_copy",
         ":ppu_silu_mul_mxfp4_op",
+        ":ppu_rope_kvcache_op",
     ],
     visibility = ["//visibility:public"],
     alwayslink = 1,

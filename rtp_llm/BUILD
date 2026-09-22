@@ -663,6 +663,11 @@ grpcio_tools_req = select({
     "//conditions:default": ["grpcio-tools==1.57.0"],
 })
 
+setuptools_req = select({
+    "@//:using_ppu_sdk22": ["setuptools==83.0.0"],
+    "//conditions:default": ["setuptools==60.5.0"],
+})
+
 whl_reqs = [
     "filelock>=3.20.0",
     "jinja2",
@@ -673,7 +678,6 @@ whl_reqs = [
     "sentencepiece==0.2.0",
     "fastapi==0.115.6",
     "uvicorn==0.30.0",
-    "setuptools==60.5.0",
     "dacite",
     "pynvml",
     "thrift",
@@ -723,7 +727,7 @@ whl_reqs = [
     # OTel trace runtime; keep the pinned protobuf compatibility constraint.
     "opentelemetry-sdk==1.44.0",
     "opentelemetry-exporter-otlp-proto-http==1.15.0",
-] + grpcio_tools_req + whl_deps() + platform_deps() + xft_dep
+] + grpcio_tools_req + setuptools_req + whl_deps() + platform_deps() + xft_dep
 
 py_wheel(
     name = "rtp_llm_frontend_whl",
