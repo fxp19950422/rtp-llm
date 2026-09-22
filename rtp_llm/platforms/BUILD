@@ -34,6 +34,19 @@ py_test(
 )
 
 py_test(
+    name = "fused_permute_test",
+    srcs = ["ppu/test/test_fused_permute.py"],
+    main = "ppu/test/test_fused_permute.py",
+    data = [":platform_sources", ":ppu_sources"],
+    deps = ["//rtp_llm:torch"],
+    tags = ["manual", "gpu", "ppu"],
+    target_compatible_with = select({
+        "@//:using_ppu": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)
+
+py_test(
     name = "mxfp4_masked_test",
     srcs = ["ppu/test/test_mxfp4_masked.py"],
     main = "ppu/test/test_mxfp4_masked.py",
