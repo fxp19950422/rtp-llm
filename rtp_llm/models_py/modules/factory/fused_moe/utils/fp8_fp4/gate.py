@@ -75,6 +75,7 @@ def _select_routes_with_nonfinite_fallback(
     normalize: bool,
     indices: Optional[torch.Tensor] = None,
     router_logits: Optional[torch.Tensor] = None,
+    stable_ties: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Select deterministic routes and contain bad router rows on device.
 
@@ -121,11 +122,16 @@ def _select_routes_with_nonfinite_fallback(
             posinf=-float("inf"),
             neginf=-float("inf"),
         )
-        # The expert axis is naturally eid-ascending.  Stable descending sort
-        # therefore implements the canonical (score desc, eid asc) ordering.
-        indices = torch.argsort(
-            safe_ranking_scores, dim=-1, descending=True, stable=True
-        )[:, :topk]
+        if stable_ties:
+            # The expert axis is naturally eid-ascending. Stable descending
+            # sort implements the DSV4 canonical (score desc, eid asc) order.
+            indices = torch.argsort(
+                safe_ranking_scores, dim=-1, descending=True, stable=True
+            )[:, :topk]
+        else:
+            # Preserve established model numerics: BF16 router scores can tie,
+            # and torch.topk's tie order is part of existing smoke goldens.
+            indices = safe_ranking_scores.topk(topk, dim=-1)[1]
     else:
         if indices.shape != (n_tokens, topk):
             raise ValueError(
@@ -203,6 +209,7 @@ class Gate(nn.Module):
         linear=None,
         fp32_gemm: Optional[bool] = None,
         fused_gate: Optional[bool] = None,
+        stable_topk: bool = False,
     ):
         """``layer_weights`` is the framework's per-layer dict
         (``ModelWeights.weights[layer_id]``) keyed by ``W``. Reads
@@ -222,6 +229,7 @@ class Gate(nn.Module):
             if fused_gate is None
             else bool(fused_gate)
         )
+        self._stable_topk = bool(stable_topk)
         self.dim = dim
         self.topk = n_activated_experts
         self.score_func = score_func
@@ -397,4 +405,5 @@ class Gate(nn.Module):
             self.score_func != "softmax",
             indices,
             router_logits=router_logits,
+            stable_ties=self._stable_topk,
         )

@@ -87,6 +87,7 @@ def _manual_expert(w2: nn.Module, swiglu_limit: float = 10.0) -> Expert:
     expert.w2 = w2
     expert.w3 = nn.Identity()
     expert.swiglu_limit = swiglu_limit
+    expert.router_weight_after_w2 = True
     return expert
 
 
@@ -114,6 +115,22 @@ class ExpertPostW2WeightContractTest(unittest.TestCase):
         activation = _reference_silu_mul(x, x, clamp_limit=10.0)
         legacy_pre_w2 = spy.quantize(activation * weight_a)
         self.assertFalse(torch.equal(routed_a, legacy_pre_w2))
+
+    def test_legacy_mode_weights_before_w2_quantization(self):
+        spy = _QuantizingW2()
+        expert = _manual_expert(spy)
+        expert.router_weight_after_w2 = False
+        x = torch.tensor([[0.8, 0.9]], dtype=torch.float32)
+        weight = torch.tensor([[0.25]], dtype=torch.float32)
+
+        with mock.patch.object(
+            expert_module, "require_silu_mul_split", return_value=_reference_silu_mul
+        ):
+            actual = expert(x, weight)
+
+        activation = _reference_silu_mul(x, x, clamp_limit=10.0)
+        self.assertTrue(torch.equal(spy.inputs[0], activation * weight))
+        self.assertTrue(torch.equal(actual, spy.quantize(activation * weight)))
 
     def test_v4_swiglu_clamp10_matches_independent_formula(self):
         expert = _manual_expert(nn.Identity(), swiglu_limit=10.0)
