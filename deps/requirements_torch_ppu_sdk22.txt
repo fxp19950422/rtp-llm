@@ -10,3 +10,4 @@ deep-ep @ file:///opt/ppu-sdk22-wheelhouse/deep_ep-2.2.0+local-cp312-cp312-linux
 fast-hadamard-transform @ file:///opt/ppu-sdk22-wheelhouse/fast_hadamard_transform-1.0.4.post1-cp312-cp312-linux_x86_64.whl#sha256=01e1f7f0b1a30edddbaf74c962f1f427020de790836f2f9f2628fa9eed81f275
 grpcio-tools @ file:///opt/ppu-sdk22-wheelhouse/grpcio_tools-1.62.0-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl#sha256=b65288ebe12e38dd3650fea65d82fcce0d35df1ae4a770b525c10119ee71962f
 mkl==2021.1.1
+setuptools==83.0.0

@@ -324,6 +324,8 @@ class IndexerFP8(PoolBackedModule):
     """FP8 lightning indexer. DeepGEMM-only score; nested
     ``CompressorFP8(head_dim=128)`` writes the 132B pool."""
 
+    _request_local_scoring = False
+
     def __init__(
         self,
         dim: int,
@@ -956,7 +958,7 @@ class IndexerFP8(PoolBackedModule):
             request_score_slices: Optional[
                 tuple[tuple[int, int, int, int], ...]
             ] = None
-            if not capturing:
+            if getattr(self, "_request_local_scoring", False) and not capturing:
                 q_bounds = tuple(int(v) for v in cu_seqlens.detach().cpu().tolist())
                 k_bounds = tuple(
                     int(v) for v in cu_kv_seqlens.detach().cpu().tolist()

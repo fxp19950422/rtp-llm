@@ -1,4 +1,5 @@
 #include "rtp_llm/models_py/bindings/RegisterOps.h"
+#include "rtp_llm/models_py/bindings/ppu/FusedRopeKVCacheOp.h"
 #include "rtp_llm/models_py/bindings/ppu/PpuSiluMulMxfp4Op.h"
 #include "rtp_llm/models_py/bindings/cuda/RegisterBaseBindings.hpp"
 #include "rtp_llm/models_py/bindings/cuda/RegisterAttnOpBindings.hpp"
@@ -84,6 +85,7 @@ void registerPyModuleOps(py::module& rtp_ops_m) {
 
     registerBaseCudaBindings(rtp_ops_m);
     registerAttnOpBindings(rtp_ops_m);
+    registerFusedRopeKVCacheOp(rtp_ops_m);
 }
 
 }  // namespace rtp_llm
