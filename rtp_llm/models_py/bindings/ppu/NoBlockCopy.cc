@@ -36,10 +36,10 @@ void execNoBlockCopy(const MultiCopyParams& params) {
 
 void warmupNoBlockCopy() {}
 
-// Staged/batched memory-copy fast paths are CUDA-only; returning "nothing to
-// do" makes KVCacheMemoryConnector fall back to the generic per-item copy.
-bool execBatchedMemoryCopy(const BatchedMemoryCopyParams& params) {
-    return params.tiles.empty();
+// Staged/batched memory-copy fast paths are CUDA-only. Non-empty batches fall
+// back to the generic per-item copy.
+BatchedMemoryCopyStatus execBatchedMemoryCopy(const BatchedMemoryCopyParams& params) {
+    return params.tiles.empty() ? BatchedMemoryCopyStatus::SUCCESS : BatchedMemoryCopyStatus::NOT_SUPPORTED;
 }
 
 bool execStagedMemoryCopy(const StagedMemoryCopyParams& params, StagedMemoryCopyScratch*) {
