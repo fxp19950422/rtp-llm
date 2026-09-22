@@ -149,9 +149,13 @@ bool SWAKVCacheGroup::preparePrefillChunk(BlockIds& block_ids, int chunk_end,
                                           std::vector<size_t>* backfilled_positions) {
     backfilled_positions->clear();
     const int slots = needBlocksNum(chunk_end, 0);
-    RTP_LLM_CHECK_WITH_INFO(slots > 0 && slots <= static_cast<int>(block_ids.blocksNum()),
-                            "chunk end exceeds admitted state table: end=%d slots=%d size=%zu",
-                            chunk_end, slots, block_ids.blocksNum());
+    if (slots <= 0 || slots > static_cast<int>(block_ids.blocksNum())) {
+        RTP_LLM_LOG_WARNING("chunk end exceeds admitted state table: end=%d slots=%d size=%zu",
+                            chunk_end,
+                            slots,
+                            block_ids.blocksNum());
+        return false;
+    }
     std::vector<size_t> missing;
     for (int i = std::max(0, slots - activeTailBlockCount()); i < slots; ++i) {
         if (isNullBlockIdx(block_ids.blocks()[i])) {
@@ -165,12 +169,12 @@ bool SWAKVCacheGroup::preparePrefillChunk(BlockIds& block_ids, int chunk_end,
         return false;
     }
     auto allocated = block_pool_->malloc(missing.size());
-    if (allocated.size() != missing.size()) {
-        if (!allocated.empty()) block_pool_->requestFree(allocated);
+    if (!allocated.has_value() || allocated->size() != missing.size()) {
         return false;
     }
+    block_pool_->incRef(*allocated);
     for (size_t i = 0; i < missing.size(); ++i) {
-        block_ids.setAt(missing[i], allocated[i]);
+        block_ids.setAt(missing[i], (*allocated)[i]);
     }
     *backfilled_positions = std::move(missing);
     return true;
@@ -192,7 +196,7 @@ void SWAKVCacheGroup::releaseBeforePrefillChunk(BlockIds& block_ids, int chunk_s
         positions.push_back(static_cast<size_t>(i));
     }
     if (!released.empty()) {
-        block_pool_->requestFree(released);
+        block_pool_->decRef(released);
         block_ids.remove(positions);
     }
 }
@@ -303,6 +307,9 @@ void SWAKVCacheGroup::removeSkippedBlocks(BlockIds& block_ids, bool enable_reuse
     // a block boundary, without retaining one whole block per draft token.
     const int reserve_tokens   = std::max(reserve_step, 0);
     const int tokens_per_block = seqSizePerBlock();
+    RTP_LLM_CHECK_WITH_INFO(tokens_per_block > 0,
+                            "invalid tokens_per_block for SWA skipped-block removal: %d",
+                            tokens_per_block);
     const int reserve_blocks   = reserve_tokens / tokens_per_block + (reserve_tokens % tokens_per_block != 0);
 
     BlockIndicesType    blocks_to_free;
