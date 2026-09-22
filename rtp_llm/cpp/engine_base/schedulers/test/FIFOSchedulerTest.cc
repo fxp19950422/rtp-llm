@@ -238,7 +238,7 @@ TEST_F(FIFOSchedulerTest, ChunkGrantPreparesActualSparseTail) {
     EXPECT_FALSE(isNullBlockIdx(blocks[1]));
     EXPECT_FALSE(isNullBlockIdx(blocks[2]));
     EXPECT_TRUE(isNullBlockIdx(blocks[3]));
-    env.scheduler().stop();
+    ASSERT_TRUE(env.scheduler().stop().ok());
 }
 
 TEST_F(FIFOSchedulerTest, PDFusionPreparesEverySparseChunkAndRetainsPreviousTail) {
@@ -255,10 +255,12 @@ TEST_F(FIFOSchedulerTest, PDFusionPreparesEverySparseChunkAndRetainsPreviousTail
         const auto& blocks = stream->kvCache().blocks(0, 0);
         EXPECT_FALSE(isNullBlockIdx(blocks[round * 4 + 2]));
         EXPECT_FALSE(isNullBlockIdx(blocks[round * 4 + 3]));
-        if (round > 0) EXPECT_FALSE(isNullBlockIdx(blocks[round * 4 - 1]));
+        if (round > 0) {
+            EXPECT_FALSE(isNullBlockIdx(blocks[round * 4 - 1]));
+        }
         stream->update(makeSingleTokenUpdate(100));
     }
-    env.scheduler().stop();
+    ASSERT_TRUE(env.scheduler().stop().ok());
 }
 
 TEST_F(FIFOSchedulerTest, SparseChunkAllocationFailureFinishesAndReleasesStream) {
