@@ -907,7 +907,7 @@ TEST_F(KVCacheManagerTest, ChunkPreparationPreservesPartialPromptKeyForPD) {
     auto tokens = makeDSV4CompleteTokenIds(length, length, spb);
     MallocInfo info{resource, tokens};
     info.reuse_cache = false;
-    info.enable_device_cache = false;
+    info.enable_cache_lookup = false;
     ASSERT_TRUE(manager->malloc(info).success);
     const auto keys = resource->cacheKeys(0);
     ASSERT_EQ(keys.size(), 9);
