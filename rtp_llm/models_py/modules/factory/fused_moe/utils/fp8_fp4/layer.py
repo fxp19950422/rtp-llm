@@ -151,7 +151,6 @@ class Fp8Fp4MoeLayer(nn.Module):
         warmup_include_capacity: bool = False,
         moe_w1_layout: str = "up_gate",
         physical_expert_num: Optional[int] = None,
-        gate_factory=None,
     ) -> None:
         super().__init__()
         if n_shared_experts < 0:
@@ -162,7 +161,7 @@ class Fp8Fp4MoeLayer(nn.Module):
         self.dim = int(dim)
         self.max_tokens_per_rank = int(max_tokens_per_rank)
         self.n_shared_experts = int(n_shared_experts)
-        self.gate = (Gate if gate_factory is None else gate_factory)(
+        self.gate = Gate(
             layer_id,
             dim,
             n_routed_experts,
