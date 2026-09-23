@@ -13,6 +13,9 @@ from rtp_llm.models_py.model_desc.block_map import (
     get_attention_inputs_value,
     select_attention_inputs_for_tag,
 )
+# Attention implementations are priority-ordered. Initialize the factory while
+# descriptors load so later platform discovery cannot change CUDA numerics.
+from rtp_llm.models_py.modules import AttnImplFactory
 from rtp_llm.ops import DeviceResourceConfig
 from rtp_llm.ops.compute_ops import (
     KVCache,
@@ -99,8 +102,6 @@ class GptModelBase(nn.Module):
         is_cuda_graph: bool = False,
         cuda_graph_selection_mode: Optional[str] = None,
     ) -> AttentionImpl | dict[str, AttentionImpl]:
-        from rtp_llm.models_py.modules import AttnImplFactory
-
         attention_inputs = get_attention_inputs_value(inputs)
         if isinstance(attention_inputs, Mapping):
             fmha_group_tags = self._get_fmha_group_tags()
