@@ -122,22 +122,21 @@ struct DtypeInfo<c10::Float8_e4m3fn> {
     static constexpr float MAX = 448;
 };
 
-template<typename OFFSET_T, bool FUSE_SILU_AND_MUL>
-__device__ __forceinline__ OFFSET_T compute_input_group_start_offset(int      expert_idx,
-                                                                      int      token_idx,
-                                                                      OFFSET_T hidden_dim_group_idx,
-                                                                      int      hidden_size,
-                                                                      int      num_tokens_per_expert,
-                                                                      int      group_size) {
+template<bool FUSE_SILU_AND_MUL>
+__device__ __forceinline__ int64_t compute_input_group_start_offset(int     expert_idx,
+                                                                    int     token_idx,
+                                                                    int64_t hidden_dim_group_idx,
+                                                                    int     hidden_size,
+                                                                    int     num_tokens_per_expert,
+                                                                    int     group_size) {
     constexpr int input_multiplier = FUSE_SILU_AND_MUL ? 2 : 1;
-    return static_cast<OFFSET_T>(expert_idx) * num_tokens_per_expert * hidden_size * input_multiplier
-           + static_cast<OFFSET_T>(token_idx) * hidden_size * input_multiplier + hidden_dim_group_idx * group_size;
+    return static_cast<int64_t>(expert_idx) * num_tokens_per_expert * hidden_size * input_multiplier
+           + static_cast<int64_t>(token_idx) * hidden_size * input_multiplier + hidden_dim_group_idx * group_size;
 }
 
 constexpr uint32_t INPUT_PRIMARY_VEC_NUM_BYTES = 32;
 
-template<typename OFFSET_T>
-struct NaiveSchedulerImpl {
+struct NaiveScheduler {
     static void compute_exec_config(int   threads_per_subwarp,
                                     int   num_local_experts,
                                     int   hidden_dim_num_groups,
@@ -169,13 +168,13 @@ struct NaiveSchedulerImpl {
                                                    FUNC           fn) {
         constexpr int expert_idx = 0;
 
-        const OFFSET_T subwarp_id = threadIdx.x / THREADS_PER_SUBWARP;
-        const int      lane_id    = threadIdx.x % THREADS_PER_SUBWARP;
+        const int64_t subwarp_id = threadIdx.x / THREADS_PER_SUBWARP;
+        const int     lane_id    = threadIdx.x % THREADS_PER_SUBWARP;
 
-        const OFFSET_T block_group_id = static_cast<OFFSET_T>(blockIdx.x) * subwarps_per_block;
-        const OFFSET_T group_id       = block_group_id + subwarp_id;
+        const int64_t block_group_id = blockIdx.x * subwarps_per_block;
+        const int64_t group_id       = block_group_id + subwarp_id;
 
-        OFFSET_T input_group_start_offset;
+        int64_t input_group_start_offset;
         if constexpr (!FUSE_SILU_AND_MUL) {
             input_group_start_offset = group_id * GROUP_SIZE;
         }
@@ -186,16 +185,13 @@ struct NaiveSchedulerImpl {
 
         if constexpr (FUSE_SILU_AND_MUL) {
             const int hidden_size    = hidden_dim_num_groups * GROUP_SIZE;
-            input_group_start_offset = compute_input_group_start_offset<OFFSET_T, FUSE_SILU_AND_MUL>(
+            input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
                 expert_idx, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert, GROUP_SIZE);
         }
 
         fn(expert_idx, token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
     }
 };
-
-using NaiveScheduler   = NaiveSchedulerImpl<int64_t>;
-using NaiveScheduler32 = NaiveSchedulerImpl<int32_t>;
 
 struct MaskedLayoutScheduler {
     // TODO can be dynamically determined (which may be good when num rank is small)
@@ -234,7 +230,7 @@ struct MaskedLayoutScheduler {
         for (int token_idx = token_idx_start; token_idx < curr_expert_token_num;
              token_idx += TOKEN_DIM_BLOCK_NUM_PER_EXPERT) {
             const int     hidden_size              = hidden_dim_num_groups * GROUP_SIZE;
-            const int64_t input_group_start_offset = compute_input_group_start_offset<int64_t, FUSE_SILU_AND_MUL>(
+            const int64_t input_group_start_offset = compute_input_group_start_offset<FUSE_SILU_AND_MUL>(
                 expert_idx, token_idx, hidden_dim_group_idx, hidden_size, num_tokens_per_expert, GROUP_SIZE);
             fn(expert_idx, token_idx, hidden_dim_group_idx, lane_id, input_group_start_offset);
         }
@@ -274,14 +270,13 @@ __global__ void per_token_group_quant_8bit_kernel(const T* __restrict__ input,
             const int token_idx,
             const int hidden_dim_group_idx,
             const int lane_id,
-            const auto input_group_start_offset) {
+            const int64_t input_group_start_offset) {
             constexpr uint32_t INPUT_PRIMARY_VEC_SIZE  = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(T);
             constexpr uint32_t INPUT_PRIMARY_INT4_SIZE = INPUT_PRIMARY_VEC_NUM_BYTES / sizeof(int4);
 
-            // The host selects int32 for tensors whose input and output
-            // element offsets fit, and int64 for larger tensors so the byte
-            // offset ``offset_num_groups * GROUP_SIZE`` cannot wrap when
-            // ``M * hidden_dim_num_groups * GROUP_SIZE >= 2^31``.
+            // Use ``int64_t`` so the byte offset ``offset_num_groups *
+            // GROUP_SIZE`` (used at the global ``st_global`` below) cannot
+            // wrap when ``M * hidden_dim_num_groups * GROUP_SIZE >= 2^31``.
             // Concrete failure: long-context CP4 prefill wo_b feeds
             // ``[M=274092, K=8192]`` -> ``offset_num_groups`` in [0, 17.5M),
             // ``offset_num_groups * GROUP_SIZE=128`` peaks at 2.245B which
@@ -290,10 +285,9 @@ __global__ void per_token_group_quant_8bit_kernel(const T* __restrict__ input,
             // surfaces a sticky ``CUDA_ERROR_ILLEGAL_ADDRESS`` (700) at the
             // next sync (typically inside DeepGEMM's TMA encode /
             // ``cuLaunchKernel``), which makes it look like a DeepGEMM bug.
-            using offset_t = decltype(input_group_start_offset);
-            const offset_t offset_num_groups =
-                static_cast<offset_t>(expert_idx) * num_tokens_per_expert * hidden_dim_num_groups
-                + static_cast<offset_t>(token_idx) * hidden_dim_num_groups + hidden_dim_group_idx;
+            const int64_t offset_num_groups =
+                static_cast<int64_t>(expert_idx) * num_tokens_per_expert * hidden_dim_num_groups
+                + static_cast<int64_t>(token_idx) * hidden_dim_num_groups + hidden_dim_group_idx;
 
             int4 input_primary_int4[INPUT_PRIMARY_INT4_SIZE];
             T*   input_primary_vec = reinterpret_cast<T*>(input_primary_int4);
@@ -310,7 +304,7 @@ __global__ void per_token_group_quant_8bit_kernel(const T* __restrict__ input,
                     + j);
             }
             if constexpr (FUSE_SILU_AND_MUL) {
-                const offset_t secondary_offset = static_cast<offset_t>(hidden_dim_num_groups) * GROUP_SIZE;
+                const int64_t secondary_offset = static_cast<int64_t>(hidden_dim_num_groups) * GROUP_SIZE;
 #pragma unroll
                 for (uint32_t j = 0; j < INPUT_PRIMARY_INT4_SIZE; ++j) {
                     input_secondary_int4[j] = ld_global_nc(
@@ -448,10 +442,6 @@ void sgl_per_token_group_quant_8bit_v2(
     const int  num_tokens_per_expert = static_cast<int>(output_q.size(-2));
     const int  scale_expert_stride   = masked_layout ? static_cast<int>(output_s.stride(0)) : 0;
     const int  scale_hidden_stride   = static_cast<int>(output_s.stride(-1));
-    // Keep the established int64 kernel instance for ordinary model paths.
-    // Selecting a distinct int32 instance for small tensors changes generated
-    // code and regressed deterministic NVFP4 smoke output on SM100_ARM.
-    const bool use_int32_offsets = false;
 
 #define LAUNCH_KERNEL_INNER(SCHEDULER, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, output_s_dtype, ...)             \
     do {                                                                                                               \
@@ -478,27 +468,6 @@ void sgl_per_token_group_quant_8bit_v2(
                                          num_tokens_per_expert);                                                       \
     } while (0)
 
-#define LAUNCH_NAIVE_KERNEL_INNER(GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, output_s_dtype, ...)                 \
-    do {                                                                                                               \
-        if (use_int32_offsets) {                                                                                       \
-            LAUNCH_KERNEL_INNER(NaiveScheduler32,                                                                     \
-                                GROUP_SIZE,                                                                            \
-                                THREADS_PER_SUBWARP,                                                                   \
-                                T,                                                                                     \
-                                DST_DTYPE,                                                                             \
-                                output_s_dtype,                                                                        \
-                                __VA_ARGS__);                                                                          \
-        } else {                                                                                                       \
-            LAUNCH_KERNEL_INNER(NaiveScheduler,                                                                       \
-                                GROUP_SIZE,                                                                            \
-                                THREADS_PER_SUBWARP,                                                                   \
-                                T,                                                                                     \
-                                DST_DTYPE,                                                                             \
-                                output_s_dtype,                                                                        \
-                                __VA_ARGS__);                                                                          \
-        }                                                                                                              \
-    } while (0)
-
 #define LAUNCH_KERNEL(GROUP_SIZE, T, DST_DTYPE)                                                                        \
     do {                                                                                                               \
         constexpr int THREADS_PER_SUBWARP = GROUP_SIZE / 16;                                                           \
@@ -522,18 +491,25 @@ void sgl_per_token_group_quant_8bit_v2(
                                             true,                                                                      \
                                             true);                                                                     \
                     } else {                                                                                           \
-                        LAUNCH_NAIVE_KERNEL_INNER(                                                                     \
-                            GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, uint32_t, true, true, true);                \
+                        LAUNCH_KERNEL_INNER(NaiveScheduler,                                                            \
+                                            GROUP_SIZE,                                                                \
+                                            THREADS_PER_SUBWARP,                                                       \
+                                            T,                                                                         \
+                                            DST_DTYPE,                                                                 \
+                                            uint32_t,                                                                  \
+                                            true,                                                                      \
+                                            true,                                                                      \
+                                            true);                                                                     \
                     }                                                                                                  \
                 } else {                                                                                               \
-                    LAUNCH_NAIVE_KERNEL_INNER(                                                                         \
-                        GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, uint32_t, true, true);                          \
+                    LAUNCH_KERNEL_INNER(                                                                               \
+                        NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, uint32_t, true, true);          \
                 }                                                                                                      \
             } else {                                                                                                   \
-                LAUNCH_NAIVE_KERNEL_INNER(GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, true);                \
+                LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, true);       \
             }                                                                                                          \
         } else {                                                                                                       \
-            LAUNCH_NAIVE_KERNEL_INNER(GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false);                   \
+            LAUNCH_KERNEL_INNER(NaiveScheduler, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, float, false);          \
         }                                                                                                              \
     } while (0)
 
@@ -568,7 +544,6 @@ void sgl_per_token_group_quant_8bit_v2(
     });
 
 #undef LAUNCH_KERNEL
-#undef LAUNCH_NAIVE_KERNEL_INNER
 #undef LAUNCH_KERNEL_INNER
 }
 }  // namespace rtp_llm
