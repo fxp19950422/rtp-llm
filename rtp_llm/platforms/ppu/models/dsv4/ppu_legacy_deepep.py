@@ -65,8 +65,16 @@ class PpuLegacyDeepEPStrategy(torch.nn.Module):
         for name, value in zip(("_ppu_w13", "_ppu_s13", "_ppu_w2", "_ppu_s2"), weights):
             self.register_buffer(name, value, persistent=False)
 
-    def _forward_low_latency(self, x, weights, indices, wrapper):
-        return self._forward_ppu_grouped_fp4_low_latency(x, weights, indices, wrapper)
+    def _forward_low_latency(
+        self, x, weights, indices, wrapper, *, active_token_mask=None
+    ):
+        return self._forward_ppu_grouped_fp4_low_latency(
+            x,
+            weights,
+            indices,
+            wrapper,
+            active_token_mask=active_token_mask,
+        )
 
     def _compute_local(
         self, recv_x, recv_weights, recv_indices, counts, *, fixed_shape
@@ -230,6 +238,8 @@ class PpuLegacyDeepEPStrategy(torch.nn.Module):
         weights: torch.Tensor,
         indices: torch.Tensor,
         wrapper,
+        *,
+        active_token_mask=None,
     ) -> torch.Tensor:
         """Legacy opt-in delegates to the public platform's full-slot adapter."""
         from rtp_llm.platforms.ppu.modules.fused_moe.mxfp4_low_latency import (
@@ -257,6 +267,7 @@ class PpuLegacyDeepEPStrategy(torch.nn.Module):
             max_dispatch_tokens=wrapper.ll_num_max_token_per_rank,
             expected_m=expected_m,
             swiglu_limit=cfg.swiglu_limit if cfg.swiglu_limit > 0 else None,
+            active_token_mask=active_token_mask,
         )
 
     @staticmethod
@@ -291,6 +302,8 @@ class PpuLegacyDeepEPStrategy(torch.nn.Module):
         x: torch.Tensor,  # [N, D] local rank's tokens (BF16)
         weights: torch.Tensor,  # [N, k] fp32
         indices: torch.Tensor,  # [N, k] int64 global expert IDs
+        *,
+        active_token_mask=None,
     ) -> torch.Tensor:
         """DP+EP path: DeepEP normal dispatch → local per-expert compute
         → DeepEP combine. Requires ``init_deepep_wrapper`` to have been
@@ -318,11 +331,22 @@ class PpuLegacyDeepEPStrategy(torch.nn.Module):
         if graph_warmup:
             sync_cuda_graph_warmup_ranks("deepep_before_dispatch", x.device)
 
+        if active_token_mask is not None:
+            mask = active_token_mask.unsqueeze(-1)
+            indices = torch.where(mask, indices, -1)
+            weights = torch.where(mask, weights, 0)
+
         # Pad topk to nearest supported value (V4's 6 → 8).
         indices_p, weights_p = self._pad_topk_for_deepep(indices, weights)
 
         if wrapper.mode == DeepEPMode.LOW_LATENCY:
-            y_combined = self._forward_low_latency(x, weights_p, indices_p, wrapper)
+            y_combined = self._forward_low_latency(
+                x,
+                weights_p,
+                indices_p,
+                wrapper,
+                active_token_mask=active_token_mask,
+            )
             if graph_warmup:
                 sync_cuda_graph_warmup_ranks("deepep_after_combine", x.device)
             return y_combined

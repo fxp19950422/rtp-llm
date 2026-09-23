@@ -110,6 +110,7 @@ class PpuEPMoE(nn.Module):
                 "w2_s": layer_weights[W.v4_shared_w2_s],
             },
             swiglu_limit=swiglu_limit,
+            sglang_moe=True,
         )
         self._shared_executor = platform_provider.build_shared_expert_executor()
         self._shared_executor.prepare(self.shared_experts)

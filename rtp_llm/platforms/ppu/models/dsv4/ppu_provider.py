@@ -119,10 +119,13 @@ class M890PDsv4Provider:
 
         if platform_provider is not None and platform_provider is not self:
             raise ValueError("Shared expert received a different model adapter")
+        sglang_moe = kwargs.pop(
+            "sglang_moe", self._bool("DSV4_PPU_SGLANG_MOE", False)
+        )
         return PpuSharedExpert(
             *args,
             platform_provider=self,
-            sglang_moe=self._bool("DSV4_PPU_SGLANG_MOE", False),
+            sglang_moe=sglang_moe,
             **kwargs,
         )
 

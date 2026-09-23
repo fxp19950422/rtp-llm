@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -26,6 +26,34 @@ def _dspark_harness(gamma: int = 5) -> DeepSeekV4DSparkModel:
 
 
 class DSparkCudaGraphContractTest(unittest.TestCase):
+    def test_forward_and_head_use_tp_aware_transformer_wrappers(self) -> None:
+        model = _dspark_harness(gamma=2)
+        embedded = torch.arange(16, dtype=torch.float32).view(2, 8)
+        normalized = torch.full((4, 8), 7.0)
+        model.v4 = SimpleNamespace(
+            _embed=Mock(return_value=embedded),
+            _norm=Mock(return_value=normalized),
+            _hc_head_reduce=lambda hidden: hidden.reshape(4, 8),
+            hc_mult=2,
+            layers=[],
+        )
+
+        hidden = model._forward_layers(
+            torch.tensor([1, 2]),
+            torch.zeros(2, dtype=torch.int64),
+            torch.zeros(2, dtype=torch.int32),
+            torch.ones(2, dtype=torch.bool),
+            None,
+            1,
+            SimpleNamespace(),
+        )
+        self.assertEqual(tuple(hidden.shape), (2, 2, 8))
+        model.v4._embed.assert_called_once()
+
+        actual = model.compute_draft_hidden_states(hidden)
+        self.assertIs(actual, normalized)
+        model.v4._norm.assert_called_once()
+
     def test_forward_uses_fixed_role_entrypoints(self) -> None:
         model = _dspark_harness(gamma=3)
         model.v4 = SimpleNamespace(

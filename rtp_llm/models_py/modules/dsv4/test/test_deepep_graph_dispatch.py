@@ -16,8 +16,10 @@ from rtp_llm.platforms.ppu.models.dsv4.ppu_legacy_deepep import (
 class _FakeBuffer:
     def __init__(self) -> None:
         self.num_worst_tokens = None
+        self.layout_indices = None
 
     def get_dispatch_layout(self, indices, _num_experts):
+        self.layout_indices = indices.clone()
         rows = indices.size(0)
         return (
             torch.zeros(8, dtype=torch.int32),
@@ -158,6 +160,15 @@ class DeepEPGraphDispatchTest(unittest.TestCase):
 
         self.assertEqual(self.buffer.num_worst_tokens, 0)
 
+    def test_inactive_rows_are_removed_from_normal_dispatch(self) -> None:
+        mask = torch.tensor([False])
+        with patch("torch.cuda.is_available", return_value=False):
+            _strategy()(self.x, self.weights, self.indices, active_token_mask=mask)
+
+        self.assertTrue(
+            torch.equal(self.buffer.layout_indices, torch.full((1, 8), -1))
+        )
+
     def test_grouped_fp4_eager_capacity_grows_without_truncation(self) -> None:
         self.assertEqual(
             _select_ppu_grouped_fp4_capacity(128, [17, 129, 7], 32, fixed_shape=False),
@@ -198,7 +209,13 @@ class DeepEPGraphDispatchTest(unittest.TestCase):
             "rtp_llm.platforms.ppu.modules.fused_moe.mxfp4_low_latency.low_latency_mxfp4_moe",
             return_value=expected,
         ) as execute:
-            out = strategy(self.x, self.weights, self.indices)
+            active_token_mask = torch.tensor([True])
+            out = strategy(
+                self.x,
+                self.weights,
+                self.indices,
+                active_token_mask=active_token_mask,
+            )
 
         self.assertIs(out, expected)
         execute.assert_called_once()
@@ -222,6 +239,7 @@ class DeepEPGraphDispatchTest(unittest.TestCase):
                 "max_dispatch_tokens": 4,
                 "expected_m": 1,
                 "swiglu_limit": 1.0,
+                "active_token_mask": active_token_mask,
             },
         )
 

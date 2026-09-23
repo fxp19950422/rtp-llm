@@ -8,6 +8,15 @@ from rtp_llm.platforms.ppu.models.dsv4.ppu_legacy_deepep import PpuLegacyDeepEPS
 
 
 class PpuMoeSelectionTest(unittest.TestCase):
+    def test_shared_expert_allows_ep_to_require_sglang_contract(self):
+        provider = M890PDsv4Provider({})
+        with patch(
+            "rtp_llm.platforms.ppu.models.dsv4.ppu_shared_expert.PpuSharedExpert"
+        ) as ctor:
+            provider.build_shared_expert(4, 8, sglang_moe=True)
+
+        self.assertTrue(ctor.call_args.kwargs["sglang_moe"])
+
     def test_verified_platform_can_force_deepep(self):
         provider = M890PDsv4Provider({"DSV4_PPU_GROUPED_FP4": "1"})
         with patch("rtp_llm.platforms.ppu.models.dsv4.ppu_ep_moe.PpuEPMoE") as ctor:
