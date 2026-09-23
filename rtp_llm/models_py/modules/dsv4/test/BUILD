@@ -202,6 +202,7 @@ py_test(
         "//rtp_llm/models_py:modules",
         "//rtp_llm:testlib",
     ],
+    exec_properties = {"gpu": "A10"},
 )
 
 py_test(

@@ -17,6 +17,7 @@ class PpuTPReduceContractTest(unittest.TestCase):
         model.dim = 2
         model.max_tokens_per_rank = capacity
         model.route_scale = 1.5
+        model._fused_gather_shared = False
         events = []
 
         def gate(x, ids, *, include_route_scale=True):

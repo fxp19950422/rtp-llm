@@ -48,14 +48,18 @@ assert not any(n.startswith('rtp_llm.platforms.ppu.modules.linear.fp8_linear') f
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_concurrent_and_legacy_bootstrap_registers_each_hook_once(self):
+        from rtp_llm.device import device_type
+        from rtp_llm.utils import import_util
+
         backend_registry.reset_backend_registrations()
         with ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(lambda _: register_backend_hooks(), range(32)))
         before = {slot: tuple(hooks) for slot, hooks in backend_registry._hooks.items()}
         self.assertTrue(before)
         self.assertTrue(all(len(hooks) == 1 for hooks in before.values()))
-        with patch("rtp_llm.device.device_type.get_device_type", return_value=0), patch(
-            "rtp_llm.utils.import_util.import_optional_internal_source_entrypoint",
+        with patch.object(device_type, "get_device_type", return_value=0), patch.object(
+            import_util,
+            "import_optional_internal_source_entrypoint",
             return_value=False,
         ):
             backend_registry.run_backend_registrations("linear", factory=object())

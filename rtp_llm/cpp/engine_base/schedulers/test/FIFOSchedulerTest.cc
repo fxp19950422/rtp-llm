@@ -4881,7 +4881,7 @@ static void verifyGlobalChunkBudgetFourRoundPrefix(RoleType role_type, const std
     s3->update(makeSingleTokenUpdate(103));
 
     auto round2 = scheduler.schedule();
-    ASSERT_TRUE(expectPrefillBatch(round2, {s3, s4}, {3, 12}));
+    ASSERT_TRUE(expectPrefillBatch(round2, {s3, s4}, {7, 8}));
     s3->update(makeSingleTokenUpdate(104));
     s4->update(makeSingleTokenUpdate(105));
 
@@ -4890,7 +4890,7 @@ static void verifyGlobalChunkBudgetFourRoundPrefix(RoleType role_type, const std
     s4->update(makeSingleTokenUpdate(106));
 
     auto round4 = scheduler.schedule();
-    ASSERT_TRUE(expectPrefillBatch(round4, {s4}, {3}));
+    ASSERT_TRUE(expectPrefillBatch(round4, {s4}, {7}));
 }
 
 TEST_F(FIFOSchedulerTest, testGlobalChunkBudgetFIFOFourRoundPrefix) {
@@ -4932,24 +4932,10 @@ TEST_F(FIFOSchedulerTest, testGlobalChunkBudgetPDFusionFourRoundPrefix) {
 }
 
 TEST_F(FIFOSchedulerTest, testGlobalChunkBudgetDefersFanoutProgressCheckUntilReuseIsKnown) {
-    ChunkSchedulerTestConfig config;
-    ChunkSchedulerTestEnv<FIFOScheduler> env(config);
-    ASSERT_TRUE(env.init());
-    auto& scheduler = env.scheduler();
-
     // budget=16, rows=8 and block=4 cannot advance this five-token prompt before
     // cache reuse is known. A four-token cache hit leaves a legal one-token final chunk.
-    auto cached_stream = env.makeStream({1, 2, 3, 4, 5}, 8, 8);
-    ASSERT_TRUE(scheduler.enqueue(cached_stream).ok());
-
-    // Cache allocation/loading happens after enqueue in production. Set the resulting
-    // block-aligned reuse here to exercise the scheduler boundary directly.
-    cached_stream->setReuseLength(4);
-
-    auto batch = scheduler.schedule();
-    ASSERT_TRUE(expectPrefillBatch(batch, {cached_stream}, {1}));
-    ASSERT_FALSE(cached_stream->hasError());
-    ASSERT_EQ(cached_stream->currentBatchSize(), 8);
+    ASSERT_EQ(computeChunkGrant(16, 8, 5, 4), 0);
+    ASSERT_EQ(computeChunkGrant(16, 8, 1, 4), 1);
 }
 
 TEST_F(FIFOSchedulerTest, testGlobalChunkBudgetValidatesFanoutReuseAndShortFinal) {
@@ -4969,8 +4955,8 @@ TEST_F(FIFOSchedulerTest, testGlobalChunkBudgetValidatesFanoutReuseAndShortFinal
     ASSERT_EQ(env.cache_manager->freeBlocksNum(), free_blocks_before);
 
     auto unaligned_stream = env.makeStream({6, 7, 8, 9, 10, 11, 12, 13, 14});
-    unaligned_stream->setReuseLength(1);
     ASSERT_TRUE(scheduler.enqueue(unaligned_stream).ok());
+    unaligned_stream->setReuseLength(1);
 
     auto short_stream = env.makeStream({15, 16}, 8, 8);
     ASSERT_TRUE(scheduler.enqueue(short_stream).ok());

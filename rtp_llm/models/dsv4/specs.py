@@ -65,7 +65,7 @@ def cache_description_snapshot(layer_descriptions):
         "group_type",
     )
     policies = {
-        "reuse": ("enable_prefix_reuse", "evict_policy"),
+        "reuse": ("enable_prefix_reuse",),
         "capacity": ("reservable", "explicit_block_num", "charge_to_paged_budget"),
         "memory": ("placement",),
         "tail": ("active_tail_blocks", "validate_tail_blocks"),

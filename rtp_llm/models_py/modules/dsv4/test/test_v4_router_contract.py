@@ -79,6 +79,7 @@ def _gate_from_logits(
     nn.Module.__init__(gate)
     gate._fp32_gemm = False
     gate._fused_gate = True
+    gate._stable_topk = False
     gate._bf16_fp32_linear = provider_module.build_dsv4_bf16_fp32_linear(
         lambda x, w: torch.nn.functional.linear(x, w).float(),
         platform_provider=provider_module.DefaultDsv4PlatformProvider(),

@@ -622,7 +622,7 @@ TEST_F(DeviceSWAKVCacheGroupTest, RemoveSkippedBlocks_ReserveTokensUsePhysicalBl
         block_pool_->incRef(allocated);
         BlockIds blocks;
         blocks.assign(allocated);
-        group.removeSkippedBlocks(blocks, true, c.reserve_tokens);
+        group.removeSkippedBlocks(blocks, false, c.reserve_tokens);
         EXPECT_EQ(validBlockCount(blocks.blocks()), static_cast<size_t>(c.retained_blocks));
         for (int i = 0; i < 6; ++i) {
             EXPECT_EQ(isNullBlockIdx(blocks.blocks()[i]), i < 6 - c.retained_blocks);

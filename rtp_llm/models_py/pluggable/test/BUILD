@@ -4,6 +4,7 @@ py_test(
     name = "test_baseline_modules",
     srcs = ["test_baseline_modules.py"],
     deps = ["//rtp_llm/models_py:models", "//rtp_llm:testlib"],
+    exec_properties = {"gpu": "A10"},
 )
 
 py_test(

@@ -43,6 +43,7 @@ class MtpProjectionWeightTest(unittest.TestCase):
             tp_size=1,
             dp_size=1,
             ep_size=1,
+            use_swizzleA=False,
             exported_device=SimpleNamespace(
                 maybe_rewrite_weight_by_key=lambda name, tensor: tensor
             ),

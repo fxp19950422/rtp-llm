@@ -148,6 +148,7 @@ py_test(
     main = "ppu/test/test_fp4_indexer_request_slices.py",
     data = [":platform_sources", ":ppu_sources"],
     deps = ["//rtp_llm/models_py:models", "//rtp_llm:testlib"],
+    exec_properties = {"gpu": "A10"},
 )
 
 test_suite(
