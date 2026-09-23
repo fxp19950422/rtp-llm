@@ -448,9 +448,10 @@ void sgl_per_token_group_quant_8bit_v2(
     const int  num_tokens_per_expert = static_cast<int>(output_q.size(-2));
     const int  scale_expert_stride   = masked_layout ? static_cast<int>(output_s.stride(0)) : 0;
     const int  scale_hidden_stride   = static_cast<int>(output_s.stride(-1));
-    const bool use_int32_offsets =
-        input.numel() <= std::numeric_limits<int32_t>::max()
-        && output_q.numel() <= std::numeric_limits<int32_t>::max();
+    // Keep the established int64 kernel instance for ordinary model paths.
+    // Selecting a distinct int32 instance for small tensors changes generated
+    // code and regressed deterministic NVFP4 smoke output on SM100_ARM.
+    const bool use_int32_offsets = false;
 
 #define LAUNCH_KERNEL_INNER(SCHEDULER, GROUP_SIZE, THREADS_PER_SUBWARP, T, DST_DTYPE, output_s_dtype, ...)             \
     do {                                                                                                               \
