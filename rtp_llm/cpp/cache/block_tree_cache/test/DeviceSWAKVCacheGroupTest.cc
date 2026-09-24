@@ -615,7 +615,7 @@ TEST_F(DeviceSWAKVCacheGroupTest, RemoveSkippedBlocks_ReserveTokensUsePhysicalBl
         SCOPED_TRACE(::testing::Message()
                      << "block_tokens=" << c.tokens_per_block << " reserve_tokens=" << c.reserve_tokens);
         auto            spec = makeDsv4StateSpec(c.tokens_per_block);
-        SWAKVCacheGroup group({}, spec, block_pool_, 0, 2, makePolicy(true));
+        SWAKVCacheGroup group({}, spec, block_pool_, 0, 2, makePolicy(false));
         const size_t    free_before = block_pool_->freeBlocksNum();
         auto            allocated   = block_pool_->malloc(6).value();
         ASSERT_EQ(allocated.size(), 6u);
@@ -634,8 +634,10 @@ TEST_F(DeviceSWAKVCacheGroupTest, RemoveSkippedBlocks_ReserveTokensUsePhysicalBl
 
 TEST_F(DeviceSWAKVCacheGroupTest, Mtp3HcaStateSupportsEightyStreamsAcrossBlockBoundaries) {
     // Match the service's 255 usable HCA state blocks and 80 concurrent streams.
-    // Only allocator bookkeeping is exercised, so use a small backing tensor.
-    auto        backing_spec = createTestKvCacheSpec(1, DataType::TYPE_FP32, 1, 256, 4, 0);
+    // Only allocator bookkeeping is exercised, so use a four-byte state block.
+    auto backing_spec = std::dynamic_pointer_cast<FixedStateCacheSpec>(
+        makeResolvedOpaqueSpec(true, "default", DataType::TYPE_FP32, 4, 256));
+    ASSERT_NE(backing_spec, nullptr);
     CacheConfig config;
     config.layer_num = config.layer_all_num = 1;
     config.block_num                        = 256;
@@ -649,8 +651,7 @@ TEST_F(DeviceSWAKVCacheGroupTest, Mtp3HcaStateSupportsEightyStreamsAcrossBlockBo
     auto pool = std::make_shared<DeviceBlockPool>(const_config);
     ASSERT_TRUE(pool->init());
     ASSERT_EQ(pool->freeBlocksNum(), 255u);
-    auto                  spec = makeDsv4StateSpec(256);
-    SWAKVCacheGroup       group({}, spec, pool, 0, 0, makePolicy(false));
+    SWAKVCacheGroup       group({}, backing_spec, pool, 0, 0, makePolicy(false));
     std::vector<BlockIds> streams(80);
     for (auto& blocks : streams) {
         ASSERT_TRUE(group.malloc(blocks, 4096, false, 4));

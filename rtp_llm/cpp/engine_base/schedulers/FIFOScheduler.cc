@@ -703,8 +703,8 @@ absl::StatusOr<list<GenerateStreamPtr>> FIFOScheduler::schedule() {
     const bool has_requeued_prefill_stream =
         waiting_streams_.size() > waiting_size_before_cache_update
         && std::any_of(waiting_streams_.begin(), waiting_streams_.end(), [](const auto& stream) {
-               return stream->hasEvent(StreamEvents::CanRun) && stream->hasEvent(StreamEvents::LoadInitiated)
-                      && stream->chunkedPrefillEnabled() && stream->isContextStream();
+               return stream->hasEvent(StreamEvents::LoadInitiated) && stream->chunkedPrefillEnabled()
+                      && stream->isContextStream();
            });
     if (has_requeued_prefill_stream && waiting_size_before_cache_update > 0) {
         auto first_requeued = waiting_streams_.begin();

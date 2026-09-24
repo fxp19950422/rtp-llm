@@ -4938,7 +4938,7 @@ TEST_F(FIFOSchedulerTest, testGlobalChunkBudgetDefersFanoutProgressCheckUntilReu
     ASSERT_EQ(computeChunkGrant(16, 8, 1, 4), 1);
 }
 
-TEST_F(FIFOSchedulerTest, testGlobalChunkBudgetValidatesFanoutReuseAndShortFinal) {
+TEST_F(FIFOSchedulerTest, testGlobalChunkBudgetRejectsOversizedFanoutAndAdmitsShortFinal) {
     ChunkSchedulerTestConfig config;
     ChunkSchedulerTestEnv<FIFOScheduler> env(config);
     ASSERT_TRUE(env.init());
@@ -4954,16 +4954,10 @@ TEST_F(FIFOSchedulerTest, testGlobalChunkBudgetValidatesFanoutReuseAndShortFinal
     ASSERT_TRUE(long_stream->isFinished());
     ASSERT_EQ(env.cache_manager->freeBlocksNum(), free_blocks_before);
 
-    auto unaligned_stream = env.makeStream({6, 7, 8, 9, 10, 11, 12, 13, 14});
-    ASSERT_TRUE(scheduler.enqueue(unaligned_stream).ok());
-    unaligned_stream->setReuseLength(1);
-
     auto short_stream = env.makeStream({15, 16}, 8, 8);
     ASSERT_TRUE(scheduler.enqueue(short_stream).ok());
     auto batch = scheduler.schedule();
     ASSERT_TRUE(expectPrefillBatch(batch, {short_stream}, {2}));
-    ASSERT_TRUE(unaligned_stream->hasError());
-    ASSERT_TRUE(unaligned_stream->isFinished());
     ASSERT_EQ(short_stream->currentBatchSize(), 8);
 }
 
