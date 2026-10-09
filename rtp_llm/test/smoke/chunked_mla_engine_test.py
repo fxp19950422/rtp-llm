@@ -256,11 +256,19 @@ class ChunkedMlaEngineTest(unittest.TestCase):
             )
             # This phase is serial, so the completion delta must be this request.
             self.assertEqual(len(after.finished_task_list), 1, after)
-            self.assertEqual(
-                after.finished_task_list[0].error_info.error_code,
-                ExceptionType.CANCELLED.value,
-                after.finished_task_list[0],
-            )
+            finished = after.finished_task_list[0]
+            if finished.error_info.error_code == 0:
+                # A fast model can finish before the socket close reaches the server.
+                expected_iterations = math.ceil(len(prompt.split()) / budget) + 1024 - 1
+                self.assertGreaterEqual(
+                    finished.iterate_count, expected_iterations, finished
+                )
+            else:
+                self.assertEqual(
+                    finished.error_info.error_code,
+                    ExceptionType.CANCELLED.value,
+                    finished,
+                )
         self.assertEqual(self._request(manager, prompt, budget), expected)
 
     def test_full_vs_chunked_prefill_and_decode(self):
