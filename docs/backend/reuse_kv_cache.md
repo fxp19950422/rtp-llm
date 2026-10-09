@@ -94,6 +94,33 @@ entries, but has no request-completion store target. Direct REMOTE inserts are u
 Backend availability does not bypass successful completion, `reuse_cache`, or allocator
 resource eligibility checks required to reach a DEVICE insert.
 
+### M890P DeepSeek-V4-Flash qualification
+
+The PPU FP4 Prefill/Decode implementation rejects `REUSE_CACHE=1` by default.
+`DSV4_PPU_PREFIX_REUSE=1` explicitly enables experimental qualification of this
+existing path; it does not enable reuse or select storage tiers by itself.
+Keep the qualified PPU model/topology, module dispatch, and execution options.
+Other platforms and models are not changed by this opt-in.
+
+For chunked Prefill accuracy experiments, `DSV4_PPU_PREFIX_TAIL_ALIGN=1` additionally
+splits a final partial cache block from its preceding full blocks. It takes effect
+only for `deepseek_v4` with `DSV4_PPU_PREFIX_REUSE=1`; the default scheduler is
+unchanged. This is not yet a qualified production setting.
+
+Use `REUSE_CACHE`, `ENABLE_DEVICE_CACHE`, `ENABLE_MEMORY_CACHE`, and
+`MEMORY_CACHE_SIZE_MB` for local-tier configuration. The host-memory capacity
+is **per rank**. `ENABLE_GPU_PREFIX_TREE`, `ENABLE_TIERED_MEMORY_CACHE`, and
+`ENABLE_PREFIX_TREE_MEMORY_CACHE` have no runtime configuration binding in this
+version and must not be used as evidence that a cache tier is enabled.
+
+Qualification must distinguish L1 hits, L2-only hits, and L1 eviction followed
+by L2 restoration. Check output equivalence and role-specific
+`prefill_memory_reuse_len` / `decode_memory_reuse_len`, not just aggregate
+`cached_tokens` or service readiness. With request cache switches honored,
+`reuse_cache=false` provides a no-reuse control; request-level tier fields do
+not override deployment policy. A host hit adds transfer overhead, so measure
+first-token latency against recomputation before recommending L2 for a workload.
+
 ### Ignoring request cache switches
 
 Setting `RTP_LLM_IGNORE_REQUEST_CACHE_SWITCHES=1` (default off) ignores the request's

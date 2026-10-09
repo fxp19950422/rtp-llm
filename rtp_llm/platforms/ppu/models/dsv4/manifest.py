@@ -111,7 +111,11 @@ def _supports_ppu_prefill(selection, request, cache_mode):
             "requires a Prefill role",
         ),
         (not metadata.get("cuda_graph"), "graph execution is not qualified"),
-        (not metadata.get("reuse_cache"), "prefix reuse is not qualified"),
+        (
+            not metadata.get("reuse_cache")
+            or options.get("DSV4_PPU_PREFIX_REUSE") == "1",
+            "prefix reuse requires experimental DSV4_PPU_PREFIX_REUSE=1",
+        ),
         (not metadata.get("lora"), "LoRA is not supported by PPU weight layouts"),
         (not metadata.get("eplb"), "EPLB is not qualified"),
         (
@@ -187,7 +191,11 @@ def supports_ppu_fp4_decode(selection, request):
         (metadata.get("indexer_cache_mode") == "fp4", "requires FP4 indexer cache"),
         (metadata.get("fp8_kv_cache") is True, "requires FP8 KV cache"),
         (not metadata.get("cp_enabled"), "CP is not supported by this candidate"),
-        (not metadata.get("reuse_cache"), "prefix reuse is not qualified"),
+        (
+            not metadata.get("reuse_cache")
+            or options.get("DSV4_PPU_PREFIX_REUSE") == "1",
+            "prefix reuse requires experimental DSV4_PPU_PREFIX_REUSE=1",
+        ),
         (not metadata.get("lora"), "LoRA is not supported by PPU weight layouts"),
         (not metadata.get("eplb"), "EPLB is not qualified"),
         (
