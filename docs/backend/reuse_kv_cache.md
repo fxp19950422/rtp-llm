@@ -113,6 +113,16 @@ is **per rank**. `ENABLE_GPU_PREFIX_TREE`, `ENABLE_TIERED_MEMORY_CACHE`, and
 `ENABLE_PREFIX_TREE_MEMORY_CACHE` have no runtime configuration binding in this
 version and must not be used as evidence that a cache tier is enabled.
 
+For the tested P4+D4, 1M-context deployment with `PREFILL_CHUNK_SIZE=256`,
+both `WARM_UP=1` and `MODEL_WARM_UP=1` require
+`DSV4_STARTUP_REAL_WARMUP_TIMEOUT_S=2400`: the default 600-second gRPC
+deadline expired during the 512K-token startup request. Keep the full
+`MAX_SEQ_LEN=1048576` warmup gate and wait for it to finish before routing
+evaluation traffic. In the tested L2-only configuration, 8 GiB per rank
+retained a 14K prefix but not a 71K prefix; 16 GiB per rank retained the
+71K prefix. Size host capacity for the intended workload and multiply it
+by the number of ranks.
+
 Qualification must distinguish L1 hits, L2-only hits, and L1 eviction followed
 by L2 restoration. Check output equivalence and role-specific
 `prefill_memory_reuse_len` / `decode_memory_reuse_len`, not just aggregate
