@@ -355,6 +355,18 @@ py_test(
 )
 
 py_test(
+    name = "ppu_tp_moe_fp32_reduce_test",
+    srcs = ["ppu/models/dsv4/test/test_ppu_tp_moe_fp32_reduce.py"],
+    main = "ppu/models/dsv4/test/test_ppu_tp_moe_fp32_reduce.py",
+    data = [":platform_sources", ":ppu_sources"],
+    deps = ["//rtp_llm/models_py:models", "//rtp_llm:testlib"],
+    target_compatible_with = select({
+        "@//:using_ppu": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)
+
+py_test(
     name = "silu_mul_mxfp4_test",
     srcs = ["ppu/test/test_silu_mul_mxfp4.py"],
     main = "ppu/test/test_silu_mul_mxfp4.py",
@@ -365,4 +377,14 @@ py_test(
         "@//:using_ppu": [],
         "//conditions:default": ["@platforms//:incompatible"],
     }),
+)
+
+test_suite(
+    name = "ppu_prefix_reuse_regression_tests",
+    tests = [
+        ":ppu_tp_moe_fp32_reduce_test",
+        "//rtp_llm/models_py/modules/dsv4/test:test_prefill_fast_path_ppu",
+        "//rtp_llm/models_py/modules/dsv4/fp8/test:test_output_projection_all_reduce_ppu",
+        "//rtp_llm/models_py/pluggable/test:test_dsv4_plan",
+    ],
 )

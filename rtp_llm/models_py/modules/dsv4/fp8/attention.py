@@ -92,6 +92,15 @@ def _use_read_from_pool() -> bool:
     return os.environ.get("DSV4_READ_FROM_POOL", "1") != "0"
 
 
+def _use_ppu_reuse_fp32_tp_reduce(platform_provider) -> bool:
+    options = getattr(platform_provider, "execution_options", {})
+    return (
+        getattr(platform_provider, "name", None) == "m890p-dsv4-candidate"
+        and options.get("DSV4_PPU_PREFIX_REUSE") == "1"
+        and options.get("DSV4_PPU_TP_FP32_REDUCE") == "1"
+    )
+
+
 def _use_cp_cache_hit_raw_q_merge() -> bool:
     # The raw-Q/O/LSE merge implementation is still an experimental validation
     # path: it avoids KV gather communication, but its current index planning is
@@ -887,6 +896,7 @@ class AttentionFP8(nn.Module):
         indexer."""
         super().__init__()
         self._platform_provider = platform_provider
+        self._prefill_tp_fp32_reduce = _use_ppu_reuse_fp32_tp_reduce(platform_provider)
         self.layer_id = layer_id
         self.dim = dim
         self.q_lora_rank = q_lora_rank
@@ -5772,6 +5782,10 @@ class AttentionFP8(nn.Module):
         from rtp_llm.models_py.distributed.collective_torch import Group, all_reduce
 
         with record_function_range("dsv4.fp8.attn.out.tp_all_reduce"):
+            if getattr(self, "_prefill_tp_fp32_reduce", False):
+                reduced = all_reduce(out.float(), Group.TP, inplace=True)
+                out.copy_(reduced)
+                return
             reduced = all_reduce(out, Group.TP, inplace=True)
             if reduced is not out:
                 out.copy_(reduced)

@@ -534,6 +534,13 @@ def forward_layers(
     use_prefill_fast_path = _prefill_fast_path_enabled(
         v4, prepare_hidden_fn, prefill_fast_layer_calls
     )
+    if not use_prefill_fast_path and any(
+        getattr(layer, "_isolate_prefill_hc_moe", False) for layer in v4.layers
+    ):
+        raise RuntimeError(
+            "M890P prefix reuse requires the FP8 Prefill fast path; "
+            "the generic layer path has not been qualified"
+        )
     if not use_prefill_fast_path:
         prefill_fast_layer_calls = None
     record_range_ctx = (

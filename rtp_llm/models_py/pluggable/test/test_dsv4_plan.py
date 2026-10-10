@@ -36,6 +36,8 @@ def selection(rank=0, *, device_name="ZW-M890P", **changed):
         speculative=False,
         cuda_graph=False,
         reuse_cache=False,
+        enable_memory_cache=False,
+        prefill_chunk_size=256,
         lora=False,
         eplb=False,
         indexer_cache_mode="fp4",
@@ -59,6 +61,15 @@ def explicit_config():
             },
         }
     )
+
+
+def reuse_options(decode):
+    options = dict(DECODE_EXECUTION_OPTIONS if decode else PREFILL_EXECUTION_OPTIONS)
+    options["DSV4_PPU_PREFIX_REUSE"] = "1"
+    if not decode:
+        options["DSV4_PPU_TP_FP32_REDUCE"] = "1"
+        options["DSV4_PPU_ISOLATE_HC_MOE"] = "1"
+    return options
 
 
 class Dsv4PlanTest(unittest.TestCase):
@@ -129,6 +140,11 @@ class Dsv4PlanTest(unittest.TestCase):
                 options = dict(base)
                 if value is not None:
                     options["DSV4_PPU_PREFIX_REUSE"] = value
+                if not decode:
+                    options.update(
+                        DSV4_PPU_TP_FP32_REDUCE="1",
+                        DSV4_PPU_ISOLATE_HC_MOE="1",
+                    )
                 changed = dict(reuse_cache=True, execution_options=options)
                 ctx = (
                     self.decode_context(**changed)
@@ -143,9 +159,84 @@ class Dsv4PlanTest(unittest.TestCase):
                         with self.assertRaisesRegex(ValueError, "DSV4_PPU_PREFIX_REUSE"):
                             ctx.prepare([request_for("model", ctx.selection)])
 
+    def test_prefix_reuse_prefill_requires_numerical_guards(self):
+        base = reuse_options(False)
+        for key in ("DSV4_PPU_TP_FP32_REDUCE", "DSV4_PPU_ISOLATE_HC_MOE"):
+            for value in (None, "0"):
+                options = dict(base)
+                if value is None:
+                    del options[key]
+                else:
+                    options[key] = value
+                ctx = self.context(selection(reuse_cache=True, execution_options=options))
+                with self.subTest(key=key, value=value):
+                    with self.assertRaisesRegex(ValueError, key):
+                        ctx.prepare([request_for("model", ctx.selection)])
+        ctx = self.context(selection(reuse_cache=True, execution_options=base))
+        ctx.prepare([request_for("model", ctx.selection)])
+        self.assertEqual(len(ctx.bindings), 130)
+
+    def test_prefix_reuse_prefill_requires_qualified_chunk_size(self):
+        options = reuse_options(False)
+        for size in (None, 0, 4096):
+            ctx = self.context(
+                selection(
+                    reuse_cache=True,
+                    execution_options=options,
+                    prefill_chunk_size=size,
+                )
+            )
+            with self.subTest(size=size):
+                with self.assertRaisesRegex(ValueError, "PREFILL_CHUNK_SIZE=256"):
+                    ctx.prepare([request_for("model", ctx.selection)])
+        ctx = self.context(
+            selection(reuse_cache=True, execution_options=options)
+        )
+        ctx.prepare([request_for("model", ctx.selection)])
+        self.assertEqual(len(ctx.bindings), 130)
+
+    def test_prefix_reuse_prefill_rejects_cuda_graph(self):
+        options = reuse_options(False)
+        ctx = self.context(
+            selection(reuse_cache=True, cuda_graph=True, execution_options=options)
+        )
+        with self.assertRaisesRegex(ValueError, "ENABLE_CUDA_GRAPH=0"):
+            ctx.prepare([request_for("model", ctx.selection)])
+
+        ctx = self.context(
+            selection(reuse_cache=False, cuda_graph=True, execution_options=options)
+        )
+        ctx.prepare([request_for("model", ctx.selection)])
+        self.assertEqual(len(ctx.bindings), 130)
+
+    def test_prefix_reuse_host_cache_requires_separate_opt_in(self):
+        for decode in (False, True):
+            for reuse in (False, True):
+                for value in (None, "0", "true", "1"):
+                    options = reuse_options(decode)
+                    if value is not None:
+                        options["DSV4_PPU_HOST_PREFIX_REUSE"] = value
+                    changed = dict(
+                        reuse_cache=reuse,
+                        enable_memory_cache=True,
+                        execution_options=options,
+                    )
+                    ctx = (
+                        self.decode_context(**changed)
+                        if decode else self.context(selection(**changed))
+                    )
+                    with self.subTest(decode=decode, reuse=reuse, value=value):
+                        if reuse and value != "1":
+                            with self.assertRaisesRegex(
+                                ValueError, "DSV4_PPU_HOST_PREFIX_REUSE"
+                            ):
+                                ctx.prepare([request_for("model", ctx.selection)])
+                            continue
+                        ctx.prepare([request_for("model", ctx.selection)])
+                        self.assertEqual(len(ctx.bindings), 130)
+
     def test_prefix_reuse_target_draft_rank_contracts(self):
         for decode, world in ((False, 4), (True, 4), (True, 8)):
-            base = DECODE_EXECUTION_OPTIONS if decode else PREFILL_EXECUTION_OPTIONS
             for gamma in (0, 1, 2, 3):
                 models = [("deepseek_v4", 43)]
                 if gamma:
@@ -162,7 +253,7 @@ class Dsv4PlanTest(unittest.TestCase):
                             speculative_type="MTP" if gamma else "NONE",
                             gen_num_per_cycle=gamma,
                             reuse_cache=True,
-                            execution_options={**base, "DSV4_PPU_PREFIX_REUSE": "1"},
+                            execution_options=reuse_options(decode),
                         )
                         ctx = (
                             self.decode_context(
@@ -177,14 +268,13 @@ class Dsv4PlanTest(unittest.TestCase):
 
     def test_prefix_reuse_opt_in_preserves_other_rejections(self):
         for decode in (False, True):
-            base = DECODE_EXECUTION_OPTIONS if decode else PREFILL_EXECUTION_OPTIONS
             for unsupported in (
                 {"indexer_cache_mode": "fp8"}, {"fp8_kv_cache": False},
                 {"hidden_size": 8192}, {"speculative": True},
             ):
                 changed = dict(
                     reuse_cache=True,
-                    execution_options={**base, "DSV4_PPU_PREFIX_REUSE": "1"},
+                    execution_options=reuse_options(decode),
                     **unsupported,
                 )
                 ctx = (

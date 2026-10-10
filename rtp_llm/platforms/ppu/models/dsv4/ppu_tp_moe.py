@@ -63,6 +63,9 @@ class PpuTPMoE(nn.Module):
         self._fused_gather_shared = platform_provider._bool(
             "DSV4_MOE_GATHER_SHARED_FUSED", True
         )
+        self._tp_fp32_reduce = platform_provider._bool(
+            "DSV4_PPU_PREFIX_REUSE", False
+        ) and platform_provider._bool("DSV4_PPU_TP_FP32_REDUCE", False)
         self._platform_provider = platform_provider
         self.gate = Gate(
             layer_id,
@@ -122,12 +125,18 @@ class PpuTPMoE(nn.Module):
         self._reduce = partial(all_reduce, group=Group.TP, inplace=True)
         logging.info(
             "DSV4_PPU_TP_MOE layer=%d rank=%d shared_w13=%s shared_w2=%s "
-            "collective=bf16_shared_plus_routed.v2",
+            "collective=%s_shared_plus_routed.v2",
             layer_id,
             tp_rank,
             tuple(self.shared_experts.w13.weight.shape),
             tuple(self.shared_experts.w2.weight.shape),
+            "fp32" if self._tp_fp32_reduce else "bf16",
         )
+
+    def _reduce_local(self, local):
+        if self._tp_fp32_reduce:
+            return self._reduce(local.float()).to(local.dtype)
+        return self._reduce(local)
 
     def _forward_local_chunk(self, x, input_ids):
         from rtp_llm.models_py.modules.dsv4 import _record_tensor as recorder
@@ -159,8 +168,8 @@ class PpuTPMoE(nn.Module):
                 local = combine_tp_partials(routed, shared, self.route_scale)
         if debug:
             recorder.record_if_level(2, prefix + "_tp_local_bf16", local)
-        with record_function_range("dsv4.moe.tp_all_reduce_bf16"):
-            result = self._reduce(local)
+        with record_function_range("dsv4.moe.tp_all_reduce"):
+            result = self._reduce_local(local)
         if debug:
             recorder.record_if_level(2, prefix + "_tp_reduced_bf16", result)
         return result

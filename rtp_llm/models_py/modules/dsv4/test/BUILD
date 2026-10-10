@@ -71,6 +71,18 @@ dsv4_sm100_py_test(
     deps = _MODEL_TEST_DEPS,
 )
 
+py_test(
+    name = "test_prefill_fast_path_ppu",
+    srcs = ["test_prefill_fast_path.py"],
+    main = "test_prefill_fast_path.py",
+    deps = _MODEL_TEST_DEPS,
+    tags = ["ppu"],
+    target_compatible_with = select({
+        "@//:using_ppu": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)
+
 _PERF_TESTS = [
     "test_fused_inv_rope_fp8_quant_perf",
     "test_fused_rmsnorm_rope_perf",

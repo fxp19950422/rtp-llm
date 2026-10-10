@@ -1449,6 +1449,56 @@ TEST_F(BlockTreeCacheFactoryTest, MiddleDisabledGroupIsExcludedWithoutShiftingRe
     releaseInsertedRequestBlocks(allocator, blocks);
 }
 
+TEST_F(BlockTreeCacheFactoryTest, HostRoundTripExcludesMiddleNonReusableGroup) {
+    const auto config    = makeReusableGroupsAroundDisabledConfig();
+    auto       allocator = initAllocator<CoordinatorCacheManager>(config);
+    KVCacheConfig kv_cache_config;
+    kv_cache_config.enable_memory_cache  = true;
+    kv_cache_config.memory_cache_size_mb = 1;
+    auto cache = createBlockTreeCache(config, kv_cache_config, allocator);
+    ASSERT_NE(cache, nullptr);
+    allocator->attachBlockTreeCache(cache);
+
+    ASSERT_EQ(cache->groupSets().size(), 1u);
+    const auto& group_set = cache->groupSets().front();
+    ASSERT_EQ(group_set->groupTags(), tagsFor(config, {0, 2}));
+    ASSERT_NE(group_set->hostPool(), nullptr);
+    const size_t reusable_bytes = config.blockSizeBytesForGroup("group0") + config.blockSizeBytesForGroup("group2");
+    EXPECT_EQ(group_set->hostPool()->payloadBytes(), reusable_bytes);
+
+    const auto blocks = insertOneKeyThroughAllocator(config, allocator, /*key=*/702);
+    ASSERT_EQ(blocks.size(), 3u);
+    for (size_t group_id = 0; group_id < blocks.size(); ++group_id) {
+        const auto& tag = config.topology().groupTags().at(group_id);
+        writeDevicePattern(allocator->convertIndexToAddr(static_cast<int>(group_id), tag, blocks[group_id]).kv_addr,
+                           config.blockSizeBytesForGroup(tag),
+                           static_cast<uint8_t>(group_id + 1));
+    }
+
+    const auto host_block = group_set->hostPool()->malloc();
+    ASSERT_TRUE(host_block.has_value());
+    group_set->hostPool()->incTreeRef(*host_block, BlockTreeRefType::STORE);
+    EXPECT_TRUE(cache->executeTransfer(block_transfer_engine_test::makeTransferTask(
+        {TransferDescriptor::deviceToHost(group_set->groupSetId(), {blocks[0], blocks[2]}, *host_block)})));
+    for (size_t group_id = 0; group_id < blocks.size(); ++group_id) {
+        const auto& tag = config.topology().groupTags().at(group_id);
+        writeDevicePattern(allocator->convertIndexToAddr(static_cast<int>(group_id), tag, blocks[group_id]).kv_addr,
+                           config.blockSizeBytesForGroup(tag),
+                           0);
+    }
+    EXPECT_TRUE(cache->executeTransfer(block_transfer_engine_test::makeTransferTask(
+        {TransferDescriptor::hostToDevice(group_set->groupSetId(), *host_block, {blocks[0], blocks[2]})})));
+    for (size_t group_id = 0; group_id < blocks.size(); ++group_id) {
+        const auto& tag = config.topology().groupTags().at(group_id);
+        expectDevicePattern(allocator->convertIndexToAddr(static_cast<int>(group_id), tag, blocks[group_id]).kv_addr,
+                            config.blockSizeBytesForGroup(tag),
+                            group_id == 1 ? 0 : static_cast<uint8_t>(group_id + 1));
+    }
+
+    group_set->hostPool()->decTreeRef(*host_block, BlockTreeRefType::STORE);
+    releaseInsertedRequestBlocks(allocator, blocks);
+}
+
 TEST_F(BlockTreeCacheFactoryTest, IndependentPoolsWatermarkTracksEachGroupSet) {
     const auto config    = makeIndependentWatermarkConfig();
     auto       allocator = initAllocator<CoordinatorCacheManager>(config);

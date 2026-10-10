@@ -559,6 +559,22 @@ class PrefillFastPathTest(_PrefillForwardTestBase):
         build_meta.assert_called_once()
         clear_meta.assert_called_once_with(v4)
 
+    def test_prefix_reuse_rejects_generic_prefill_fallback(self):
+        v4 = _FakeV4()
+        v4.layers[0]._isolate_prefill_hc_moe = True
+        with patch.dict(
+            prefill_forward.os.environ, {"DSV4_PREFILL_FAST_PATH": "0"}, clear=True
+        ), self.assertRaisesRegex(RuntimeError, "requires the FP8 Prefill fast path"):
+            prefill_forward.forward_layers(
+                v4,
+                kv_cache=None,
+                input_ids=torch.tensor([3, 4], dtype=torch.long),
+                positions=torch.tensor([7, 8], dtype=torch.long),
+                cu_seqlens=torch.tensor([0, 2], dtype=torch.long),
+                block_tables_by_type=None,
+            )
+        self.assertEqual(v4.calls, [])
+
     def test_forward_layers_fast_path_preserves_varlen_batch_metadata(self):
         v4 = _FakeV4()
         input_ids = torch.tensor([3, 4, 5, 6], dtype=torch.long)
@@ -1000,6 +1016,78 @@ class PrefillFusedHCInterfaceTest(unittest.TestCase):
                     ))
                 self.assertEqual(normalize.call_count, 0 if fused else 2)
             torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+
+    def test_isolated_hc_and_moe_keep_request_shape(self):
+        class Attention:
+            def can_fuse_prefill_attn_norm_input_quant(self, *_):
+                return False
+
+            def __call__(self, x, positions, *, kv_cache, block_tables_by_type):
+                return x
+
+        def pre(value):
+            mix = torch.zeros((value.shape[0], 1, 1))
+            return value[:, 0, :] + value.shape[0], mix, mix
+
+        def post(value, residual, *_):
+            return residual + value[:, None, :] + value.shape[0]
+
+        def block(isolate):
+            return SimpleNamespace(
+                tp_size=1,
+                tp_rank=0,
+                _isolate_prefill_hc_moe=isolate,
+                attn_hc=object(),
+                ffn_hc=object(),
+                attn_norm=SimpleNamespace(weight=torch.ones(8)),
+                ffn_norm=SimpleNamespace(weight=torch.ones(8)),
+                attn=Attention(),
+                ffn=lambda value, ids: value + value.shape[0],
+                _prefill_fast_hc_impls=lambda: (pre, pre, post, post),
+                _sync_after_first_cp_prefill_attention=lambda: None,
+            )
+
+        x = torch.ones((4, 1, 8))
+        ids = torch.tensor([1, 2, 3, 4])
+        positions = torch.arange(4)
+        with patch(
+            "rtp_llm.models_py.modules.dsv4.block._prefill_fast_norm",
+            side_effect=lambda norm, value, **kwargs: value,
+        ):
+            single = Block._forward_prefill_fast_fp8(
+                block(False), x[:2], ids[:2], positions[:2], torch.tensor([0, 2])
+            )
+            isolated = Block._forward_prefill_fast_fp8(
+                block(True), x, ids, positions, torch.tensor([0, 2, 4])
+            )
+            with_empty = Block._forward_prefill_fast_fp8(
+                block(True), x, ids, positions, torch.tensor([0, 0, 2, 4, 4])
+            )
+            batched = Block._forward_prefill_fast_fp8(
+                block(False), x, ids, positions, torch.tensor([0, 2, 4])
+            )
+
+        self.assertTrue(torch.equal(single, isolated[:2]))
+        self.assertTrue(torch.equal(isolated, with_empty))
+        self.assertFalse(torch.equal(single, batched[:2]))
+
+    def test_isolated_hc_rejects_invalid_request_boundaries(self):
+        block = SimpleNamespace(_isolate_prefill_hc_moe=True)
+        x = torch.ones((2, 1, 8))
+        ids = torch.tensor([1, 2])
+        positions = torch.arange(2)
+        for boundaries in ([0, 2, 1, 2], [0, 0, 0], [1, 1, 2]):
+            length = 0 if boundaries == [0, 0, 0] else 2
+            with self.subTest(boundaries=boundaries), self.assertRaisesRegex(
+                ValueError, "invalid DSV4 prefill request boundaries"
+            ):
+                Block._forward_prefill_fast_fp8(
+                    block,
+                    x[:length],
+                    ids[:length],
+                    positions[:length],
+                    torch.tensor(boundaries),
+                )
 
 
 if __name__ == "__main__":

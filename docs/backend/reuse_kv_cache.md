@@ -94,6 +94,47 @@ entries, but has no request-completion store target. Direct REMOTE inserts are u
 Backend availability does not bypass successful completion, `reuse_cache`, or allocator
 resource eligibility checks required to reach a DEVICE insert.
 
+### Experimental M890P DeepSeek-V4-Flash reuse
+
+PPU Prefill prefix reuse requires `REUSE_CACHE=1`, `ENABLE_DEVICE_CACHE=1`,
+`ENABLE_MEMORY_CACHE=0`, and these model execution options:
+
+```text
+DSV4_PPU_PREFIX_REUSE=1
+DSV4_PPU_TP_FP32_REDUCE=1
+DSV4_PPU_ISOLATE_HC_MOE=1
+PREFILL_CHUNK_SIZE=256
+ENABLE_CUDA_GRAPH=0
+```
+
+The Prefill module rejects reuse when either numerical option is missing or the
+effective chunk size differs from 256. Prefill also requires the FP8 fast layer
+path; an unqualified generic-layer fallback raises an error when the isolation
+option is active. Multi-request CUDA Graph capture uses device-resident request
+boundaries, which this per-request HC/MoE path cannot split without a host sync;
+Prefill reuse therefore rejects CUDA Graph until that path is qualified. Decode
+requires the prefix-reuse opt-in, but not the
+Prefill-only numerical options. The FP32 TP reductions and
+per-request HC/MoE path remain off for other models and platforms. For the
+deterministic HC backend, keep the existing mixing policy unchanged; a separate
+stabilization experiment regressed a real cold Prefill request.
+
+M890P host-memory and tiered prefix reuse remain unqualified. The additional
+`DSV4_PPU_HOST_PREFIX_REUSE=1` option permits controlled L2-only and tiered
+experiments, but is off by default; it is not a production qualification. A
+cache hit or a short-prefix TTFT improvement
+does not qualify long contexts, mixed batches, or cache restoration from host
+memory. Before deployment, compare cache-off/on output token IDs and streaming
+TTFT at the intended context lengths, including concurrent hot and mixed
+cold/hot requests. A Python-file overlay of this candidate passed
+warmup-enabled short/medium/long/1M P4+D4 service checks and 20 repeated
+concurrent-branch probes, but these synthetic-prefix checks do not establish
+production-load quality or throughput. A complete image built from the current
+PR head and host-memory restoration have not yet been validated. For a 1M
+startup profile on the tested host, the default 600-second real warmup RPC
+deadline was insufficient; an explicit 1800-second deadline completed the
+1,048,575-token warmup in 886 seconds.
+
 ### Ignoring request cache switches
 
 Setting `RTP_LLM_IGNORE_REQUEST_CACHE_SWITCHES=1` (default off) ignores the request's

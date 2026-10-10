@@ -115,6 +115,31 @@ def _supports_ppu_prefill(selection, request, cache_mode):
             "prefix reuse requires experimental DSV4_PPU_PREFIX_REUSE=1",
         ),
         (
+            not metadata.get("reuse_cache")
+            or options.get("DSV4_PPU_TP_FP32_REDUCE") == "1",
+            "PPU Prefill prefix reuse requires DSV4_PPU_TP_FP32_REDUCE=1",
+        ),
+        (
+            not metadata.get("reuse_cache")
+            or options.get("DSV4_PPU_ISOLATE_HC_MOE") == "1",
+            "PPU Prefill prefix reuse requires DSV4_PPU_ISOLATE_HC_MOE=1",
+        ),
+        (
+            not metadata.get("reuse_cache")
+            or metadata.get("prefill_chunk_size") == 256,
+            "PPU Prefill prefix reuse is qualified only with PREFILL_CHUNK_SIZE=256",
+        ),
+        (
+            not metadata.get("reuse_cache") or not metadata.get("cuda_graph"),
+            "PPU Prefill prefix reuse requires ENABLE_CUDA_GRAPH=0",
+        ),
+        (
+            not metadata.get("reuse_cache")
+            or not metadata.get("enable_memory_cache")
+            or options.get("DSV4_PPU_HOST_PREFIX_REUSE") == "1",
+            "PPU DSV4 host-memory prefix reuse requires experimental DSV4_PPU_HOST_PREFIX_REUSE=1",
+        ),
+        (
             metadata.get("indexer_cache_mode") == cache_mode,
             f"requires {cache_mode.upper()} indexer cache",
         ),
@@ -190,6 +215,12 @@ def supports_ppu_fp4_decode(selection, request):
             not metadata.get("reuse_cache")
             or options.get("DSV4_PPU_PREFIX_REUSE") == "1",
             "prefix reuse requires experimental DSV4_PPU_PREFIX_REUSE=1",
+        ),
+        (
+            not metadata.get("reuse_cache")
+            or not metadata.get("enable_memory_cache")
+            or options.get("DSV4_PPU_HOST_PREFIX_REUSE") == "1",
+            "PPU DSV4 host-memory prefix reuse requires experimental DSV4_PPU_HOST_PREFIX_REUSE=1",
         ),
         (
             comm.get("enabled") is True

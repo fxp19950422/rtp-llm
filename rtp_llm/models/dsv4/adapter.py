@@ -111,6 +111,8 @@ def metadata_snapshot(model_config, engine_config):
         "gen_num_per_cycle": int(engine_config.sp_config.gen_num_per_cycle),
         "cuda_graph": bool(engine_config.hw_kernel_config.enable_cuda_graph),
         "reuse_cache": bool(engine_config.kv_cache_config.reuse_cache),
+        "enable_memory_cache": bool(engine_config.kv_cache_config.enable_memory_cache),
+        "prefill_chunk_size": int(model_config.prefill_chunk_size),
         "lora": bool(getattr(model_config, "lora_infos", None)),
         "eplb": bool(model_config.eplb_config.enable_eplb()),
         "indexer_cache_mode": indexer_cache_mode,

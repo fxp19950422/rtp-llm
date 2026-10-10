@@ -79,6 +79,18 @@ _CONTRACT_TESTS = [
     "test_compressor_cp_merged_gather",
 ]
 
+py_test(
+    name = "test_output_projection_all_reduce_ppu",
+    srcs = ["test_output_projection_all_reduce.py"],
+    main = "test_output_projection_all_reduce.py",
+    deps = _DSV4_FP8_TEST_DEPS,
+    tags = ["ppu"],
+    target_compatible_with = select({
+        "@//:using_ppu": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+)
+
 [
     dsv4_py_test(
         name = name,

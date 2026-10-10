@@ -128,6 +128,12 @@ class Block(nn.Module):
         self.tp_rank = int(tp_rank)
         self.fp8_kv_cache = fp8_kv_cache
         self._platform_provider = platform_provider
+        options = getattr(platform_provider, "execution_options", {})
+        self._isolate_prefill_hc_moe = (
+            getattr(platform_provider, "name", None) == "m890p-dsv4-candidate"
+            and options.get("DSV4_PPU_PREFIX_REUSE") == "1"
+            and options.get("DSV4_PPU_ISOLATE_HC_MOE") == "1"
+        )
         self._attention_layout = resolve_dsv4_attention_layout(
             platform_provider
             if platform_provider is not None
@@ -571,6 +577,64 @@ class Block(nn.Module):
         if input_ids is None:
             raise RuntimeError("DSV4 prefill fast path requires input_ids")
 
+        ranges = None
+        if getattr(self, "_isolate_prefill_hc_moe", False) and cu_seqlens.numel() > 2:
+            boundaries = cu_seqlens.tolist()
+            request_ranges = list(zip(boundaries, boundaries[1:]))
+            if (
+                boundaries[0] != 0
+                or boundaries[-1] != x.shape[0]
+                or not any(start < end for start, end in request_ranges)
+                or any(start > end for start, end in request_ranges)
+            ):
+                raise ValueError("invalid DSV4 prefill request boundaries")
+            ranges = [
+                (start, end)
+                for start, end in request_ranges
+                if start < end
+            ]
+
+        def hc_pre(hc, impl, norm, residual):
+            if ranges is None:
+                return _prefill_fast_hc_pre_norm(
+                    hc, impl, norm, residual, tp_size=self.tp_size, tp_rank=self.tp_rank
+                )
+            parts = [
+                _prefill_fast_hc_pre_norm(
+                    hc,
+                    impl,
+                    norm,
+                    residual[start:end],
+                    tp_size=self.tp_size,
+                    tp_rank=self.tp_rank,
+                )
+                for start, end in ranges
+            ]
+            fused = parts[0][1]
+            if any(part[1] != fused for part in parts):
+                raise RuntimeError("inconsistent per-request HC norm fusion")
+            values = tuple(
+                torch.cat([part[0][index] for part in parts], dim=0)
+                for index in range(3)
+            )
+            return values, fused
+
+        def hc_post(impl, body, residual, post, comb):
+            if ranges is None:
+                return impl(body, residual, post, comb)
+            return torch.cat(
+                [
+                    impl(
+                        body[start:end],
+                        residual[start:end],
+                        post[start:end],
+                        comb[start:end],
+                    )
+                    for start, end in ranges
+                ],
+                dim=0,
+            )
+
         (
             attn_hc_pre,
             ffn_hc_pre,
@@ -579,13 +643,11 @@ class Block(nn.Module):
         ) = self._prefill_fast_hc_impls()
 
         residual = x
-        (x_pre, post, comb), norm_fused = _prefill_fast_hc_pre_norm(
+        (x_pre, post, comb), norm_fused = hc_pre(
             self.attn_hc,
             attn_hc_pre,
             self.attn_norm,
             x,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
         )
         if norm_fused:
             attn_out = self.attn(
@@ -624,17 +686,15 @@ class Block(nn.Module):
                 kv_cache=kv_cache,
                 block_tables_by_type=block_tables_by_type,
             )
-        x = attn_hc_post(attn_out, residual, post, comb)
+        x = hc_post(attn_hc_post, attn_out, residual, post, comb)
         self._sync_after_first_cp_prefill_attention()
 
         residual = x
-        (x_pre, post, comb), norm_fused = _prefill_fast_hc_pre_norm(
+        (x_pre, post, comb), norm_fused = hc_pre(
             self.ffn_hc,
             ffn_hc_pre,
             self.ffn_norm,
             x,
-            tp_size=self.tp_size,
-            tp_rank=self.tp_rank,
         )
         if not norm_fused:
             x_pre = _prefill_fast_norm(
@@ -643,8 +703,17 @@ class Block(nn.Module):
                 tp_size=self.tp_size,
                 tp_rank=self.tp_rank,
             )
-        ffn_out = self.ffn(x_pre, input_ids)
-        return ffn_hc_post(ffn_out, residual, post, comb)
+        if ranges is None:
+            ffn_out = self.ffn(x_pre, input_ids)
+        else:
+            ffn_out = torch.cat(
+                [
+                    self.ffn(x_pre[start:end], input_ids[start:end])
+                    for start, end in ranges
+                ],
+                dim=0,
+            )
+        return hc_post(ffn_hc_post, ffn_out, residual, post, comb)
 
     def forward(
         self,
