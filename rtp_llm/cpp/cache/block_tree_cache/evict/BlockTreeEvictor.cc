@@ -330,6 +330,14 @@ bool BlockTreeEvictor::submitEvictionTask(std::vector<TransferDescriptor>     de
         deadline,
         std::move(on_timeout));
     if (!submitted) {
+        const TransferDescriptor& first = task_ptr->descriptors().front();
+        if (first.source_tier == Tier::DEVICE && first.target_tier == Tier::HOST && traceHostEvictions()) {
+            for (const TransferDescriptor& desc : task_ptr->descriptors()) {
+                RTP_LLM_LOG_INFO("host cache evict mode=watermark stage=task_rejected key=%ld group_set=%zu",
+                                 desc.node->cache_key,
+                                 desc.group_set_id);
+            }
+        }
         updatePendingRelease(task_ptr->descriptors(), false);
         rollbackTransferLocked(task_ptr->descriptors());
         return false;
@@ -359,7 +367,7 @@ BlockTreeEvictor::batchEvictLocked(size_t group_set_id, Tier source_tier, size_t
             break;
         }
         if (source_tier == Tier::DEVICE && target_tier == Tier::HOST && traceHostEvictions()) {
-            RTP_LLM_LOG_INFO("host cache evict mode=watermark key=%ld group_set=%zu source=DEVICE target=HOST",
+            RTP_LLM_LOG_INFO("host cache evict mode=watermark stage=selected key=%ld group_set=%zu source=DEVICE target=HOST",
                              eviction_desc->node->cache_key,
                              group_set_id);
         }
@@ -374,6 +382,13 @@ BlockTreeEvictor::batchEvictLocked(size_t group_set_id, Tier source_tier, size_t
     auto target_blocks =
         tree_->groupSets()[group_set_id]->allocateBlocks(descriptors.size(), target_tier, BlockTreeRefType::EVICTION);
     if (!target_blocks.has_value()) {
+        if (source_tier == Tier::DEVICE && target_tier == Tier::HOST && traceHostEvictions()) {
+            for (const TransferDescriptor& desc : descriptors) {
+                RTP_LLM_LOG_INFO("host cache evict mode=watermark stage=target_allocation_failed key=%ld group_set=%zu",
+                                 desc.node->cache_key,
+                                 desc.group_set_id);
+            }
+        }
         rollbackTransferLocked(descriptors);
         return {};
     }
@@ -409,10 +424,20 @@ void BlockTreeEvictor::scheduleEvictionSettlement(std::shared_ptr<const Eviction
         {
             std::lock_guard<std::mutex> lock(*mutex_);
             std::vector<bool>           detached;
+            std::vector<int64_t>        trace_keys;
             detached.reserve(task->descriptors().size());
+            const bool trace_host_demotion = traceHostEvictions()
+                && task->descriptors().front().source_tier == Tier::DEVICE
+                && task->descriptors().front().target_tier == Tier::HOST;
+            if (trace_host_demotion) {
+                trace_keys.reserve(task->descriptors().size());
+            }
             for (const TransferDescriptor& desc : task->descriptors()) {
                 const bool is_detached = desc.node->group_set_resources[desc.group_set_id].transfer_detached;
                 detached.push_back(is_detached);
+                if (trace_host_demotion) {
+                    trace_keys.push_back(desc.node->cache_key);
+                }
                 any_detached     = any_detached || is_detached;
                 any_not_detached = any_not_detached || !is_detached;
             }
@@ -428,6 +453,12 @@ void BlockTreeEvictor::scheduleEvictionSettlement(std::shared_ptr<const Eviction
 
             for (size_t desc_index = 0; desc_index < task->descriptors().size(); ++desc_index) {
                 const TransferDescriptor& desc = task->descriptors()[desc_index];
+                if (trace_host_demotion) {
+                    RTP_LLM_LOG_INFO("host cache evict mode=watermark stage=settled key=%ld group_set=%zu result=%s",
+                                     trace_keys[desc_index],
+                                     desc.group_set_id,
+                                     detached[desc_index] ? "detached" : (success ? "host" : "rolled_back"));
+                }
                 if (success || detached[desc_index]) {
                     TransferDescriptor settled_desc = desc;
                     if (detached[desc_index]) {
