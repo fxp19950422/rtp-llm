@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cstdlib>
 #include <exception>
 #include <utility>
 
@@ -14,6 +15,18 @@
 #include "rtp_llm/cpp/utils/TimeUtil.h"
 
 namespace rtp_llm {
+
+namespace {
+
+bool traceHostStore() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("DSV4_PPU_TRACE_HOST_STORE");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+}  // namespace
 
 BlockTreeLoader::BlockTreeLoader(BlockTree*                      tree,
                                  BlockTreeEvictor&               evictor,
@@ -51,8 +64,17 @@ BlockTreeMatchResult BlockTreeLoader::matchLocked(const CacheKeysType& cache_key
         return {};
     }
 
-    std::vector<TreeNode*> path   = tree_->findNode(cache_keys);
-    BlockTreeMatchResult   result = createMatchResult(path, cache_keys);
+    std::vector<TreeNode*> path         = tree_->findNode(cache_keys);
+    const size_t           found_blocks = path.size();
+    BlockTreeMatchResult   result       = createMatchResult(path, cache_keys);
+    if (traceHostStore()) {
+        RTP_LLM_LOG_INFO("host cache lookup path first_key=%ld requested=%zu found=%zu candidate_span=%zu next_key=%ld",
+                         cache_keys.front(),
+                         cache_keys.size(),
+                         found_blocks,
+                         path.size(),
+                         path.size() < cache_keys.size() ? cache_keys[path.size()] : 0);
+    }
     RTP_LLM_LOG_DEBUG("matched %zu device blocks, cache_keys=%zu, tree_nodes=%zu",
                       result.matched_device_blocks,
                       cache_keys.size(),
@@ -62,6 +84,7 @@ BlockTreeMatchResult BlockTreeLoader::matchLocked(const CacheKeysType& cache_key
 
 bool BlockTreeLoader::validMatch(std::vector<TreeNode*>& path, std::vector<bool>& candidate_valid) const {
     size_t valid_block_count = 0;
+    bool   first_invalid_logged = false;
     candidate_valid.reserve(path.size());
     std::vector<std::unique_ptr<MatchValidator>> match_validators;
     match_validators.reserve(tree_->groupSets().size());
@@ -74,6 +97,16 @@ bool BlockTreeLoader::validMatch(std::vector<TreeNode*>& path, std::vector<bool>
         for (size_t group_set_id = 0; group_set_id < tree_->groupSets().size(); ++group_set_id) {
             if (!match_validators[group_set_id]->validate(node->group_set_resources[group_set_id])) {
                 all_groups_valid = false;
+                if (!first_invalid_logged && traceHostStore()) {
+                    const GroupSetResource& resource = node->group_set_resources[group_set_id];
+                    RTP_LLM_LOG_INFO("host cache lookup invalid key=%ld path_index=%zu group_set=%zu top_tier=%s transfer_state=%d",
+                                     node->cache_key,
+                                     i,
+                                     group_set_id,
+                                     tierName(resource.getTopTier()),
+                                     static_cast<int>(resource.transfer_state));
+                    first_invalid_logged = true;
+                }
             }
         }
         if (all_groups_valid) {
