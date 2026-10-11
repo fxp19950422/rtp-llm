@@ -1,6 +1,7 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeCache.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <utility>
 
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeTaskPool.h"
@@ -149,6 +150,24 @@ BlockTreeMatchResult BlockTreeCache::match(const CacheKeysType& cache_keys) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
         result = loader_.matchLocked(cache_keys);
+    }
+    static const bool trace_host_store = [] {
+        const char* value = std::getenv("DSV4_PPU_TRACE_HOST_STORE");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    if (trace_host_store && config_.enable_host_cache) {
+        const size_t host_loads = result.async_context ?
+                                      std::count_if(result.async_context->loadDescs().begin(),
+                                                    result.async_context->loadDescs().end(),
+                                                    [](const TransferDescriptor& desc) {
+                                                        return desc.source_tier == Tier::HOST;
+                                                    }) :
+                                      0;
+        RTP_LLM_LOG_INFO("host cache lookup first_key=%ld path_blocks=%zu device_blocks=%zu host_loads=%zu",
+                         cache_keys.empty() ? 0 : cache_keys.front(),
+                         cache_keys.size(),
+                         result.matched_device_blocks,
+                         host_loads);
     }
     metrics_reporter_->reportCacheReuseTimeMetrics(result.reuse_time_metrics_snapshots);
     return result;

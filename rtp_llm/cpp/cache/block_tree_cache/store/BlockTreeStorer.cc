@@ -1,7 +1,8 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/store/BlockTreeStorer.h"
 
-#include <chrono>
 #include <cassert>
+#include <chrono>
+#include <cstdlib>
 #include <exception>
 #include <utility>
 
@@ -13,6 +14,16 @@
 #include "rtp_llm/cpp/utils/TimeUtil.h"
 
 namespace rtp_llm {
+namespace {
+bool traceHostStore() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("DSV4_PPU_TRACE_HOST_STORE");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+}  // namespace
+
 BlockTreeStorer::BlockTreeStorer(BlockTree*                      tree,
                                  BlockTreeEvictor&               evictor,
                                  BlockTransferDispatcher*        transfer_dispatcher,
@@ -105,10 +116,24 @@ void BlockTreeStorer::submitLowerTierLocked(const CacheKeysType&                
         target_tier,
         cache_keys,
         std::chrono::milliseconds(target_tier == Tier::DISK ? disk_timeout_ms_ : host_timeout_ms_));
+    if (target_tier == Tier::HOST && traceHostStore()) {
+        task->submitted_at_us = currentTimeUs();
+        RTP_LLM_LOG_INFO("host store submit task=%p first_key=%ld path_blocks=%zu",
+                         static_cast<const void*>(task.get()),
+                         cache_keys.empty() ? 0 : cache_keys.front(),
+                         cache_keys.size());
+    }
 
     block_tree_cache_detail::ScopeRollback prepare_guard([this, &task]() { settleLocked(*task, /*publish=*/false); });
 
     if (!store_task_runner_.prepareTask(*task, resources)) {
+        if (target_tier == Tier::HOST && traceHostStore()) {
+            RTP_LLM_LOG_INFO("host store prepare rejected task=%p first_key=%ld path_blocks=%zu allocated=%zu",
+                             static_cast<const void*>(task.get()),
+                             cache_keys.empty() ? 0 : cache_keys.front(),
+                             cache_keys.size(),
+                             task->descriptors().size());
+        }
         return;
     }
     const int64_t queue_begin = currentTimeUs();
@@ -205,6 +230,18 @@ void BlockTreeStorer::settleTask(const StoreTask& task, bool copy_success) {
                           tierName(task.target_tier),
                           accepted,
                           task.descriptors().size() - accepted);
+    }
+    if (task.target_tier == Tier::HOST && traceHostStore()) {
+        RTP_LLM_LOG_INFO("host store settle task=%p first_key=%ld path_blocks=%zu descriptors=%zu accepted=%zu "
+                         "copy_success=%d published=%d elapsed_us=%ld",
+                         static_cast<const void*>(&task),
+                         task.cache_keys.empty() ? 0 : task.cache_keys.front(),
+                         task.cache_keys.size(),
+                         task.descriptors().size(),
+                         accepted,
+                         copy_success,
+                         copy_success && !stopping,
+                         currentTimeUs() - task.submitted_at_us);
     }
 }
 
