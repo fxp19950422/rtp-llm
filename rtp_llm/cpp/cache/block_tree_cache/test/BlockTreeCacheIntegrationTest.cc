@@ -897,7 +897,8 @@ TEST_F(BlockTreeCacheIntegrationTest, HostStoreBecomesMatchableOnlyAfterAsyncPub
     EXPECT_EQ(before_publish.async_context, nullptr);
 
     paused_transfer->release();
-    waitForCacheTasksToDrain(*cache);
+    // Submission can finish before the transfer callback publishes the HOST node.
+    BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*cache);
     ASSERT_FALSE(cache->tree()->findNode({100}).empty());
     BlockTreeMatchResult after_publish = cache->match({100});
     std::shared_ptr<LoadAsyncContext> context = takeLoadContext(after_publish);
