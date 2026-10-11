@@ -861,6 +861,56 @@ TEST_F(BlockTreeCacheIntegrationTest, UncommittedLoadContextReleasesSourceRefere
     environment->expectFullyReclaimed();
 }
 
+TEST_F(BlockTreeCacheIntegrationTest, HostStoreBecomesMatchableOnlyAfterAsyncPublish) {
+    if (!cudaAvailable()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+
+    constexpr size_t kBlockBytes = 16;
+    constexpr size_t kPoolSize   = 2;
+    auto device_pool = makeDevicePool({{kBlockBytes, 0}}, kPoolSize, "async_host_publish_device");
+    auto host_pool   = makeHostPool(kBlockBytes, kPoolSize);
+    auto full = std::make_shared<FullGroupSet>(std::vector<DeviceBlockPoolPtr>{device_pool}, host_pool, nullptr);
+    auto topology = block_transfer_engine_test::makeTestTopology({block_transfer_engine_test::makeTestGroupBase(
+        defaultCacheGroupPolicy(CacheGroupType::FULL), {0}, kBlockBytes)});
+    full->initialize(0, topology, topology->groupTags());
+
+    BlockTreeCacheConfig config;
+    config.enable_device_cache        = false;
+    config.enable_host_cache          = true;
+    config.host_cache_sync_timeout_ms = 60000;
+    auto cache                        = makeBlockTreeCacheForTest({full}, config);
+    auto paused_transfer = std::make_shared<PausablePerRankBlockTransferEngine>(
+        std::vector<GroupSetPtr>{full}, cache->isDiskCacheEnabled(), /*succeed=*/true);
+    PausableTransferReleaseGuard release_guard(paused_transfer);
+    BlockTreeCacheTestPeer::setPerRankBlockTransferEngineForTest(*cache, paused_transfer);
+
+    const MultiNodeBlocks request_blocks = allocateDeviceBlocksForTest(*full, 1);
+    std::vector<std::vector<GroupSetResource>> resources(1, std::vector<GroupSetResource>(1));
+    resources[0][0].device_blocks = request_blocks.front();
+    cache->insert({100}, resources, Tier::HOST);
+    ASSERT_TRUE(paused_transfer->waitUntilEnteredFor(kRaceWaitTimeout));
+
+    EXPECT_TRUE(cache->tree()->findNode({100}).empty());
+    BlockTreeMatchResult before_publish = cache->match({100});
+    EXPECT_EQ(before_publish.matched_device_blocks, 0u);
+    EXPECT_EQ(before_publish.async_context, nullptr);
+
+    paused_transfer->release();
+    waitForCacheTasksToDrain(*cache);
+    ASSERT_FALSE(cache->tree()->findNode({100}).empty());
+    BlockTreeMatchResult after_publish = cache->match({100});
+    std::shared_ptr<LoadAsyncContext> context = takeLoadContext(after_publish);
+    ASSERT_NE(context, nullptr);
+    ASSERT_EQ(context->loadDescs().size(), 1u);
+    EXPECT_EQ(context->loadDescs()[0].source_tier, Tier::HOST);
+    context.reset();
+
+    cache.reset();
+    device_pool->decRef(request_blocks.front());
+    EXPECT_EQ(device_pool->freeBlocksNum(), kPoolSize);
+}
+
 TEST_F(BlockTreeCacheIntegrationTest, CacheShutdownWaitsForSubmitReturnedStoreContextSettlement) {
     if (!cudaAvailable()) {
         GTEST_SKIP() << "CUDA not available";
