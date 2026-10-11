@@ -214,6 +214,19 @@ void BlockTreeStorer::settleTask(const StoreTask& task, bool copy_success) {
         std::lock_guard<std::mutex> lock(mutex_);
         stopping = stopping_.load();
         accepted = settleLocked(task, copy_success && !stopping);
+        // Serialize publication evidence with the lookup trace under the tree lock.
+        if (task.target_tier == Tier::HOST && traceHostStore()) {
+            RTP_LLM_LOG_INFO("host store settle task=%p first_key=%ld path_blocks=%zu descriptors=%zu accepted=%zu "
+                             "copy_success=%d published=%d elapsed_us=%ld",
+                             static_cast<const void*>(&task),
+                             task.cache_keys.empty() ? 0 : task.cache_keys.front(),
+                             task.cache_keys.size(),
+                             task.descriptors().size(),
+                             accepted,
+                             copy_success,
+                             copy_success && !stopping,
+                             currentTimeUs() - task.submitted_at_us);
+        }
     }
 
     if (stopping) {
@@ -230,18 +243,6 @@ void BlockTreeStorer::settleTask(const StoreTask& task, bool copy_success) {
                           tierName(task.target_tier),
                           accepted,
                           task.descriptors().size() - accepted);
-    }
-    if (task.target_tier == Tier::HOST && traceHostStore()) {
-        RTP_LLM_LOG_INFO("host store settle task=%p first_key=%ld path_blocks=%zu descriptors=%zu accepted=%zu "
-                         "copy_success=%d published=%d elapsed_us=%ld",
-                         static_cast<const void*>(&task),
-                         task.cache_keys.empty() ? 0 : task.cache_keys.front(),
-                         task.cache_keys.size(),
-                         task.descriptors().size(),
-                         accepted,
-                         copy_success,
-                         copy_success && !stopping,
-                         currentTimeUs() - task.submitted_at_us);
     }
 }
 
