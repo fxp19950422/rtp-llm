@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <string>
@@ -18,6 +19,18 @@
 #include "rtp_llm/cpp/utils/TimeUtil.h"
 
 namespace rtp_llm {
+
+namespace {
+
+bool traceHostEvictions() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("DSV4_PPU_TRACE_HOST_STORE");
+        return value != nullptr && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+}  // namespace
 
 BlockTreeEvictor::BlockTreeEvictor(BlockTree*                     tree,
                                    EvictionPolicy                 device_policy,
@@ -224,6 +237,12 @@ bool BlockTreeEvictor::dropLocked(size_t group_set_id, Tier source_tier, bool no
     if (!eviction_desc.has_value()) {
         return false;
     }
+    if (source_tier == Tier::DEVICE && is_tier_enabled_(Tier::HOST) && traceHostEvictions()) {
+        RTP_LLM_LOG_INFO("host cache evict mode=force_drop key=%ld group_set=%zu source=%s target=NONE",
+                         eviction_desc->node->cache_key,
+                         group_set_id,
+                         tierName(source_tier));
+    }
     runDropTask(std::move(*eviction_desc), notify_settled);
     return true;
 }
@@ -338,6 +357,11 @@ BlockTreeEvictor::batchEvictLocked(size_t group_set_id, Tier source_tier, size_t
         auto eviction_desc = chooseVictim(group_set_id, source_tier, /*force_drop=*/false);
         if (!eviction_desc.has_value()) {
             break;
+        }
+        if (source_tier == Tier::DEVICE && target_tier == Tier::HOST && traceHostEvictions()) {
+            RTP_LLM_LOG_INFO("host cache evict mode=watermark key=%ld group_set=%zu source=DEVICE target=HOST",
+                             eviction_desc->node->cache_key,
+                             group_set_id);
         }
         timings.emplace_back(eviction_desc->node->group_set_resources[eviction_desc->group_set_id].candidate_meta);
         reserveSource({*eviction_desc});
