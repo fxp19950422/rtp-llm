@@ -383,6 +383,8 @@ test_suite(
     name = "ppu_prefix_reuse_regression_tests",
     tests = [
         ":ppu_tp_moe_fp32_reduce_test",
+        "//rtp_llm/cpp/cache/block_tree_cache/test:block_tree_cache_factory_test",
+        "//rtp_llm/cpp/cache/block_tree_cache/test:block_tree_cache_integration_test",
         "//rtp_llm/models_py/modules/dsv4/test:test_prefill_fast_path_ppu",
         "//rtp_llm/models_py/modules/dsv4/fp8/test:test_output_projection_all_reduce_ppu",
         "//rtp_llm/models_py/pluggable/test:test_dsv4_plan",

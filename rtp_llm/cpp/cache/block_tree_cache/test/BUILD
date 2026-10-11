@@ -55,7 +55,11 @@ pool_test_deps = [
 
 cc_test(
     name = "block_tree_cache_factory_test",
-    exec_properties = {"gpu": "L20_CU13"},
+    exec_properties = select({
+        "@//:using_ppu": {"gpu": "PPU-ZW810E"},
+        "//conditions:default": {"gpu": "L20_CU13"},
+    }),
+    visibility = ["//rtp_llm/platforms:__pkg__"],
     testonly = True,
     srcs = ["BlockTreeCacheFactoryTest.cc"],
     copts = pool_test_copts,
@@ -134,7 +138,11 @@ cc_test(
 
 cc_test(
     name = "block_tree_cache_integration_test",
-    exec_properties = {"gpu": "L20_CU13"},
+    exec_properties = select({
+        "@//:using_ppu": {"gpu": "PPU-ZW810E"},
+        "//conditions:default": {"gpu": "L20_CU13"},
+    }),
+    visibility = ["//rtp_llm/platforms:__pkg__"],
     testonly = True,
     srcs = ["BlockTreeCacheIntegrationTest.cc"],
     copts = test_copts,
