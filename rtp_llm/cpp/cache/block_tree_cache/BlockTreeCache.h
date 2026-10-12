@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -61,6 +62,9 @@ struct BlockTreeCacheConfig {
     // ---- Cross-rank transfer timeout ----
     int host_cache_sync_timeout_ms{10000};
     int disk_cache_sync_timeout_ms{30000};
+
+    // Default-off bounded rematch for a prefix overlapping device demotion.
+    int demotion_lookup_wait_ms{0};
 
     // Total max-stride staging blocks per rank, split evenly across Full/SWA pools.
     // Default guarantees at least 64 Full blocks; actual capacities depend on payload sizes.
@@ -182,6 +186,7 @@ private:
     void checkWatermark();
     // Caller holds mutex_.
     void onWorkflowSettledLocked(bool tree_data_mutated, bool check_watermark);
+    bool hasPendingDeviceDemotionLocked(const CacheKeysType& cache_keys) const;
 
     BlockTreeCacheConfig                           config_;
     std::unique_ptr<BlockTree>                     tree_;
@@ -190,6 +195,7 @@ private:
     std::unique_ptr<BlockTreeTaskPool>             task_pool_;
     std::shared_ptr<BlockTreeCacheMetricsReporter> metrics_reporter_;
     mutable std::mutex                             mutex_;
+    std::condition_variable                        demotion_settled_;
     BlockTreeEvictor                               evictor_;
     bool                                           initialized_{false};
     // Preserve the historical empty-cache wire value. The first successful

@@ -6,6 +6,7 @@
 #include <future>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -41,6 +42,31 @@ public:
 
 private:
     bool old_;
+};
+
+class ScopedEnvVar {
+public:
+    ScopedEnvVar(const char* name, const char* value): name_(name) {
+        if (const char* old = std::getenv(name)) {
+            old_ = old;
+        }
+        if (value) {
+            setenv(name, value, 1);
+        } else {
+            unsetenv(name);
+        }
+    }
+    ~ScopedEnvVar() {
+        if (old_) {
+            setenv(name_.c_str(), old_->c_str(), 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+private:
+    std::string                name_;
+    std::optional<std::string> old_;
 };
 
 CacheConfig makeSingleConfig() {
@@ -2117,6 +2143,90 @@ TEST_F(BlockTreeCacheFactoryTest, TierWatermarksPropagateAndInvalidCombinationsA
         invalid_config.block_tree_device_evict_high_watermark_ratio = high_ratio;
         expectFactoryRejects(config, invalid_allocator, invalid_config);
     }
+}
+
+TEST_F(BlockTreeCacheFactoryTest, DemotionLookupWaitIsExplicitAndDsv4PpuPrefillOnly) {
+    ScopedEnvVar                   role("ROLE_TYPE", "PREFILL");
+    ScopedEnvVar                   reuse("DSV4_PPU_PREFIX_REUSE", "1");
+    ScopedEnvVar                   host_reuse("DSV4_PPU_HOST_PREFIX_REUSE", "1");
+    ScopedEnvVar                   wait("DSV4_PPU_DEMOTION_LOOKUP_WAIT_MS", "50");
+    const std::vector<std::string> tags{
+        "swa_kv", "csa_kv", "indexer_kv", "indexer_state", "csa_state", "hca_kv", "hca_state"};
+    auto        spec = test::makeResolvedMhaSpec(DataType::TYPE_FP16, 1, 8, 4);
+    CacheConfig config;
+    config.dtype                     = DataType::TYPE_FP16;
+    config.layer_num                 = 1;
+    config.seq_size_per_block        = 4;
+    config.use_opaque_kv_cache_store = true;
+    config.fromGroupedSpecs(std::vector<KVCacheSpecPtr>(tags.size(), spec),
+                            std::vector<std::vector<int>>(tags.size(), {0}),
+                            std::vector<CacheGroupType>(tags.size(), CacheGroupType::FULL),
+                            tags);
+    config.setGroupBlockLayout(tags,
+                               std::vector<uint32_t>(tags.size(), 8),
+                               std::vector<size_t>(tags.size(), spec->block_size_bytes()),
+                               std::vector<size_t>(tags.size(), 0));
+    KVCacheConfig kv;
+    kv.enable_device_cache  = true;
+    kv.enable_memory_cache  = true;
+    kv.memory_cache_size_mb = 1;
+    const auto expect_wait  = [&](const CacheConfig& cfg, const KVCacheConfig& settings, int expected) {
+        auto allocator = initAllocator<CoordinatorCacheManager>(cfg);
+        auto cache     = createBlockTreeCache(cfg, settings, allocator);
+        ASSERT_NE(cache, nullptr);
+        EXPECT_EQ(cache->config().demotion_lookup_wait_ms, expected);
+    };
+#ifdef USE_PPU
+    expect_wait(config, kv, 50);
+    for (const int value : {0, 1000}) {
+        const auto   text = std::to_string(value);
+        ScopedEnvVar boundary("DSV4_PPU_DEMOTION_LOOKUP_WAIT_MS", text.c_str());
+        expect_wait(config, kv, value);
+    }
+    for (const char* value : {"-1", "1001", "50ms", "", "99999999999999999999"}) {
+        ScopedEnvVar invalid("DSV4_PPU_DEMOTION_LOOKUP_WAIT_MS", value);
+        expectFactoryRejects(config, initAllocator<CoordinatorCacheManager>(config), kv);
+    }
+#else
+    expect_wait(config, kv, 0);
+    ScopedEnvVar ignored_invalid("DSV4_PPU_DEMOTION_LOOKUP_WAIT_MS", "invalid");
+    expect_wait(config, kv, 0);
+#endif
+    {
+        ScopedEnvVar disabled("DSV4_PPU_DEMOTION_LOOKUP_WAIT_MS", nullptr);
+        expect_wait(config, kv, 0);
+    }
+    {
+        ScopedEnvVar decode("ROLE_TYPE", "DECODE");
+        expect_wait(config, kv, 0);
+    }
+    {
+        ScopedEnvVar disabled("DSV4_PPU_HOST_PREFIX_REUSE", "0");
+        expect_wait(config, kv, 0);
+    }
+    {
+        ScopedEnvVar disabled("DSV4_PPU_PREFIX_REUSE", "0");
+        expect_wait(config, kv, 0);
+    }
+    {
+        auto device_off                = kv;
+        device_off.enable_device_cache = false;
+        expect_wait(config, device_off, 0);
+    }
+    {
+        auto host_off                = kv;
+        host_off.enable_memory_cache = false;
+        expect_wait(config, host_off, 0);
+    }
+    {
+        auto non_opaque                      = config;
+        non_opaque.use_opaque_kv_cache_store = false;
+        expect_wait(non_opaque, kv, 0);
+    }
+    expect_wait(makeSingleConfig(), kv, 0);
+    auto other_opaque                      = makeSingleConfig();
+    other_opaque.use_opaque_kv_cache_store = true;
+    expect_wait(other_opaque, kv, 0);
 }
 
 TEST_F(BlockTreeCacheFactoryTest, FullPrefixScanConfigPropagatesAndValidates) {

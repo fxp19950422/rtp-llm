@@ -879,6 +879,7 @@ std::unique_ptr<FullSWAEnvironment> FullSWAEnvironment::create(const FullSWAEnvi
     config.enable_device_cache = true;
     config.enable_host_cache   = true;
     config.enable_disk_cache   = options.enable_disk;
+    config.demotion_lookup_wait_ms = options.demotion_lookup_wait_ms;
 
     environment->scripted_per_rank_transfer_engine =
         std::make_shared<ScriptedPerRankBlockTransferEngine>(environment->groups, true, options.enable_disk);

@@ -1,6 +1,7 @@
 #include "rtp_llm/cpp/cache/block_tree_cache/BlockTreeCache.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <utility>
 
@@ -81,7 +82,7 @@ bool BlockTreeCache::init() {
     }
     RTP_LLM_LOG_INFO("initialized with %zu group sets, %zu reusable topology groups, "
                      "pool_threads=%d, storage_backend=%s, "
-                     "device=%s, host=%s, disk=%s, remote=%s",
+                     "device=%s, host=%s, disk=%s, remote=%s, demotion_lookup_wait_ms=%d",
                      tree_->groupSets().size(),
                      tree_->reusableGroupCount(),
                      config_.task_pool_size,
@@ -89,7 +90,8 @@ bool BlockTreeCache::init() {
                      config_.enable_device_cache ? "on" : "off",
                      config_.enable_host_cache ? "on" : "off",
                      config_.enable_disk_cache ? "on" : "off",
-                     config_.enable_remote_cache ? "on" : "off");
+                     config_.enable_remote_cache ? "on" : "off",
+                     config_.demotion_lookup_wait_ms);
     for (const GroupSetPtr& group_set : tree_->groupSets()) {
         RTP_LLM_LOG_INFO("  group_set[%zu] type=%s host_pool=%s disk_pool=%s",
                          group_set->groupSetId(),
@@ -148,7 +150,21 @@ bool BlockTreeCache::executeTransfer(TransferTask task) {
 BlockTreeMatchResult BlockTreeCache::match(const CacheKeysType& cache_keys) {
     BlockTreeMatchResult result;
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (config_.demotion_lookup_wait_ms > 0 && hasPendingDeviceDemotionLocked(cache_keys)) {
+            const auto started = std::chrono::steady_clock::now();
+            // No match references/tickets exist yet. Release the tree lock so
+            // settlement can publish HOST or restore DEVICE before rematching.
+            const bool settled =
+                demotion_settled_.wait_for(lock,
+                                           std::chrono::milliseconds(config_.demotion_lookup_wait_ms),
+                                           [this, &cache_keys] { return !hasPendingDeviceDemotionLocked(cache_keys); });
+            const auto waited_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started)
+                    .count();
+            RTP_LLM_LOG_INFO(
+                "demotion lookup rematch waited_us=%ld settled=%d", static_cast<int64_t>(waited_us), settled);
+        }
         result = loader_.matchLocked(cache_keys);
     }
     static const bool trace_host_store = [] {
@@ -314,6 +330,22 @@ bool BlockTreeCache::abortPendingLoad(const std::shared_ptr<AsyncContext>& conte
     return loader_.abortPendingLoad(context);
 }
 
+bool BlockTreeCache::hasPendingDeviceDemotionLocked(const CacheKeysType& cache_keys) const {
+    const auto path = tree_->findNode(cache_keys);
+    for (size_t group_id = 0; group_id < tree_->groupSets().size(); ++group_id) {
+        const size_t reuse_count =
+            std::min(tree_->groupSets()[group_id]->computeReuseBlockCount(path.size()), path.size());
+        for (size_t i = path.size() - reuse_count; i < path.size(); ++i) {
+            const auto& resource = path[i]->group_set_resources[group_id];
+            if (resource.transfer_state == GroupSetTransferState::DEMOTING && !resource.transfer_detached
+                && resource.hasCompleteDeviceValue()) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 void BlockTreeCache::onWorkflowSettledLocked(bool tree_data_mutated, bool check_watermark) {
     if (tree_data_mutated) {
         ++mutation_version_;
@@ -321,6 +353,7 @@ void BlockTreeCache::onWorkflowSettledLocked(bool tree_data_mutated, bool check_
     if (check_watermark) {
         checkWatermark();
     }
+    demotion_settled_.notify_all();
 }
 
 void BlockTreeCache::checkWatermark() {

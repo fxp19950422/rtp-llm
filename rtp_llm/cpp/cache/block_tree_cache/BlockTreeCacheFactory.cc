@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <limits>
 #include <optional>
@@ -31,6 +34,40 @@ namespace rtp_llm {
 namespace {
 
 constexpr size_t kPoolAlignment = 4096;
+
+std::optional<int> dsv4PpuDemotionLookupWaitMs(const CacheConfig& cache_config, const BlockTreeCacheConfig& config) {
+#ifdef USE_PPU
+    const auto enabled = [](const char* name) {
+        const char* value = std::getenv(name);
+        return value != nullptr && std::strcmp(value, "1") == 0;
+    };
+    const char* role = std::getenv("ROLE_TYPE");
+    if (!cache_config.use_opaque_kv_cache_store || !config.enable_device_cache || !config.enable_host_cache
+        || role == nullptr || std::strcmp(role, "PREFILL") != 0 || !enabled("DSV4_PPU_PREFIX_REUSE")
+        || !enabled("DSV4_PPU_HOST_PREFIX_REUSE")) {
+        return 0;
+    }
+    const std::unordered_set<std::string> expected_tags{
+        "swa_kv", "csa_kv", "indexer_kv", "indexer_state", "csa_state", "hca_kv", "hca_state"};
+    const auto& tags = cache_config.topology().groupTags();
+    if (std::unordered_set<std::string>(tags.begin(), tags.end()) != expected_tags) {
+        return 0;
+    }
+    const char* value = std::getenv("DSV4_PPU_DEMOTION_LOOKUP_WAIT_MS");
+    if (value == nullptr) {
+        return 0;
+    }
+    int        wait_ms = 0;
+    const auto parsed  = std::from_chars(value, value + std::strlen(value), wait_ms);
+    if (parsed.ec != std::errc{} || parsed.ptr != value + std::strlen(value) || wait_ms < 0 || wait_ms > 1000) {
+        RTP_LLM_LOG_ERROR("DSV4_PPU_DEMOTION_LOOKUP_WAIT_MS must be an integer in [0,1000]");
+        return std::nullopt;
+    }
+    return wait_ms;
+#else
+    return 0;
+#endif
+}
 
 std::optional<EvictionPolicy> parseEvictionPolicy(const std::string& value) {
     std::string normalized = value;
@@ -543,6 +580,11 @@ BlockTreeCachePtr createBlockTreeCache(const CacheConfig&                       
     config.enable_host_cache   = host_enabled;
     config.enable_disk_cache   = disk_enabled;
     config.enable_remote_cache = kv_cache_config.enable_remote_cache && storage_backend != nullptr;
+    const auto demotion_lookup_wait_ms = dsv4PpuDemotionLookupWaitMs(cache_config, config);
+    if (!demotion_lookup_wait_ms.has_value()) {
+        return nullptr;
+    }
+    config.demotion_lookup_wait_ms = *demotion_lookup_wait_ms;
     if (!config.enable_remote_cache) {
         storage_backend = nullptr;
     }

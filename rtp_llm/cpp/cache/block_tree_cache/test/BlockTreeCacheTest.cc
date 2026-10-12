@@ -737,7 +737,9 @@ TEST_F(BlockTreeCacheTest, MatchSkipsBusySwaResourceWithoutTruncatingFullPrefix)
             nullptr,
             nullptr);
         std::vector<GroupSetPtr>        groups      = {full_group, swa_group};
-        std::unique_ptr<BlockTreeCache> multi_cache = makeBlockTreeCacheForTest(std::move(groups));
+        BlockTreeCacheConfig            config;
+        config.demotion_lookup_wait_ms              = 1000;
+        std::unique_ptr<BlockTreeCache> multi_cache = makeBlockTreeCacheForTest(std::move(groups), config);
         ASSERT_NE(multi_cache, nullptr);
 
         std::vector<std::vector<GroupSetResource>> resources(4, std::vector<GroupSetResource>(2));
@@ -750,7 +752,9 @@ TEST_F(BlockTreeCacheTest, MatchSkipsBusySwaResourceWithoutTruncatingFullPrefix)
         TreeNode* busy_node = multi_cache->tree()->root()->children.at(100)->children.at(200);
         busy_node->group_set_resources[1].transfer_state = state;
 
+        const auto           started = std::chrono::steady_clock::now();
         BlockTreeMatchResult result = multi_cache->match({100, 200, 300, 400});
+        EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::milliseconds(500));
         EXPECT_EQ(result.matched_device_blocks, 4u);
         EXPECT_EQ(multi_cache->matchedBlocksForGroup("group0", result.matched_device_resources),
                   (BlockIndicesType{10, 11, 12, 13}));
