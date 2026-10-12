@@ -153,19 +153,31 @@ BlockTreeMatchResult BlockTreeCache::match(const CacheKeysType& cache_keys) {
         std::unique_lock<std::mutex> lock(mutex_);
         if (config_.demotion_lookup_wait_ms > 0 && hasPendingDeviceDemotionLocked(cache_keys)) {
             const auto started = std::chrono::steady_clock::now();
-            // No match references/tickets exist yet. Release the tree lock so
-            // settlement can publish HOST or restore DEVICE before rematching.
-            const bool settled =
-                demotion_settled_.wait_for(lock,
-                                           std::chrono::milliseconds(config_.demotion_lookup_wait_ms),
-                                           [this, &cache_keys] { return !hasPendingDeviceDemotionLocked(cache_keys); });
-            const auto waited_us =
-                std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started)
-                    .count();
-            RTP_LLM_LOG_INFO(
-                "demotion lookup rematch waited_us=%ld settled=%d", static_cast<int64_t>(waited_us), settled);
+            if (demotion_lookup_waiters_ == 0) {
+                demotion_lookup_deadline_ = started + std::chrono::milliseconds(config_.demotion_lookup_wait_ms);
+            }
+            ++demotion_lookup_waiters_;
+            try {
+                // Release the tree lock for in-flight settlement, but defer new
+                // watermark victims until rematch pins its sources. Concurrent
+                // waiters share one deadline so they cannot extend the pause.
+                const bool settled = demotion_settled_.wait_until(lock, demotion_lookup_deadline_, [this, &cache_keys] {
+                    return !hasPendingDeviceDemotionLocked(cache_keys);
+                });
+                const auto waited_us =
+                    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started)
+                        .count();
+                RTP_LLM_LOG_INFO(
+                    "demotion lookup rematch waited_us=%ld settled=%d", static_cast<int64_t>(waited_us), settled);
+                result = loader_.matchLocked(cache_keys);
+            } catch (...) {
+                finishDemotionLookupLocked();
+                throw;
+            }
+            finishDemotionLookupLocked();
+        } else {
+            result = loader_.matchLocked(cache_keys);
         }
-        result = loader_.matchLocked(cache_keys);
     }
     static const bool trace_host_store = [] {
         const char* value = std::getenv("DSV4_PPU_TRACE_HOST_STORE");
@@ -346,6 +358,15 @@ bool BlockTreeCache::hasPendingDeviceDemotionLocked(const CacheKeysType& cache_k
     return false;
 }
 
+void BlockTreeCache::finishDemotionLookupLocked() {
+    RTP_LLM_CHECK(demotion_lookup_waiters_ > 0);
+    --demotion_lookup_waiters_;
+    if (demotion_lookup_waiters_ == 0 && watermark_deferred_) {
+        watermark_deferred_ = false;
+        checkWatermark();
+    }
+}
+
 void BlockTreeCache::onWorkflowSettledLocked(bool tree_data_mutated, bool check_watermark) {
     if (tree_data_mutated) {
         ++mutation_version_;
@@ -357,6 +378,10 @@ void BlockTreeCache::onWorkflowSettledLocked(bool tree_data_mutated, bool check_
 }
 
 void BlockTreeCache::checkWatermark() {
+    if (demotion_lookup_waiters_ > 0 && std::chrono::steady_clock::now() < demotion_lookup_deadline_) {
+        watermark_deferred_ = true;
+        return;
+    }
     for (Tier tier : {Tier::DISK, Tier::HOST, Tier::DEVICE}) {
         const auto watermark = config_.watermarkForTier(tier);
         if (!config_.isTierEnabled(tier) || !watermark.enabled()) {

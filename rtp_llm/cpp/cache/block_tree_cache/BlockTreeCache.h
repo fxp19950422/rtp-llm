@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <chrono>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -187,6 +188,7 @@ private:
     // Caller holds mutex_.
     void onWorkflowSettledLocked(bool tree_data_mutated, bool check_watermark);
     bool hasPendingDeviceDemotionLocked(const CacheKeysType& cache_keys) const;
+    void finishDemotionLookupLocked();
 
     BlockTreeCacheConfig                           config_;
     std::unique_ptr<BlockTree>                     tree_;
@@ -196,6 +198,9 @@ private:
     std::shared_ptr<BlockTreeCacheMetricsReporter> metrics_reporter_;
     mutable std::mutex                             mutex_;
     std::condition_variable                        demotion_settled_;
+    size_t                                         demotion_lookup_waiters_{0};
+    std::chrono::steady_clock::time_point          demotion_lookup_deadline_;
+    bool                                           watermark_deferred_{false};
     BlockTreeEvictor                               evictor_;
     bool                                           initialized_{false};
     // Preserve the historical empty-cache wire value. The first successful

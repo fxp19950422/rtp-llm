@@ -63,7 +63,7 @@ TEST(BlockTreeCacheDemotionLookupTest, RematchesAfterCopySettlementAndRollback) 
     for (const auto action : {TransferCopyAction::Succeed, TransferCopyAction::Fail, TransferCopyAction::Throw}) {
         SCOPED_TRACE(transferCopyActionName(action));
         FullSWAEnvironmentOptions options;
-        options.path_length             = 1;
+        options.path_length             = 4;
         options.enable_disk             = false;
         options.demotion_lookup_wait_ms = 1000;
         auto environment                = FullSWAEnvironment::create(options);
@@ -84,33 +84,77 @@ TEST(BlockTreeCacheDemotionLookupTest, RematchesAfterCopySettlementAndRollback) 
         });
         entered.get_future().wait();
         EXPECT_EQ(match.wait_for(std::chrono::milliseconds(30)), std::future_status::timeout);
+        BlockTreeCacheTestPeer::setTierWatermarkForTest(*environment->cache, Tier::DEVICE, 0.01);
+        BlockTreeCacheTestPeer::runMaintenanceForTest(*environment->cache);
+        EXPECT_EQ(engine->submittedBatchCount(), 1u);
         // Unrelated lookups must still acquire the tree lock while this one waits.
         EXPECT_EQ(environment->cache->match({999}).matched_device_blocks, 0u);
         barrier->release();
         auto result = match.get();
         BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*environment->cache);
+        EXPECT_GT(engine->submittedBatchCount(), 1u);
+        BlockTreeCacheTestPeer::setTierWatermarkForTest(*environment->cache, Tier::DEVICE, 0.0);
         if (action == TransferCopyAction::Succeed) {
             auto load_context = takeLoadContext(result);
             ASSERT_NE(load_context, nullptr);
-            EXPECT_EQ(load_context->matchedBlocks(), 1u);
+            EXPECT_EQ(load_context->matchedBlocks(), 4u);
             EXPECT_TRUE(std::any_of(load_context->loadDescs().begin(),
                                     load_context->loadDescs().end(),
                                     [](const auto& desc) { return desc.source_tier == Tier::HOST; }));
             // Abandoning the rematched load must release its HOST hold/ticket.
             load_context.reset();
         } else {
-            EXPECT_EQ(result.matched_device_blocks, 1u);
+            EXPECT_EQ(result.matched_device_blocks, 4u);
             EXPECT_EQ(result.async_context, nullptr);
             EXPECT_TRUE(environment->allResourcesAtTier(Tier::DEVICE));
         }
         environment->releaseMatch(result);
         EXPECT_EQ(BlockTreeCacheTestPeer::pendingEvictionReleasesForTest(*environment->cache), 0u);
-        for (const auto& resource : environment->resourcesForPathNode(0)) {
-            EXPECT_EQ(resource.transfer_state, GroupSetTransferState::IDLE);
+        for (size_t i = 0; i < options.path_length; ++i) {
+            for (const auto& resource : environment->resourcesForPathNode(i)) {
+                EXPECT_EQ(resource.transfer_state, GroupSetTransferState::IDLE);
+            }
         }
         environment->reclaimAll();
         environment->expectFullyReclaimed();
     }
+}
+
+TEST(BlockTreeCacheDemotionLookupTest, ConcurrentWaitersShareThePauseDeadline) {
+    if (!cudaAvailable()) {
+        GTEST_SKIP() << "CUDA not available";
+    }
+    FullSWAEnvironmentOptions options;
+    options.path_length             = 1;
+    options.enable_disk             = false;
+    options.demotion_lookup_wait_ms = 500;
+    auto environment                = FullSWAEnvironment::create(options);
+    ASSERT_NE(environment, nullptr);
+    auto barrier = std::make_shared<CallbackBarrier>();
+    auto engine  = std::make_shared<ControlledPerRankBlockTransferEngine>(
+        environment->groups, TransferCopyAction::Succeed, barrier);
+    BlockTreeCacheTestPeer::setPerRankBlockTransferEngineForTest(*environment->cache, engine);
+    environment->insertRequestPath();
+    environment->releaseRequestRefs();
+    [[maybe_unused]] auto release_guard = std::shared_ptr<void>(nullptr, [barrier](void*) { barrier->release(); });
+    ASSERT_TRUE(BlockTreeCacheTestPeer::demoteOneForGroupSetForTest(*environment->cache, 0, Tier::DEVICE));
+    ASSERT_TRUE(barrier->waitUntilEnteredFor(1, std::chrono::seconds(5)));
+    auto lookup = [&] { return environment->cache->match(environment->keys); };
+    auto first  = std::async(std::launch::async, lookup);
+    EXPECT_EQ(first.wait_for(std::chrono::milliseconds(200)), std::future_status::timeout);
+    auto second       = std::async(std::launch::async, lookup);
+    auto first_result = first.get();
+    EXPECT_EQ(second.wait_for(std::chrono::milliseconds(100)), std::future_status::ready);
+    auto second_result = second.get();
+    for (const auto* result : {&first_result, &second_result}) {
+        EXPECT_EQ(result->matched_device_blocks, 0u);
+        EXPECT_TRUE(result->matched_device_resources.empty());
+        EXPECT_EQ(result->async_context, nullptr);
+    }
+    barrier->release();
+    BlockTreeCacheTestPeer::waitForTaskPoolIdleForTest(*environment->cache);
+    environment->reclaimAll();
+    environment->expectFullyReclaimed();
 }
 
 TEST(BlockTreeCacheDemotionLookupTest, TimeoutAndDefaultOffDoNotPinBusySource) {
