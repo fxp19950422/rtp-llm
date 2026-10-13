@@ -382,6 +382,7 @@ py_test(
 test_suite(
     name = "ppu_prefix_reuse_regression_tests",
     tests = [
+        "//rtp_llm/cpp/disaggregate/cache_store/test:tcp_server_idle_test",
         ":ppu_tp_moe_fp32_reduce_test",
         "//rtp_llm/cpp/cache/block_tree_cache/test:block_tree_cache_factory_test",
         "//rtp_llm/cpp/cache/block_tree_cache/test:block_tree_cache_integration_test",

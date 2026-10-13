@@ -44,10 +44,22 @@ cc_library(
 )
 
 cc_test(
+    name = "tcp_server_idle_test",
+    srcs = ["TcpServerTest.cpp"],
+    copts = copts(),
+    deps = [
+        "//rtp_llm/cpp/disaggregate/cache_store",
+        "@com_google_googletest//:gtest_main",
+    ] + cuda13_torch_link_deps,
+    env = {"GPU_COUNT": "0"},
+    visibility = ["//visibility:public"],
+)
+
+cc_test(
     name = "cache_store_gtest",
     srcs = glob(
         ["*.cpp"],
-        exclude = test_base_sources,
+        exclude = test_base_sources + ["TcpServerTest.cpp"],
     ),
     deps = [
         ":cache_store_test_base",

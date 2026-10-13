@@ -2,6 +2,7 @@
 
 #include "aios/network/arpc/arpc/metric/KMonitorANetServerMetricReporter.h"
 #include "autil/LockFreeThreadPool.h"
+#include "autil/EnvUtil.h"
 
 #include "rtp_llm/cpp/utils/Logger.h"
 
@@ -52,12 +53,19 @@ bool TcpServer::init(uint32_t io_thread_count,
 }
 
 bool TcpServer::start(uint32_t listen_port) {
+    const int max_idle_time_ms = autil::EnvUtil::getEnv("CACHE_STORE_TCP_MAX_IDLE_TIME_MS", arpc::MAX_IDLE_TIME);
+    if (max_idle_time_ms <= 0) {
+        RTP_LLM_LOG_WARNING("cache store TCP max idle time must be positive, got %d", max_idle_time_ms);
+        return false;
+    }
     std::string listen_spec = "tcp:0.0.0.0:" + std::to_string(listen_port);
-    if (!rpc_server_->Listen(listen_spec)) {
+    // A pending load can wait for Prefill without any TCP traffic. Its control
+    // connection must survive that wait, independently of the RDMA data path.
+    if (!rpc_server_->Listen(listen_spec, 5000, max_idle_time_ms)) {
         RTP_LLM_LOG_WARNING("tcp server init failed, listen %s failed", listen_spec.c_str());
         return false;
     }
-    RTP_LLM_LOG_INFO("tcp server start success, listen %s", listen_spec.c_str());
+    RTP_LLM_LOG_INFO("tcp server start success, listen %s, max idle time %d ms", listen_spec.c_str(), max_idle_time_ms);
     return true;
 }
 
