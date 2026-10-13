@@ -47,6 +47,12 @@ cc_test(
     name = "tcp_server_idle_test",
     srcs = ["TcpServerTest.cpp"],
     copts = copts(),
+    # The cache-store dependency links the device runtime even though this
+    # transport-only test does not initialize or allocate an accelerator.
+    exec_properties = select({
+        "@//:using_ppu": {"gpu": "PPU-ZW810E"},
+        "//conditions:default": {"gpu": "L20_CU13"},
+    }),
     deps = [
         "//rtp_llm/cpp/disaggregate/cache_store",
         "@com_google_googletest//:gtest_main",
