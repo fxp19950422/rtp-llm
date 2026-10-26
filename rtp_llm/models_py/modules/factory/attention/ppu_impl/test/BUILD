@@ -20,6 +20,6 @@ py_test(
     }),
     visibility = ["//visibility:public"],
     deps = [
-        "//rtp_llm/models_py/modules:ppu_modules",
+        "//rtp_llm/models_py:ppu_modules",
     ] + [":torch"],
 )

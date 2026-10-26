@@ -15,7 +15,7 @@ py_test(
         "//conditions:default": ["@platforms//:incompatible"],
     }),
     deps = [
-        "//rtp_llm/models_py/modules:ppu_modules",
+        "//rtp_llm/models_py:ppu_modules",
     ] + [":torch"],
     visibility = ["//visibility:public"],
 )
