@@ -193,6 +193,8 @@ py_library(
     deps = [
         ":modules",
         "//rtp_llm:models",
+        "//rtp_llm:device",
+        "//rtp_llm:ops",
     ],
     data = ["//rtp_llm/libs:libth_transformer_config_so"],
     visibility = ["//visibility:public"],
