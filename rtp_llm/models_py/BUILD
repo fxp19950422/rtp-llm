@@ -190,7 +190,11 @@ py_library(
     # PPU registration hooks remain internal integration code. Keep this
     # public alias for PPU tests without creating a nested Bazel package.
     srcs = [],
-    deps = [":modules"],
+    deps = [
+        ":modules",
+        "//rtp_llm:device",
+        "//rtp_llm:ops",
+    ],
     visibility = ["//visibility:public"],
 )
 
