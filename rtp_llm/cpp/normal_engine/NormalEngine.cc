@@ -2,6 +2,7 @@
 #include "rtp_llm/cpp/engine_base/EngineBase.h"
 #include "rtp_llm/cpp/normal_engine/NormalExecutor.h"
 #include "rtp_llm/cpp/normal_engine/NormalEngine.h"
+#include "rtp_llm/cpp/normal_engine/DecodeBenchmarkGate.h"
 #include "rtp_llm/cpp/normal_engine/NormalGenerateStream.h"
 #include "rtp_llm/cpp/utils/StatusUtil.h"
 #include "rtp_llm/cpp/engine_base/schedulers/FIFOScheduler.h"
@@ -1094,6 +1095,26 @@ absl::Status NormalEngine::step() try {
         {
             RTP_LLM_PROFILE_SCOPE_DYNAMIC("engine.normal.schedule(reserve_step=%d)", reserve_step_);
             CHECK_AND_ASSIGN(streams, scheduler_->schedule());
+        }
+        if (pd_sep_config.role_type == RoleType::DECODE) {
+            static const int benchmark_batch = []() {
+                const char* value = std::getenv("DSV4_DECODE_BARRIER_BATCH");
+                return value ? std::atoi(value) : 0;
+            }();
+            if (benchmark_batch > 0) {
+                static DecodeBenchmarkGate gate(
+                    std::getenv("DSV4_DECODE_BARRIER_DIR") ? std::getenv("DSV4_DECODE_BARRIER_DIR") : "",
+                    benchmark_batch, parallelism_config.dp_rank, parallelism_config.dp_size);
+                if (gate.hold(streams.size())) {
+                    return absl::OkStatus();
+                }
+                static bool logged_release = false;
+                if (!logged_release) {
+                    RTP_LLM_LOG_WARNING("DSV4_DECODE_BARRIER_BATCH: RELEASE target=%d rank=%d local_ready=%zu [benchmark only]",
+                                        benchmark_batch, parallelism_config.dp_rank, streams.size());
+                    logged_release = true;
+                }
+            }
         }
         if (parallelism_config.dp_size > 1) {
             RTP_LLM_PROFILE_SCOPE("engine.normal.may_add_fake_stream_work");
