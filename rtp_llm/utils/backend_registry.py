@@ -31,6 +31,7 @@ a different implementation, which shows up as wrong numerics rather than a
 startup failure.
 """
 
+import importlib
 import logging
 import threading
 from typing import Any, Callable, Dict, List, Set, Tuple
