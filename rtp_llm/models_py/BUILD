@@ -201,7 +201,11 @@ py_library(
         "//rtp_llm/model_loader:loader",
         "//rtp_llm:pydantic",
     ],
-    data = ["//rtp_llm/libs:libth_transformer_config_so"],
+    data = [
+        "//:rtp_compute_ops",
+        "//:th_transformer",
+        "//rtp_llm/libs:libth_transformer_config_so",
+    ],
     visibility = ["//visibility:public"],
 )
 
