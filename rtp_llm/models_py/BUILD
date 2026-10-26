@@ -186,6 +186,15 @@ py_library(
 )
 
 py_library(
+    name = "ppu_modules",
+    # PPU registration hooks remain internal integration code. Keep this
+    # public alias for PPU tests without creating a nested Bazel package.
+    srcs = [],
+    deps = [":modules"],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
     name = "kernels",
     srcs = glob([
         "kernels/*.py",
