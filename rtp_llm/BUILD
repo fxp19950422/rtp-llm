@@ -510,6 +510,8 @@ py_library(
         ":config_ops",
         ":warmup",
         ":jit_cache_manager_lib",
+        # PPU backend entrypoint and registration hooks.
+        "//rtp_llm/models_py:ppu_modules",
     ],
     data = jit_deps(),
     imports = ["."],

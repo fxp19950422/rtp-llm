@@ -189,7 +189,12 @@ py_library(
     name = "ppu_modules",
     # Keep the public PPU test closure aligned with the internal ppu_modules
     # target: the factory imports the shared model runtime during collection.
-    srcs = [],
+    srcs = [
+        "__init__.py",
+        "modules/factory/attention/register.py",
+        "modules/factory/fused_moe/register.py",
+        "modules/factory/linear/register.py",
+    ],
     deps = [
         ":modules",
         "//rtp_llm:models",
@@ -200,6 +205,7 @@ py_library(
         "//rtp_llm:transformers",
         "//rtp_llm/model_loader:loader",
         "//rtp_llm:pydantic",
+        "//rtp_llm:utils",
     ],
     data = [
         "//:rtp_compute_ops",
