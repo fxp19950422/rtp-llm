@@ -192,6 +192,7 @@ py_library(
     srcs = [],
     deps = [
         ":modules",
+        "//rtp_llm:config",
         "//rtp_llm:device",
         "//rtp_llm:ops",
     ],
