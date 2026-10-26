@@ -165,6 +165,7 @@ py_library(
         "utils/test/*.py",
         "utils/test/**/*.py",
     ]),
+    data = glob(["utils/moe_luts/*"]),
     deps = [
         ":jit_cache_env",
         ":torch",
