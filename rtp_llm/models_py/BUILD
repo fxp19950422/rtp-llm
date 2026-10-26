@@ -222,8 +222,8 @@ py_library(
     srcs = glob(["kernels/ppu/**/*.py"]),
     data = glob(["kernels/ppu/**/*.json"]),
     deps = [
-        ":torch",
-        ":triton",
+        "//rtp_llm:torch",
+        "//rtp_llm:triton",
     ],
     visibility = ["//visibility:public"],
 )
