@@ -187,18 +187,12 @@ py_library(
 
 py_library(
     name = "ppu_modules",
-    # PPU registration hooks remain internal integration code. Keep this
-    # public alias for PPU tests without creating a nested Bazel package.
+    # Keep the public PPU test closure aligned with the internal ppu_modules
+    # target: the factory imports the shared model runtime during collection.
     srcs = [],
     deps = [
         ":modules",
-        "//rtp_llm:config",
-        "//rtp_llm:device",
-        "//rtp_llm:ops",
-        "//rtp_llm:lora",
-        "//rtp_llm:transformers",
-        "//rtp_llm/model_loader:loader",
-        "//rtp_llm:pydantic",
+        "//rtp_llm:models",
     ],
     data = ["//rtp_llm/libs:libth_transformer_config_so"],
     visibility = ["//visibility:public"],
