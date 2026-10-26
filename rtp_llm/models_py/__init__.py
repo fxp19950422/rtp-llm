@@ -7,6 +7,8 @@ backend hooks before the factories consume those slots.
 import logging
 import os
 import sys
+import importlib.util
+from pathlib import Path
 
 _jit = os.environ.get("_JIT_CACHE_PATHS", "")
 if _jit:
@@ -18,9 +20,27 @@ try:
     from rtp_llm.device.device_type import DeviceType, get_device_type
 
     if get_device_type() == DeviceType.Ppu:
-        from rtp_llm.models_py.modules.factory.attention import register as attn_register
-        from rtp_llm.models_py.modules.factory.fused_moe import register as moe_register
-        from rtp_llm.models_py.modules.factory.linear import register as linear_register
+        # Loading through the factory packages executes their __init__.py files,
+        # which initializes the slots before these hooks can be recorded. Load
+        # the three lightweight registration modules directly instead.
+        _register_root = Path(__file__).parent / "modules" / "factory"
+
+        def _load_register(name: str, package: str):
+            module_name = f"rtp_llm._ppu_{name}_register"
+            module = sys.modules.get(module_name)
+            if module is None:
+                path = _register_root / package / "register.py"
+                spec = importlib.util.spec_from_file_location(module_name, path)
+                if spec is None or spec.loader is None:
+                    raise ImportError(f"cannot load PPU register module: {path}")
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+            return module
+
+        attn_register = _load_register("attention", "attention")
+        moe_register = _load_register("fused_moe", "fused_moe")
+        linear_register = _load_register("linear", "linear")
 
         attn_register.install()
         moe_register.install()
