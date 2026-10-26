@@ -15,7 +15,7 @@ py_test(
         "//conditions:default": ["@platforms//:incompatible"],
     }),
     deps = [
-        "//rtp_llm/models_py/kernels:internal_kernels",
+        "//rtp_llm/models_py:internal_kernels",
     ] + [":torch"],
     visibility = ["//visibility:public"],
 )
@@ -32,7 +32,7 @@ py_test(
         "//:using_ppu": [],
         "//conditions:default": ["@platforms//:incompatible"],
     }),
-    deps = ["//rtp_llm/models_py/kernels:internal_kernels"],
+    deps = ["//rtp_llm/models_py:internal_kernels"],
     visibility = ["//visibility:public"],
 )
 
@@ -53,7 +53,7 @@ py_test(
         "//conditions:default": ["@platforms//:incompatible"],
     }),
     deps = [
-        "//rtp_llm/models_py/kernels:internal_kernels",
+        "//rtp_llm/models_py:internal_kernels",
         ":deep_gemm",
         ":numpy",
         ":torch",

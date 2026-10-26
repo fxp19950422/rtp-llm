@@ -218,6 +218,17 @@ py_library(
 )
 
 py_library(
+    name = "internal_kernels",
+    srcs = glob(["kernels/ppu/**/*.py"]),
+    data = glob(["kernels/ppu/**/*.json"]),
+    deps = [
+        ":torch",
+        ":triton",
+    ],
+    visibility = ["//visibility:public"],
+)
+
+py_library(
     name = "configs",
     srcs = glob([
         "configs/*.py",
