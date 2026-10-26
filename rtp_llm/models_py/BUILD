@@ -196,6 +196,7 @@ py_library(
         "//rtp_llm:device",
         "//rtp_llm:ops",
         "//rtp_llm/model_loader:loader",
+        "//rtp_llm:pydantic",
     ],
     visibility = ["//visibility:public"],
 )
