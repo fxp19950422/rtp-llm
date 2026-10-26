@@ -346,4 +346,3 @@ def ppu_suites():
             ),
         ],
     )
-
