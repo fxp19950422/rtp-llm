@@ -1,4 +1,19 @@
 import importlib
+import logging
+
+
+def _load_ppu_backend_entrypoint() -> None:
+    """Register public PPU backends before any factory slot is initialized."""
+    try:
+        from rtp_llm.device.device_type import DeviceType, get_device_type
+
+        if get_device_type() == DeviceType.Ppu:
+            importlib.import_module("rtp_llm.models_py")
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("[ppu] early backend entrypoint load failed: %s", exc, exc_info=True)
+
+
+_load_ppu_backend_entrypoint()
 from typing import Any
 
 
@@ -22,3 +37,4 @@ def __getattr__(name: str) -> Any:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}") from e
     globals()[name] = value
     return value
+
