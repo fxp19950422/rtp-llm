@@ -10,27 +10,27 @@ def ppu_suites():
         tests = [
             smoke_test(
                 name="streaming_ppu",
-                task_info="data/model/qwen25/q_r_s_fp16.json",
+                task_info="data/model/qwen25/q_r_s_fp16_ppu.json",
                 smoke_args="--act_type FP16 --warm_up 0",
                 gpu_type=["PPU-ZW810E"],
             ),
             smoke_test(
                 name="worker_status_reuse",
-                task_info="data/model/qwen25/worker_status_reuse_cache.json",
+                task_info="data/model/qwen25/worker_status_reuse_cache_ppu.json",
                 smoke_args="--reuse_cache 1 --seq_size_per_block 8 --act_type FP16 --warm_up 0",
                 gpu_type=["PPU-ZW810E"],
 
             ),
             smoke_test(
                 name="cache_status",
-                task_info="data/model/qwen25/cache_status.json",
+                task_info="data/model/qwen25/cache_status_ppu.json",
                 # use scratch to avoid fastsafetensors pread failure on PPU NAS (errno 103 on 2GB blocks)
                 smoke_args="--warm_up 0 --max_seq_len 16384 --ft_disable_custom_ar 1 --sp_type eagle --gen_num_per_cycle 4 --seq_size_per_block 256 --act_type FP16 --sp_model_type qwen_2-mtp --sp_checkpoint_path /mnt/nas1/mtp_reg/qwen2_14b_draft/ --tp_size 1 --load_method scratch",
                 gpu_type=["PPU-ZW810E"],
             ),
             smoke_test(
                 name="calculate_loss_ppu",
-                task_info="data/model/qwen25/q_r_s_loss.json",
+                task_info="data/model/qwen25/q_r_s_loss_ppu.json",
                 smoke_args="--act_type FP16 --warm_up 0",
                 gpu_type=["PPU-ZW810E"],
             ),
@@ -52,14 +52,14 @@ def ppu_suites():
             ),
             smoke_test(
                 name="multi_task_ppu",
-                task_info="data/model/qwen25/q_r_mt.json",
+                task_info="data/model/qwen25/q_r_mt_ppu.json",
                 smoke_args="--warm_up 0 --seq_size_per_block 8 --multi_task_prompt rtp_llm/test/smoke/data/model/qwen25/multitask.json --act_type FP16",
                 gpu_type=["PPU-ZW810E"],
 
             ),
             smoke_test(
                 name="multi_task_tp2_ppu",
-                task_info="data/model/qwen25/q_r_mt.json",
+                task_info="data/model/qwen25/q_r_mt_ppu.json",
                 smoke_args="--warm_up 0 --seq_size_per_block 8 --multi_task_prompt rtp_llm/test/smoke/data/model/qwen25/multitask.json --act_type FP16 --tp_size 2",
                 gpu_type=["PPU-ZW810E"],
 
@@ -68,7 +68,7 @@ def ppu_suites():
                 name="cache_edge_case",
                 smoke_args="--reuse_cache 1 --act_type FP16 --enable_device_cache 1 --seq_size_per_block 4 --warm_up 0",
                 gpu_type=["PPU-ZW810E"],
-                task_info="data/model/qwen25/q_r_l20_cache_edge_case_1.json",
+                task_info="data/model/qwen25/q_r_l20_cache_edge_case_1_ppu.json",
 
             ),
         ],

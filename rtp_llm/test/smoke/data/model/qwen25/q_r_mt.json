@@ -1,10 +1,7 @@
-// Test: qwen25/q_r_mt.json
-// Description: multi-turn
-// Model: qwen_2 @ /mnt/nas1/hf/Qwen2.5-0.5B-Instruct
 {
-    "tokenizer_path": "/mnt/nas1/hf/Qwen2.5-0.5B-Instruct",
     "model_type": "qwen_2",
     "model_path": "/mnt/nas1/hf/Qwen2.5-0.5B-Instruct",
+    "tokenizer_path": "/mnt/nas1/hf/Qwen2.5-0.5B-Instruct",
     "query_result": [
         {
             "query": {
@@ -17,40 +14,21 @@
                     "return_cum_log_probs": true
                 },
                 "yield_generator": true,
-                "_prompt_source": "candidates/s1[:8] (3 tokens)"
+                "_prompt_source": "$prompt:s1[:8] (3 tokens)"
             },
             "result": {
-                "response": " the difference between them?\n\nDjango North is a",
-                "response_alternatives": null,
-                "hidden_states": null,
-                "logits": null,
-                "loss": null,
-                "input_ids": null,
-                "output_ids": null,
+                "response": "1. Mathematics is like a lighthouse in the",
+                "iter_count": 10,
+                "finished": true,
                 "aux_info": {
                     "input_len": 3,
-                    "prefix_len": 13,
                     "reuse_len": 8,
-                    "local_reuse_len": 8,
-                    "remote_reuse_len": 0,
-                    "memory_reuse_len": 0,
-                    "prefill_total_reuse_len": null,
-                    "prefill_local_reuse_len": null,
-                    "prefill_remote_reuse_len": 0,
-                    "prefill_memory_reuse_len": 0,
-                    "decode_total_reuse_len": null,
-                    "decode_local_reuse_len": null,
-                    "decode_remote_reuse_len": 0,
-                    "decode_memory_reuse_len": 0,
-                    "output_len": 10,
-                    "step_output_len": 1,
+                    "prefix_len": 11,
                     "iter_count": 10,
+                    "output_len": 10,
                     "cum_log_probs": [
                         0.0
-                    ],
-                    "beam_responses": [],
-                    "pd_sep": false,
-                    "softmax_probs": []
+                    ]
                 }
             }
         },
@@ -63,38 +41,18 @@
                     "task_id": 1
                 },
                 "yield_generator": true,
-                "_prompt_source": "candidates/s1[:8] (3 tokens)"
+                "_prompt_source": "$prompt:s1[:8] (3 tokens)"
             },
             "result": {
-                "response": " the difference between them?\n\nDjango North is a",
-                "response_alternatives": null,
-                "hidden_states": null,
-                "logits": null,
-                "loss": null,
-                "input_ids": null,
-                "output_ids": null,
+                "response": "1. Mathematics is like a lighthouse in the",
+                "iter_count": 10,
+                "finished": true,
                 "aux_info": {
                     "input_len": 3,
-                    "prefix_len": 13,
                     "reuse_len": 8,
-                    "local_reuse_len": 8,
-                    "remote_reuse_len": 0,
-                    "memory_reuse_len": 0,
-                    "prefill_total_reuse_len": null,
-                    "prefill_local_reuse_len": null,
-                    "prefill_remote_reuse_len": 0,
-                    "prefill_memory_reuse_len": 0,
-                    "decode_total_reuse_len": null,
-                    "decode_local_reuse_len": null,
-                    "decode_remote_reuse_len": 0,
-                    "decode_memory_reuse_len": 0,
-                    "output_len": 10,
-                    "step_output_len": 1,
+                    "prefix_len": 11,
                     "iter_count": 10,
-                    "cum_log_probs": [],
-                    "beam_responses": [],
-                    "pd_sep": false,
-                    "softmax_probs": []
+                    "output_len": 10
                 }
             }
         },
@@ -108,38 +66,18 @@
                     "task_id": "1"
                 },
                 "yield_generator": true,
-                "_prompt_source": "candidates/s1[:8] (3 tokens)"
+                "_prompt_source": "$prompt:s1[:8] (3 tokens)"
             },
             "result": {
-                "response": " the difference between them?\n\nDjango North is a",
-                "response_alternatives": null,
-                "hidden_states": null,
-                "logits": null,
-                "loss": null,
-                "input_ids": null,
-                "output_ids": null,
+                "response": "1. Mathematics is like a lighthouse in the",
+                "iter_count": 10,
+                "finished": true,
                 "aux_info": {
                     "input_len": 3,
-                    "prefix_len": 13,
                     "reuse_len": 8,
-                    "local_reuse_len": 8,
-                    "remote_reuse_len": 0,
-                    "memory_reuse_len": 0,
-                    "prefill_total_reuse_len": null,
-                    "prefill_local_reuse_len": null,
-                    "prefill_remote_reuse_len": 0,
-                    "prefill_memory_reuse_len": 0,
-                    "decode_total_reuse_len": null,
-                    "decode_local_reuse_len": null,
-                    "decode_remote_reuse_len": 0,
-                    "decode_memory_reuse_len": 0,
-                    "output_len": 10,
-                    "step_output_len": 1,
+                    "prefix_len": 11,
                     "iter_count": 10,
-                    "cum_log_probs": [],
-                    "beam_responses": [],
-                    "pd_sep": false,
-                    "softmax_probs": []
+                    "output_len": 10
                 }
             }
         },
@@ -152,38 +90,18 @@
                     "top_p": 0
                 },
                 "yield_generator": true,
-                "_prompt_source": "candidates/s1[:8] (3 tokens)"
+                "_prompt_source": "$prompt:s1[:8] (3 tokens)"
             },
             "result": {
-                "response": "1000000000",
-                "response_alternatives": null,
-                "hidden_states": null,
-                "logits": null,
-                "loss": null,
-                "input_ids": null,
-                "output_ids": null,
+                "response": "100\n\nExplanation: The number 1",
+                "iter_count": 10,
+                "finished": true,
                 "aux_info": {
                     "input_len": 3,
                     "prefix_len": 0,
                     "reuse_len": 0,
-                    "local_reuse_len": 0,
-                    "remote_reuse_len": 0,
-                    "memory_reuse_len": 0,
-                    "prefill_total_reuse_len": null,
-                    "prefill_local_reuse_len": null,
-                    "prefill_remote_reuse_len": 0,
-                    "prefill_memory_reuse_len": 0,
-                    "decode_total_reuse_len": null,
-                    "decode_local_reuse_len": null,
-                    "decode_remote_reuse_len": 0,
-                    "decode_memory_reuse_len": 0,
                     "output_len": 10,
-                    "step_output_len": 1,
-                    "iter_count": 10,
-                    "cum_log_probs": [],
-                    "beam_responses": [],
-                    "pd_sep": false,
-                    "softmax_probs": []
+                    "iter_count": 10
                 }
             }
         },
@@ -200,34 +118,14 @@
             },
             "result": {
                 "response": " Flask is a lightweight web framework for Python, and",
-                "response_alternatives": null,
-                "hidden_states": null,
-                "logits": null,
-                "loss": null,
-                "input_ids": null,
-                "output_ids": null,
+                "iter_count": 10,
+                "finished": true,
                 "aux_info": {
                     "input_len": 13,
+                    "reuse_len": 0,
                     "prefix_len": 0,
-                    "reuse_len": 8,
-                    "local_reuse_len": 8,
-                    "remote_reuse_len": 0,
-                    "memory_reuse_len": 0,
-                    "prefill_total_reuse_len": null,
-                    "prefill_local_reuse_len": null,
-                    "prefill_remote_reuse_len": 0,
-                    "prefill_memory_reuse_len": 0,
-                    "decode_total_reuse_len": null,
-                    "decode_local_reuse_len": null,
-                    "decode_remote_reuse_len": 0,
-                    "decode_memory_reuse_len": 0,
-                    "output_len": 10,
-                    "step_output_len": 1,
                     "iter_count": 10,
-                    "cum_log_probs": [],
-                    "beam_responses": [],
-                    "pd_sep": false,
-                    "softmax_probs": []
+                    "output_len": 10
                 }
             }
         }

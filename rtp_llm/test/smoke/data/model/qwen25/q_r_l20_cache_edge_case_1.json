@@ -1,12 +1,7 @@
-// Test: qwen25/q_r_l20_cache_edge_case_1.json
-// Description: Cache reuse test | cache edge case (block alignment)
-// Model: qwen_2 @ /mnt/nas1/hf/Qwen2.5-0.5B-Instruct
-        // q0: candidates/s5[:48] (8 tokens)
-        // q1: candidates/s5[:48] (8 tokens)
 {
-  "tokenizer_path": "/mnt/nas1/hf/Qwen2.5-0.5B-Instruct",
   "model_type": "qwen_2",
   "model_path": "/mnt/nas1/hf/Qwen2.5-0.5B-Instruct",
+  "tokenizer_path": "/mnt/nas1/hf/Qwen2.5-0.5B-Instruct",
   "query_result": [
     {
       "query": {

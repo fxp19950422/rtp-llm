@@ -1,10 +1,7 @@
-// Test: qwen25/worker_status_reuse_cache.json
-// Description: Cache reuse test | worker status API
-// Model: qwen_2 @ /mnt/nas1/hf/Qwen2.5-0.5B-Instruct
 {
-  "tokenizer_path": "/mnt/nas1/hf/Qwen2.5-0.5B-Instruct",
   "model_type": "qwen_2",
   "model_path": "/mnt/nas1/hf/Qwen2.5-0.5B-Instruct",
+  "tokenizer_path": "/mnt/nas1/hf/Qwen2.5-0.5B-Instruct",
   "query_result": [
     {
       "endpoint": "/rtp_llm/worker_status",
@@ -159,26 +156,7 @@
         "http_port": 17966,
         "grpc_port": 17962,
         "running_task_info": [],
-        "finished_task_list": [
-          {
-            "request_id": 3333461163854987265,
-            "prefix_length": 0,
-            "input_length": 11,
-            "waiting_time_ms": 0,
-            "iterate_count": 10,
-            "end_time_ms": 1776526569459,
-            "dp_rank": 0
-          },
-          {
-            "request_id": 3333461179345899522,
-            "prefix_length": 8,
-            "input_length": 14,
-            "waiting_time_ms": 0,
-            "iterate_count": 10,
-            "end_time_ms": 1776526569557,
-            "dp_rank": 0
-          }
-        ],
+        "finished_task_list": [],
         "dp_size": 1,
         "tp_size": 1,
         "alive": true,
