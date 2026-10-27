@@ -52,7 +52,12 @@ _failures: Dict[str, BaseException] = {}
 def ensure_backend_entrypoint_loaded() -> bool:
     """Load the optional model-backend entrypoint before consuming a slot."""
     # The public PPU entrypoint owns the migrated backend registrations.
-    importlib.import_module("rtp_llm.models_py")
+    try:
+        importlib.import_module("rtp_llm.models_py")
+    except ModuleNotFoundError as exc:
+        # Utils-only Bazel consumers do not package model backends.
+        if exc.name != "rtp_llm.models_py":
+            raise
     from rtp_llm.utils.import_util import import_optional_internal_source_entrypoint
 
     return import_optional_internal_source_entrypoint("models_py")
