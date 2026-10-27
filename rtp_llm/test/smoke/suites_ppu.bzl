@@ -1,6 +1,16 @@
 load("//rtp_llm/test/smoke:defs.bzl", "smoke_test")
 
 def ppu_suites():
+    # Explicit hardware regression for the migrated CP/reuse golden.
+    smoke_test(
+        name = "qwen35_moe_cp_reuse_tp2_ppu",
+        task_info = "data/model/qwen35/qwen35_moe_bf16_tp2_ppu_cp_reuse.json",
+        smoke_args = "--warm_up 0 --act_type BF16 --seq_size_per_block 2048 --tp_size 2 --world_size 2 --cp_rotate_method ALL_GATHER --max_seq_len 32768 --kv_cache_mem_mb 4096 --reuse_cache 1 --enable_device_cache 1 --enable_memory_cache 1 --memory_cache_size_mb 1024 --load_method scratch",
+        sleep_time_qr = 10,
+        gpu_type = ["PPU-ZW810E"],
+        tags = ["manual"],
+    )
+
     # PPU (PPU-ZW810E) — All cases share basic framework features
     # ============================================================================
 

@@ -278,3 +278,11 @@ py_test(
         "//rtp_llm:utils",
     ],
 )
+
+py_test(
+    name = "ppu_entrypoint_test",
+    srcs = ["ppu_entrypoint_test.py"],
+    deps = ["//rtp_llm:utils"],
+    # Use the production source owner, not the kernel-test-only ppu_modules.
+    data = ["//rtp_llm/models_py:modules"],
+)

@@ -10,16 +10,14 @@ import sys
 import importlib.util
 from pathlib import Path
 
-_jit = os.environ.get("_JIT_CACHE_PATHS", "")
-if _jit:
-    for _p in _jit.split(":"):
-        if _p and _p not in sys.path:
-            sys.path.insert(0, _p)
-
 try:
     from rtp_llm.device.device_type import DeviceType, get_device_type
 
     if get_device_type() == DeviceType.Ppu:
+        # Spawned PPU workers inherit the cache paths through the environment.
+        for _p in os.environ.get("_JIT_CACHE_PATHS", "").split(":"):
+            if _p and _p not in sys.path:
+                sys.path.insert(0, _p)
         # Loading through the factory packages executes their __init__.py files,
         # which initializes the slots before these hooks can be recorded. Load
         # the three lightweight registration modules directly instead.

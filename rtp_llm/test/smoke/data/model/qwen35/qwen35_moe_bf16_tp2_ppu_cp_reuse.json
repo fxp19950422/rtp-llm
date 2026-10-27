@@ -12,7 +12,7 @@
   "query_result": [
     {
       "query": {
-        "prompt": "$prompt:x4",
+        "prompt": "$prompt:ppu_qwen35_cp_reuse_x4",
         "generate_config": {
           "max_new_tokens": 20,
           "top_k": 1,
@@ -26,7 +26,7 @@
     },
     {
       "query": {
-        "prompt": "$prompt:x4",
+        "prompt": "$prompt:ppu_qwen35_cp_reuse_x4",
         "generate_config": {
           "max_new_tokens": 20,
           "top_k": 1,
@@ -42,7 +42,7 @@
     },
     {
       "query": {
-        "prompt": "$prompt:x4",
+        "prompt": "$prompt:ppu_qwen35_cp_reuse_x4",
         "generate_config": {
           "max_new_tokens": 20,
           "top_k": 1,

@@ -102,6 +102,7 @@ filegroup(
 py_library(
     name = "modules",
     srcs = glob([
+        "__init__.py",
         "modules/*.py",
         "modules/**/*.py",
     ]),
