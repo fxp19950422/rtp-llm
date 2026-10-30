@@ -2,6 +2,8 @@
 #include "rtp_llm/models_py/bindings/core/CommonDefines.h"
 
 #include <limits>
+#include <cstdio>
+#include <cstdlib>
 
 #if USING_CUDA
 #include <ATen/cuda/CUDAContext.h>
@@ -424,6 +426,26 @@ static GreedyOutput flashinferSampleGreedy(const GreedyParams& params, const tor
 
 GreedyOutput sampleGreedy(const GreedyParams& params) {
     // [batch_size, step + 1] — clone to GPU
+    const auto probe = [&](const char* phase) {
+        if (!std::getenv("RTP_PPU_CI_LOGITS_PROBE") || params.step > 85) {
+            return;
+        }
+        auto top = params.logits.topk(8, -1);
+        auto values = std::get<0>(top).to(torch::kCPU).contiguous();
+        auto ids = std::get<1>(top).to(torch::kCPU).contiguous();
+        for (int64_t row = 0; row < values.size(0); ++row) {
+            std::fprintf(stderr, "PPU_LOGITS_PROBE phase=%s step=%ld row=%ld topk=%d topp=%.9g temp=%.9g candidates=",
+                         phase, static_cast<long>(params.step), static_cast<long>(row),
+                         params.top_k.data_ptr<int32_t>()[row], params.top_p.data_ptr<float>()[row],
+                         params.temperature.data_ptr<float>()[row]);
+            for (int64_t i = 0; i < 8; ++i) {
+                std::fprintf(stderr, "%ld:%.9g,", static_cast<long>(ids.data_ptr<int64_t>()[row * 8 + i]),
+                             values.data_ptr<float>()[row * 8 + i]);
+            }
+            std::fprintf(stderr, "\n");
+        }
+    };
+    probe("before");
     auto device_tokens = params.token_ids.to(torch::kCUDA, true);
     // [step + 1, batch_size]
     auto transposed_tokens = device_tokens.transpose(0, 1).contiguous();
@@ -451,6 +473,7 @@ GreedyOutput sampleGreedy(const GreedyParams& params) {
         }
     }
 
+    probe("after");
     // fast path for topk = 1
     // TODO: Support output_all_probs and cum_log_probs in this fast path.
     auto top_k_ptr = params.top_k.data_ptr<int32_t>();
