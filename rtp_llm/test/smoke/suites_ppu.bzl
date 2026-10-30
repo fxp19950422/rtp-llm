@@ -106,6 +106,7 @@ def ppu_suites():
                     "decode": "--warm_up 0 --seq_size_per_block 64 --act_type fp16 --role_type DECODE --cache_store_rdma_mode 0 --use_local 1 --load_cache_timeout_ms 20000 --reserver_runtime_mem_mb 8192 --tp_size 2"
                 },
                 gpu_type=["PPU-ZW810E"],
+                test_envs={"RTP_PPU_CI_LOGITS_PROBE": "1"},
             ),
             smoke_test(
                 name="pd_tp2_to_tp2",
