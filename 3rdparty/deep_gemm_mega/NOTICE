@@ -1,0 +1,9 @@
+PPU MegaMoE is derived from DeepGEMM (DeepSeek and T-Head).
+The included MIT license and per-file copyright notices remain applicable.
+MXFP4 MegaMoE contributions: yaotiesheng.yts; Flash numerical and BM64 tuning
+contributions: yuzilin.yzl. This component is maintained within RTP-LLM.
+
+The build uses official t-head/actlize (BSD-3-Clause and included MIT portions)
+and fmtlib/fmt (MIT). Their complete license files are included in the wheel.
+Local changes isolate the package, C++ symbols, JIT headers, configuration and
+cache namespace, and limit the extension API to the PPU MegaMoE path.
